@@ -1,5 +1,5 @@
 [package]
-name = "piscem-meta"
+name = "piscem-infer"
 version = "0.1.0"
 edition = "2021"
 

@@ -1,13 +1,13 @@
 use ahash::AHashMap;
-use anyhow:: Context;
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
 use slog::{crit, info, o, Drain};
 use std::fs::File;
-use std::io::{BufReader, Read};
 use std::io::Write;
+use std::io::{BufReader, Read};
 use std::mem;
 use std::path::PathBuf;
 
@@ -277,10 +277,15 @@ enum Commands {
     /// quantify from the rad file
     #[clap(arg_required_else_help = true)]
     Quant {
+        /// input stem (i.e. without the .rad suffix)
         #[clap(short, long, value_parser)]
         input: PathBuf,
+        /// where output should be written
         #[clap(short, long, value_parser)]
         output: PathBuf,
+        /// max iterations to run the EM
+        #[clap(short, long, default_value_t = 1500, value_parser)]
+        max_iter: u32,
     },
 }
 
@@ -297,7 +302,7 @@ fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error>
     // read type of length
     reader.read_exact(&mut rbuf[0..1])?;
     let lt = rbuf.pread::<u8>(0).unwrap() as u64;
-    assert!(lt == 3);
+    assert_eq!(lt, 3);
 
     // read length of the array
     reader.read_exact(&mut rbuf[0..4])?;
@@ -306,7 +311,7 @@ fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error>
     // read type of entry
     reader.read_exact(&mut rbuf[0..1])?;
     let et = rbuf.pread::<u8>(0).unwrap() as u64;
-    assert!(et == 3);
+    assert_eq!(et, 3);
 
     let mut vec = Vec::<u32>::with_capacity(len);
     for _ in 0..len {
@@ -363,7 +368,7 @@ fn m_step(
     }
 }
 
-fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64]) -> Vec<f64> {
+fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64], max_iter: u32) -> Vec<f64> {
     let total_weight: f64 = eq_map.values().sum::<usize>() as f64;
 
     // init
@@ -372,12 +377,11 @@ fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64]) -> Vec<f64> {
     let mut curr_counts = vec![0.0f64; eff_lens.len()];
 
     let mut rel_diff = 0.0_f64;
-    let mut niter = 0_usize;
-    const MAX_ITER: usize = 1000;
+    let mut niter = 0_u32;
 
-    while niter < MAX_ITER {
+    while niter < max_iter {
         m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
-        
+
         //std::mem::swap(&)
         for i in 0..curr_counts.len() {
             if prev_counts[i] > 1e-8 {
@@ -385,11 +389,13 @@ fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64]) -> Vec<f64> {
                 rel_diff = if rel_diff > rd { rel_diff } else { rd };
             }
         }
-       
+
         std::mem::swap(&mut prev_counts, &mut curr_counts);
         curr_counts.fill(0.0_f64);
-        
-        if rel_diff < 1e-3 { break; }
+
+        if rel_diff < 1e-3 {
+            break;
+        }
         niter += 1;
         if niter % 100 == 0 {
             eprintln!("iteration {}; rel diff {}", niter, rel_diff);
@@ -397,13 +403,20 @@ fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64]) -> Vec<f64> {
         rel_diff = 0.0_f64;
     }
 
-    prev_counts
+    prev_counts.iter_mut().for_each(|x| if *x < 1e-8 { *x = 0.0} );
+    m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
+
+    curr_counts
 }
 
-fn write_results(output: PathBuf, hdr: &rad_types::RadHeader, e_counts: &[f64], eff_lengths: &[f64]) -> anyhow::Result<()> {
-
+fn write_results(
+    output: PathBuf,
+    hdr: &rad_types::RadHeader,
+    e_counts: &[f64],
+    eff_lengths: &[f64],
+) -> anyhow::Result<()> {
     let mut ofile = File::create(output)?;
-  
+
     ofile.write_all("target_name\teelen\tecount\n".to_string().as_bytes())?;
 
     for (i, name) in hdr.ref_names.iter().enumerate() {
@@ -430,7 +443,7 @@ fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
 
     match cli_args.command {
-        Commands::Quant { input, output } => {
+        Commands::Quant { input, output, max_iter } => {
             info!(log, "path {:?}", input);
             let mut input_rad = input;
             input_rad.set_extension("rad");
@@ -540,7 +553,7 @@ fn main() -> anyhow::Result<()> {
 
             let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
 
-            let em_res = em(&eq_map, &eff_lengths);
+            let em_res = em(&eq_map, &eff_lengths, max_iter);
 
             write_results(output, &hdr, &em_res, &eff_lengths)?;
 

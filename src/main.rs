@@ -275,24 +275,26 @@ fn process<T: Read>(
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// quantify from the rad file
-    #[clap(arg_required_else_help = true)]
+    #[command(arg_required_else_help = true)]
     Quant {
         /// input stem (i.e. without the .rad suffix)
-        #[clap(short, long, value_parser)]
+        #[arg(short, long)]
         input: PathBuf,
         /// where output should be written
-        #[clap(short, long, value_parser)]
+        #[arg(short, long)]
         output: PathBuf,
         /// max iterations to run the EM
-        #[clap(short, long, default_value_t = 1500, value_parser)]
+        #[arg(short, long, default_value_t = 1500)]
         max_iter: u32,
     },
 }
 
 /// quantifying from a metagenomic rad file
 #[derive(Debug, Parser)]
+#[command(author, version, about)]
+#[command(propagate_version = true)]
 struct Cli {
-    #[clap(subcommand)]
+    #[command(subcommand)]
     command: Commands,
 }
 

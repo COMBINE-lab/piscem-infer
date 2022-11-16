@@ -8,12 +8,10 @@ use slog::{crit, info, o, Drain};
 use std::fs::File;
 use std::io::Write;
 use std::io::{BufReader, Read};
-use std::mem;
 use std::path::PathBuf;
 
 mod utils;
-use utils::map_record_types::{MappingType, MappedFragmentOrientation, MetaReadRecord};
-use utils::custom_rad_utils::{MetaChunk, MetaReadRecord};
+use utils::custom_rad_utils::MetaChunk;
 
 #[derive(Hash, PartialEq, Eq)]
 struct EqLabel {
@@ -208,7 +206,11 @@ fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64], max_iter: u32) -> Vec
         rel_diff = 0.0_f64;
     }
 
-    prev_counts.iter_mut().for_each(|x| if *x < 1e-8 { *x = 0.0} );
+    prev_counts.iter_mut().for_each(|x| {
+        if *x < 1e-8 {
+            *x = 0.0
+        }
+    });
     m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
 
     curr_counts
@@ -248,7 +250,11 @@ fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
 
     match cli_args.command {
-        Commands::Quant { input, output, max_iter } => {
+        Commands::Quant {
+            input,
+            output,
+            max_iter,
+        } => {
             info!(log, "path {:?}", input);
             let mut input_rad = input;
             input_rad.set_extension("rad");

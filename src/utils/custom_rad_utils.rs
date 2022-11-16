@@ -1,7 +1,9 @@
-use std::io::Read;
+use libradicl::rad_types;
 use scroll::Pread;
+use std::io::Read;
+use std::mem;
 
-use crate::map_record_types::MetaReadRecord;
+use crate::utils::map_record_types::MetaReadRecord;
 
 #[derive(Debug)]
 pub struct MetaChunk {
@@ -10,8 +12,8 @@ pub struct MetaChunk {
     pub reads: Vec<MetaReadRecord>,
 }
 
-
 impl MetaChunk {
+    #[allow(dead_code)]
     pub fn read_header<T: Read>(reader: &mut T) -> (u32, u32) {
         let mut buf = [0u8; 8];
 
@@ -43,6 +45,7 @@ impl MetaChunk {
     /// peeks to the first record in the buffer `buf`, and returns
     /// the barcode and umi associated with this record.  It is assumed
     /// that there is at least one record present in the buffer.
+    #[allow(dead_code)]
     pub fn peek_record(
         buf: &[u8],
         bct: &rad_types::RadIntId,

@@ -27,6 +27,19 @@ impl MappingType {
             _ => MappingType::Unmapped,
         }
     }
+
+    #[inline]
+    pub fn get_mask(&self) -> u32 {
+        match &self {
+            // if unmapped, we ignore flags all together.
+            MappingType::Unmapped => 0b00,
+            // if paired we care about both read and mate.
+            MappingType::MappedPair => 0b11,
+            // if orphan or single, we care only about read
+            // mate flag should be ignored.
+            _ => 0b10,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -45,7 +58,7 @@ impl MappedFragmentOrientation {
         // if not paired, then we don't care about
         // the lowest order bit so shift it off
         if m == MappingType::SingleMapped {
-            if (n >> 1) > 0 {
+            if (n & 0b10) == 2 {
                 MappedFragmentOrientation::Forward
             } else {
                 MappedFragmentOrientation::Reverse
@@ -58,6 +71,34 @@ impl MappedFragmentOrientation {
                 3 => MappedFragmentOrientation::ForwardForward,
                 _ => MappedFragmentOrientation::Unknown,
             }
+        }
+    }
+}
+
+impl From<MappedFragmentOrientation> for u32 {
+    fn from(item: MappedFragmentOrientation) -> Self {
+        match item {
+            MappedFragmentOrientation::ForwardReverse => 0b011,
+            MappedFragmentOrientation::ForwardForward => 0b101,
+            MappedFragmentOrientation::ReverseReverse => 0b110,
+            MappedFragmentOrientation::ReverseForward => 0b100,
+            MappedFragmentOrientation::Forward => 0b1,
+            MappedFragmentOrientation::Reverse => 0b10,
+            MappedFragmentOrientation::Unknown => 0b0,
+        }
+    }
+}
+
+impl From<u32> for MappedFragmentOrientation {
+    fn from(item: u32) -> Self {
+        match item {
+            0b011 => MappedFragmentOrientation::ForwardReverse,
+            0b101 => MappedFragmentOrientation::ForwardForward,
+            0b110 => MappedFragmentOrientation::ReverseReverse,
+            0b100 => MappedFragmentOrientation::ReverseForward,
+            0b1 => MappedFragmentOrientation::Forward,
+            0b10 => MappedFragmentOrientation::Reverse,
+            _ => MappedFragmentOrientation::Unknown,
         }
     }
 }
@@ -99,7 +140,7 @@ impl MetaReadRecord {
             reader.read_exact(&mut rbuf[0..4]).unwrap();
             let v = rbuf.pread::<u32>(0).unwrap();
 
-            let dir_int = v & MASK_LOWER_30_BITS;
+            let dir_int = (v & MASK_LOWER_30_BITS) >> 30;
             let dir = MappedFragmentOrientation::from_u32_paired_status(dir_int, f);
             rec.dirs.push(dir);
             rec.refs.push(v & MASK_UPPER_2_BITS);

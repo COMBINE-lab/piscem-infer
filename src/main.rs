@@ -12,10 +12,20 @@ use std::path::PathBuf;
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
+use utils::map_record_types::MappedFragmentOrientation;
 
 #[derive(Hash, PartialEq, Eq)]
 struct EqLabel {
     pub targets: Vec<u32>,
+}
+
+impl EqLabel {
+    #[inline]
+    pub fn targets(&self) -> &[u32] {
+        // number of targets is total length / 2
+        let nt = self.targets.len() >> 1;
+        &self.targets[0..nt]
+    }
 }
 
 fn conditional_means(freq: &[u32]) -> Vec<f64> {
@@ -40,6 +50,7 @@ fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
     frag_map_t: &rad_types::RadIntId,
+    log: &slog::Logger,
     tot_mappings: &mut usize,
     num_mapped_reads: &mut usize,
 ) -> (AHashMap<EqLabel, usize>, Vec<f64>) {
@@ -47,6 +58,9 @@ fn process<T: Read>(
     let mut frag_lengths = vec![0u32; 65536];
     let mut _unique_frags = 0u32;
 
+    let mut mapped_ori_count_global = vec![0u32; 7];
+    let mut mapped_ori_count = vec![0u32; 7];
+    //let mut dir_vec = vec![0u32, 64];
     for _ in 0..nrec {
         let c = MetaChunk::from_bytes(br, frag_map_t);
         for mappings in &c.reads {
@@ -55,9 +69,22 @@ fn process<T: Read>(
             *tot_mappings += nm;
             *num_mapped_reads += 1;
 
+            let mut label_ints = mappings.refs.clone();
+
+            // reset the counter
+            mapped_ori_count.fill(0);
+            // extend with the info on the mapping
+            // orientations
+            label_ints.extend(mappings.dirs.iter().map(|x| {
+                let y = u32::from(*x);
+                mapped_ori_count[y as usize] += 1;
+                y
+            }));
+
             let eql = EqLabel {
-                targets: mappings.refs.clone(),
+                targets: label_ints,
             };
+
             map.entry(eql)
                 .and_modify(|counter| *counter += 1)
                 .or_insert(1);
@@ -66,8 +93,16 @@ fn process<T: Read>(
                 frag_lengths[mappings.frag_lengths[0] as usize] += 1;
                 _unique_frags += 1;
             }
+
+            // update global orientations
+            for i in 0..mapped_ori_count.len() {
+                mapped_ori_count_global[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
+            }
         }
     }
+
+    info!(log, "unknown, F, R, FR, RF, FF, RR");
+    info!(log, "orientation_counts = {:?}", mapped_ori_count_global);
 
     let cond_means = conditional_means(&frag_lengths);
     (map, cond_means)
@@ -158,12 +193,12 @@ fn m_step(
     for (k, v) in eq_map {
         let mut denom = 0.0_f64;
         let count = *v as f64;
-        for target_id in &k.targets {
+        for target_id in k.targets() {
             denom += prev_count[*target_id as usize] / eff_lens[*target_id as usize];
         }
 
         if denom > 1e-8 {
-            for target_id in &k.targets {
+            for target_id in k.targets() {
                 curr_counts[*target_id as usize] += count
                     * ((prev_count[*target_id as usize] / eff_lens[*target_id as usize]) / denom);
             }
@@ -358,6 +393,7 @@ fn main() -> anyhow::Result<()> {
                 &mut br,
                 hdr.num_chunks as usize,
                 &frag_map_t,
+                &log,
                 &mut tot_mappings,
                 &mut num_mapped_reads,
             );

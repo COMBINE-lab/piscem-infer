@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::Write;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
+use tabled::{Style, Table, Tabled};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
@@ -101,8 +102,48 @@ fn process<T: Read>(
         }
     }
 
-    info!(log, "unknown, F, R, FR, RF, FF, RR");
-    info!(log, "orientation_counts = {:?}", mapped_ori_count_global);
+    #[derive(Tabled)]
+    struct DirEntry {
+        name: &'static str,
+        count: u32,
+    }
+
+    let count_table = vec![
+        DirEntry {
+            name: "unknown",
+            count: mapped_ori_count_global[0],
+        },
+        DirEntry {
+            name: "f",
+            count: mapped_ori_count_global[1],
+        },
+        DirEntry {
+            name: "r",
+            count: mapped_ori_count_global[2],
+        },
+        DirEntry {
+            name: "fr",
+            count: mapped_ori_count_global[3],
+        },
+        DirEntry {
+            name: "rf",
+            count: mapped_ori_count_global[4],
+        },
+        DirEntry {
+            name: "ff",
+            count: mapped_ori_count_global[5],
+        },
+        DirEntry {
+            name: "rr",
+            count: mapped_ori_count_global[6],
+        },
+    ];
+
+    info!(
+        log,
+        "\n{}",
+        Table::new(count_table).with(Style::rounded()).to_string()
+    );
 
     let cond_means = conditional_means(&frag_lengths);
     (map, cond_means)

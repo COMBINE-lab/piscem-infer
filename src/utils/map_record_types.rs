@@ -7,7 +7,7 @@ use crate::utils::custom_rad_utils::*;
 const MASK_LOWER_30_BITS: u32 = 0xC0000000;
 const MASK_UPPER_2_BITS: u32 = 0x3FFFFFFF;
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum MappingType {
     Unmapped,
     SingleMapped,

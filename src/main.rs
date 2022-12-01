@@ -37,7 +37,7 @@ impl EqLabel {
     }
 }
 
-/// An equivalence class map that maps target equivalence 
+/// An equivalence class map that maps target equivalence
 /// classes to their counts.
 struct EqMap {
     pub count_map: AHashMap<EqLabel, usize>,
@@ -45,9 +45,9 @@ struct EqMap {
 }
 
 impl EqMap {
-    /// Create a new equivalence class map, if 
-    /// `cotntains_ori` is true, the equivalence class 
-    /// definitions will include the orientation flags, 
+    /// Create a new equivalence class map, if
+    /// `cotntains_ori` is true, the equivalence class
+    /// definitions will include the orientation flags,
     /// if false, they will not.
     fn new(contains_ori: bool) -> Self {
         Self {
@@ -61,7 +61,7 @@ impl EqMap {
         self.count_map.len()
     }
 
-    /// Return an iterator over the equivalence class 
+    /// Return an iterator over the equivalence class
     /// map iterator.
     fn iter(&self) -> EqEntryIter {
         EqEntryIter {
@@ -266,7 +266,6 @@ fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 
 #[inline]
 fn m_step(eq_map: &EqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mut [f64]) {
-    //for (k, v) in eq_map.count_map.iter() {
     for (k, v) in eq_map.iter() {
         let mut denom = 0.0_f64;
         let count = *v as f64;
@@ -283,7 +282,17 @@ fn m_step(eq_map: &EqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mu
     }
 }
 
-fn em(eq_map: &EqMap, eff_lens: &[f64], max_iter: u32) -> Vec<f64> {
+/// Holds the info relevant for running the EM algorithm
+struct EMInfo<'eqm, 'el> {
+    eq_map: &'eqm EqMap,
+    eff_lens: &'el [f64],
+    max_iter: u32,
+}
+
+fn em(em_info: &EMInfo) -> Vec<f64> {
+    let eq_map = em_info.eq_map;
+    let eff_lens = em_info.eff_lens;
+    let max_iter = em_info.max_iter;
     let total_weight: f64 = eq_map.count_map.values().sum::<usize>() as f64;
 
     // init
@@ -504,7 +513,12 @@ fn main() -> anyhow::Result<()> {
 
             let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
 
-            let em_res = em(&eq_map, &eff_lengths, max_iter);
+            let eminfo = EMInfo {
+                eq_map: &eq_map,
+                eff_lens: &eff_lengths,
+                max_iter,
+            };
+            let em_res = em(&eminfo);
 
             write_results(output, &hdr, &em_res, &eff_lengths)?;
 

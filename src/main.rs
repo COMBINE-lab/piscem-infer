@@ -13,7 +13,7 @@ use tabled::{Style, Table, Tabled};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
-use utils::map_record_types::MappedFragmentOrientation;
+// use utils::map_record_types::MappedFragmentOrientation;
 
 #[derive(Hash, PartialEq, Eq)]
 struct EqLabel {
@@ -84,7 +84,10 @@ impl<'a>Iterator for EqEntryIter<'a> {
     }
 }
 
-
+/// Takes as input `freq`, the frequency of occurrence of 
+/// fragments of each observed length, and returns 
+/// the conditional mean of the fragment length distribution 
+/// at every value 1 <= i <= freq.len()
 fn conditional_means(freq: &[u32]) -> Vec<f64> {
     let mut cond_means = vec![0.0f64; freq.len()];
     let mut vals = vec![0.0f64; freq.len()];
@@ -235,6 +238,7 @@ struct Cli {
     command: Commands,
 }
 
+/// Read the lengths of the reference sequences from the RAD file header.
 fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error> {
     let mut rbuf = [0u8; 8];
 
@@ -262,6 +266,8 @@ fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error>
     Ok(vec)
 }
 
+/// Go through the set of references (`ref_lens`), and adjust their lengths according to 
+/// the computed conditional means `cond_means` of the fragment length distribution.
 fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
     let tmean = cond_means.last().unwrap();
     let el = ref_lens

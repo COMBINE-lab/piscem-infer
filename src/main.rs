@@ -21,10 +21,22 @@ struct EqLabel {
 }
 
 impl EqLabel {
+    /*
     #[inline]
     pub fn targets(&self) -> &[u32] {
         // number of targets is total length / 2
         let nt = self.targets.len() >> 1;
+        &self.targets[0..nt]
+    }
+    */
+
+    // return the slice of identifiers (u32s) that correspond 
+    // to the target ids. If the EqLabel was built without orientations
+    // this is the whole vector, otherwise it's the first half.
+    #[inline]
+    pub fn target_labels(&self, with_ori: bool) -> &[u32] {
+        // number of targets is total length / 2
+        let nt = if with_ori { self.targets.len() >> 1 } else { self.targets.len() };
         &self.targets[0..nt]
     }
 }
@@ -35,35 +47,43 @@ struct EqMap {
 }
 
 impl EqMap {
-    fn new() -> Self {
+
+    fn new(contains_ori: bool) -> Self {
         Self {
             count_map: AHashMap::<EqLabel, usize>::new(),
-            contains_ori: false
+            contains_ori
         }
     }
+
     fn len(&self) -> usize {
         self.count_map.len()
     }
-    /*
-    fn iter(&self)-> EqEntryIter<EqLabel, usize> {
+
+    fn iter(&self)-> EqEntryIter {
         EqEntryIter{
-            self.count_map.iter()
+            underlying_iter: self.count_map.iter(),
+            contains_ori: self.contains_ori
         }
     }
-    */
-}
-/*
-struct EqEntryIter<'a, K: 'a, V: 'a> {
-    underlying_iter:  std::collections::hash_map::Iter<'a, K: 'a, V: 'a>,
 }
 
-impl<'a, K: 'a, V: 'a> for EqEntryIter<'a, K: 'a, V: 'a> {
-    type Item = (&'a K, &'a V);
+struct EqEntryIter<'a> {
+    underlying_iter:  std::collections::hash_map::Iter<'a, EqLabel, usize>,
+    contains_ori: bool
+}
+
+impl<'a>Iterator for EqEntryIter<'a> {
+    type Item = (&'a [u32], &'a usize);
     fn next(&mut self) -> Option<Self::Item> {
-        return self.underlying_iter.next()
+        match self.underlying_iter.next() {
+            Some((k, v)) => {
+               Some((k.target_labels(self.contains_ori), v))
+            },
+            None => { None }
+        }
     }
 }
-*/
+
 
 fn conditional_means(freq: &[u32]) -> Vec<f64> {
     let mut cond_means = vec![0.0f64; freq.len()];
@@ -91,7 +111,10 @@ fn process<T: Read>(
     tot_mappings: &mut usize,
     num_mapped_reads: &mut usize,
 ) -> (EqMap, Vec<f64>) {
-    let mut eqmap = EqMap::new();
+    
+    // true because it contains orientations
+    let mut eqmap = EqMap::new(true);
+
     let map = &mut eqmap.count_map;
     let mut frag_lengths = vec![0u32; 65536];
     let mut _unique_frags = 0u32;
@@ -268,15 +291,16 @@ fn m_step(
     eff_lens: &[f64],
     curr_counts: &mut [f64],
 ) {
-    for (k, v) in eq_map.count_map.iter() {
+    //for (k, v) in eq_map.count_map.iter() {
+    for (k, v) in eq_map.iter() {
         let mut denom = 0.0_f64;
         let count = *v as f64;
-        for target_id in k.targets() {
+        for target_id in k {
             denom += prev_count[*target_id as usize] / eff_lens[*target_id as usize];
         }
 
         if denom > 1e-8 {
-            for target_id in k.targets() {
+            for target_id in k {
                 curr_counts[*target_id as usize] += count
                     * ((prev_count[*target_id as usize] / eff_lens[*target_id as usize]) / denom);
             }

@@ -4,12 +4,13 @@ use clap::{Parser, Subcommand};
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
-use slog::{crit, info, o, Drain};
 use std::fs::File;
 use std::io::Write;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use tabled::{Style, Table, Tabled};
+use tracing::{error, info, Level};
+// use tracing_subscriber;
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
@@ -30,28 +31,31 @@ impl EqLabel {
     }
     */
 
-    // return the slice of identifiers (u32s) that correspond 
+    // return the slice of identifiers (u32s) that correspond
     // to the target ids. If the EqLabel was built without orientations
     // this is the whole vector, otherwise it's the first half.
     #[inline]
     pub fn target_labels(&self, with_ori: bool) -> &[u32] {
         // number of targets is total length / 2
-        let nt = if with_ori { self.targets.len() >> 1 } else { self.targets.len() };
+        let nt = if with_ori {
+            self.targets.len() >> 1
+        } else {
+            self.targets.len()
+        };
         &self.targets[0..nt]
     }
 }
 
 struct EqMap {
     pub count_map: AHashMap<EqLabel, usize>,
-    pub contains_ori: bool
+    pub contains_ori: bool,
 }
 
 impl EqMap {
-
     fn new(contains_ori: bool) -> Self {
         Self {
             count_map: AHashMap::<EqLabel, usize>::new(),
-            contains_ori
+            contains_ori,
         }
     }
 
@@ -59,34 +63,32 @@ impl EqMap {
         self.count_map.len()
     }
 
-    fn iter(&self)-> EqEntryIter {
-        EqEntryIter{
+    fn iter(&self) -> EqEntryIter {
+        EqEntryIter {
             underlying_iter: self.count_map.iter(),
-            contains_ori: self.contains_ori
+            contains_ori: self.contains_ori,
         }
     }
 }
 
 struct EqEntryIter<'a> {
-    underlying_iter:  std::collections::hash_map::Iter<'a, EqLabel, usize>,
-    contains_ori: bool
+    underlying_iter: std::collections::hash_map::Iter<'a, EqLabel, usize>,
+    contains_ori: bool,
 }
 
-impl<'a>Iterator for EqEntryIter<'a> {
+impl<'a> Iterator for EqEntryIter<'a> {
     type Item = (&'a [u32], &'a usize);
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying_iter.next() {
-            Some((k, v)) => {
-               Some((k.target_labels(self.contains_ori), v))
-            },
-            None => { None }
+            Some((k, v)) => Some((k.target_labels(self.contains_ori), v)),
+            None => None,
         }
     }
 }
 
-/// Takes as input `freq`, the frequency of occurrence of 
-/// fragments of each observed length, and returns 
-/// the conditional mean of the fragment length distribution 
+/// Takes as input `freq`, the frequency of occurrence of
+/// fragments of each observed length, and returns
+/// the conditional mean of the fragment length distribution
 /// at every value 1 <= i <= freq.len()
 fn conditional_means(freq: &[u32]) -> Vec<f64> {
     let mut cond_means = vec![0.0f64; freq.len()];
@@ -110,11 +112,10 @@ fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
     frag_map_t: &rad_types::RadIntId,
-    log: &slog::Logger,
+    //log: &slog::Logger,
     tot_mappings: &mut usize,
     num_mapped_reads: &mut usize,
 ) -> (EqMap, Vec<f64>) {
-    
     // true because it contains orientations
     let mut eqmap = EqMap::new(true);
 
@@ -203,39 +204,12 @@ fn process<T: Read>(
     ];
 
     info!(
-        log,
         "\n{}",
         Table::new(count_table).with(Style::rounded()).to_string()
     );
 
     let cond_means = conditional_means(&frag_lengths);
     (eqmap, cond_means)
-}
-
-#[derive(Debug, Subcommand)]
-enum Commands {
-    /// quantify from the rad file
-    #[command(arg_required_else_help = true)]
-    Quant {
-        /// input stem (i.e. without the .rad suffix)
-        #[arg(short, long)]
-        input: PathBuf,
-        /// where output should be written
-        #[arg(short, long)]
-        output: PathBuf,
-        /// max iterations to run the EM
-        #[arg(short, long, default_value_t = 1500)]
-        max_iter: u32,
-    },
-}
-
-/// quantifying from a metagenomic rad file
-#[derive(Debug, Parser)]
-#[command(author, version, about)]
-#[command(propagate_version = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
 }
 
 /// Read the lengths of the reference sequences from the RAD file header.
@@ -266,7 +240,7 @@ fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error>
     Ok(vec)
 }
 
-/// Go through the set of references (`ref_lens`), and adjust their lengths according to 
+/// Go through the set of references (`ref_lens`), and adjust their lengths according to
 /// the computed conditional means `cond_means` of the fragment length distribution.
 fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
     let tmean = cond_means.last().unwrap();
@@ -291,12 +265,7 @@ fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 }
 
 #[inline]
-fn m_step(
-    eq_map: &EqMap,
-    prev_count: &[f64],
-    eff_lens: &[f64],
-    curr_counts: &mut [f64],
-) {
+fn m_step(eq_map: &EqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mut [f64]) {
     //for (k, v) in eq_map.count_map.iter() {
     for (k, v) in eq_map.iter() {
         let mut denom = 0.0_f64;
@@ -377,7 +346,43 @@ fn write_results(
     Ok(())
 }
 
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// quantify from the rad file
+    #[command(arg_required_else_help = true)]
+    Quant {
+        /// input stem (i.e. without the .rad suffix)
+        #[arg(short, long)]
+        input: PathBuf,
+        /// where output should be written
+        #[arg(short, long)]
+        output: PathBuf,
+        /// max iterations to run the EM
+        #[arg(short, long, default_value_t = 1500)]
+        max_iter: u32,
+    },
+}
+
+/// quantifying from a metagenomic rad file
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
+#[command(propagate_version = true)]
+struct Cli {
+    #[arg(short, long)]
+    quiet: bool,
+    #[command(subcommand)]
+    command: Commands,
+}
+
 fn main() -> anyhow::Result<()> {
+    let cli_args = Cli::parse();
+    if cli_args.quiet {
+        tracing_subscriber::fmt().with_max_level(Level::WARN).init();
+    } else {
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    }
+
+    /*
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::CompactFormat::new(decorator)
         /*.use_custom_timestamp(|out: &mut dyn std::io::Write| {
@@ -386,11 +391,9 @@ fn main() -> anyhow::Result<()> {
         })*/
         .build()
         .fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
-
+    let mut drain = slog_async::Async::new(drain).build().fuse();
     let log = slog::Logger::root(drain, o!());
-
-    let cli_args = Cli::parse();
+    */
 
     match cli_args.command {
         Commands::Quant {
@@ -398,34 +401,31 @@ fn main() -> anyhow::Result<()> {
             output,
             max_iter,
         } => {
-            info!(log, "path {:?}", input);
+            info!("path {:?}", input);
             let mut input_rad = input;
             input_rad.set_extension("rad");
             let i_file = File::open(input_rad).context("could not open input rad file")?;
             let mut br = BufReader::new(i_file);
 
             let hdr = rad_types::RadHeader::from_bytes(&mut br);
-            info!(log, "read header!");
+            info!("read header!");
             // file-level
             let fl_tags = rad_types::TagSection::from_bytes(&mut br);
-            info!(log, "read {:?} file-level tags", fl_tags.tags.len());
+            info!("read {:?} file-level tags", fl_tags.tags.len());
 
             // read-level
             let rl_tags = rad_types::TagSection::from_bytes(&mut br);
-            info!(log, "read {:?} read-level tags", rl_tags.tags.len());
+            info!("read {:?} read-level tags", rl_tags.tags.len());
 
             const FRAG_TYPE_NAME: &str = "frag_map_type";
             let mut ftt: Option<u8> = None;
             // parse actual tags
             for rt in &rl_tags.tags {
                 if rad_types::decode_int_type_tag(rt.typeid).is_none() {
-                    crit!(
-                        log,
-                        "currently only RAD types 1--4 are supported for 'b' and 'u' tags."
-                    );
+                    error!("currently only RAD types 1--4 are supported for 'b' and 'u' tags.");
                     std::process::exit(exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
                 }
-                info!(log, "\tread-level tag {}", rt.name);
+                info!("\tread-level tag {}", rt.name);
                 if rt.name == FRAG_TYPE_NAME {
                     ftt = Some(rt.typeid);
                 }
@@ -433,7 +433,7 @@ fn main() -> anyhow::Result<()> {
 
             // alignment-level
             let al_tags = rad_types::TagSection::from_bytes(&mut br);
-            info!(log, "read {:?} alignemnt-level tags", al_tags.tags.len());
+            info!("read {:?} alignemnt-level tags", al_tags.tags.len());
 
             const REF_ORI_NAME: &str = "compressed_ori_ref";
             const POS_NAME: &str = "pos";
@@ -445,13 +445,10 @@ fn main() -> anyhow::Result<()> {
             // parse actual tags
             for at in &al_tags.tags {
                 if rad_types::decode_int_type_tag(at.typeid).is_none() {
-                    crit!(
-                        log,
-                        "currently only RAD types 1--4 are supported for 'b' and 'u' tags."
-                    );
+                    error!("currently only RAD types 1--4 are supported for 'b' and 'u' tags.");
                     std::process::exit(exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
                 }
-                info!(log, "\talignment-level tag {}", at.name);
+                info!("\talignment-level tag {}", at.name);
                 match at.name.as_str() {
                     REF_ORI_NAME => {
                         ref_ori_t = Some(at.typeid);
@@ -463,7 +460,7 @@ fn main() -> anyhow::Result<()> {
                         fraglen_t = Some(at.typeid);
                     }
                     _ => {
-                        info!(log, "unknown alignment-level tag {}", at.name);
+                        info!("unknown alignment-level tag {}", at.name);
                     }
                 }
             }
@@ -478,9 +475,9 @@ fn main() -> anyhow::Result<()> {
             for ft in &fl_tags.tags {
                 if ft.name == REF_LENGTHS_NAME {
                     if ft.typeid != 7 {
-                        crit!(log, "expected array type (7) but found, {}", ft.typeid);
+                        error!("expected array type (7) but found, {}", ft.typeid);
                     }
-                    info!(log, "found frag_length file-level tag");
+                    info!("found frag_length file-level tag");
 
                     let v = read_ref_lengths(&mut br)?;
                     ref_lengths = Some(v);
@@ -489,7 +486,7 @@ fn main() -> anyhow::Result<()> {
 
             let ref_lengths =
                 ref_lengths.expect("was not able to read reference lengths from file!");
-            info!(log, "read {} reference lengths", ref_lengths.len());
+            info!("read {} reference lengths", ref_lengths.len());
 
             let frag_map_t = rad_types::decode_int_type_tag(
                 ftt.expect("no fragment mapping type description present."),
@@ -501,7 +498,6 @@ fn main() -> anyhow::Result<()> {
                 &mut br,
                 hdr.num_chunks as usize,
                 &frag_map_t,
-                &log,
                 &mut tot_mappings,
                 &mut num_mapped_reads,
             );
@@ -512,11 +508,11 @@ fn main() -> anyhow::Result<()> {
 
             write_results(output, &hdr, &em_res, &eff_lengths)?;
 
-            info!(log, "num mapped reads = {}", num_mapped_reads);
-            info!(log, "total mappings = {}", tot_mappings);
-            info!(log, "number of equivalence classes = {}", eq_map.len());
+            info!("num mapped reads = {}", num_mapped_reads);
+            info!("total mappings = {}", tot_mappings);
+            info!("number of equivalence classes = {}", eq_map.len());
             let total_weight: usize = eq_map.count_map.values().sum();
-            info!(log, "total equivalence map weight = {}", total_weight);
+            info!("total equivalence map weight = {}", total_weight);
         }
     }
     Ok(())

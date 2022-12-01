@@ -22,15 +22,6 @@ struct EqLabel {
 }
 
 impl EqLabel {
-    /*
-    #[inline]
-    pub fn targets(&self) -> &[u32] {
-        // number of targets is total length / 2
-        let nt = self.targets.len() >> 1;
-        &self.targets[0..nt]
-    }
-    */
-
     // return the slice of identifiers (u32s) that correspond
     // to the target ids. If the EqLabel was built without orientations
     // this is the whole vector, otherwise it's the first half.
@@ -46,12 +37,18 @@ impl EqLabel {
     }
 }
 
+/// An equivalence class map that maps target equivalence 
+/// classes to their counts.
 struct EqMap {
     pub count_map: AHashMap<EqLabel, usize>,
     pub contains_ori: bool,
 }
 
 impl EqMap {
+    /// Create a new equivalence class map, if 
+    /// `cotntains_ori` is true, the equivalence class 
+    /// definitions will include the orientation flags, 
+    /// if false, they will not.
     fn new(contains_ori: bool) -> Self {
         Self {
             count_map: AHashMap::<EqLabel, usize>::new(),
@@ -59,10 +56,13 @@ impl EqMap {
         }
     }
 
+    /// The number of equivalence classes
     fn len(&self) -> usize {
         self.count_map.len()
     }
 
+    /// Return an iterator over the equivalence class 
+    /// map iterator.
     fn iter(&self) -> EqEntryIter {
         EqEntryIter {
             underlying_iter: self.count_map.iter(),

@@ -29,6 +29,42 @@ impl EqLabel {
     }
 }
 
+struct EqMap {
+    pub count_map: AHashMap<EqLabel, usize>,
+    pub contains_ori: bool
+}
+
+impl EqMap {
+    fn new() -> Self {
+        Self {
+            count_map: AHashMap::<EqLabel, usize>::new(),
+            contains_ori: false
+        }
+    }
+    fn len(&self) -> usize {
+        self.count_map.len()
+    }
+    /*
+    fn iter(&self)-> EqEntryIter<EqLabel, usize> {
+        EqEntryIter{
+            self.count_map.iter()
+        }
+    }
+    */
+}
+/*
+struct EqEntryIter<'a, K: 'a, V: 'a> {
+    underlying_iter:  std::collections::hash_map::Iter<'a, K: 'a, V: 'a>,
+}
+
+impl<'a, K: 'a, V: 'a> for EqEntryIter<'a, K: 'a, V: 'a> {
+    type Item = (&'a K, &'a V);
+    fn next(&mut self) -> Option<Self::Item> {
+        return self.underlying_iter.next()
+    }
+}
+*/
+
 fn conditional_means(freq: &[u32]) -> Vec<f64> {
     let mut cond_means = vec![0.0f64; freq.len()];
     let mut vals = vec![0.0f64; freq.len()];
@@ -54,8 +90,9 @@ fn process<T: Read>(
     log: &slog::Logger,
     tot_mappings: &mut usize,
     num_mapped_reads: &mut usize,
-) -> (AHashMap<EqLabel, usize>, Vec<f64>) {
-    let mut map: AHashMap<EqLabel, usize> = AHashMap::new();
+) -> (EqMap, Vec<f64>) {
+    let mut eqmap = EqMap::new();
+    let map = &mut eqmap.count_map;
     let mut frag_lengths = vec![0u32; 65536];
     let mut _unique_frags = 0u32;
 
@@ -146,7 +183,7 @@ fn process<T: Read>(
     );
 
     let cond_means = conditional_means(&frag_lengths);
-    (map, cond_means)
+    (eqmap, cond_means)
 }
 
 #[derive(Debug, Subcommand)]
@@ -226,12 +263,12 @@ fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 
 #[inline]
 fn m_step(
-    eq_map: &AHashMap<EqLabel, usize>,
+    eq_map: &EqMap,
     prev_count: &[f64],
     eff_lens: &[f64],
     curr_counts: &mut [f64],
 ) {
-    for (k, v) in eq_map {
+    for (k, v) in eq_map.count_map.iter() {
         let mut denom = 0.0_f64;
         let count = *v as f64;
         for target_id in k.targets() {
@@ -247,8 +284,8 @@ fn m_step(
     }
 }
 
-fn em(eq_map: &AHashMap<EqLabel, usize>, eff_lens: &[f64], max_iter: u32) -> Vec<f64> {
-    let total_weight: f64 = eq_map.values().sum::<usize>() as f64;
+fn em(eq_map: &EqMap, eff_lens: &[f64], max_iter: u32) -> Vec<f64> {
+    let total_weight: f64 = eq_map.count_map.values().sum::<usize>() as f64;
 
     // init
     let avg = total_weight / (eff_lens.len() as f64);
@@ -448,7 +485,7 @@ fn main() -> anyhow::Result<()> {
             info!(log, "num mapped reads = {}", num_mapped_reads);
             info!(log, "total mappings = {}", tot_mappings);
             info!(log, "number of equivalence classes = {}", eq_map.len());
-            let total_weight: usize = eq_map.values().sum();
+            let total_weight: usize = eq_map.count_map.values().sum();
             info!(log, "total equivalence map weight = {}", total_weight);
         }
     }

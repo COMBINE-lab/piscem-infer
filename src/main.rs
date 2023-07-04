@@ -8,27 +8,28 @@ use std::io::Write;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use tabled::{settings::Style, Table, Tabled};
-use tracing::{error, info, Level};
-// use tracing_subscriber;
+use tracing::{error, info, warn, Level};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
+use crate::utils::em::OrientationProperty;
+
 fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
     frag_map_t: &rad_types::RadIntId,
-    //log: &slog::Logger,
     tot_mappings: &mut usize,
     num_mapped_reads: &mut usize,
 ) -> (EqMap, Vec<f64>) {
     // true because it contains orientations
-    let mut eqmap = EqMap::new(true);
+    let mut eqmap = EqMap::new(OrientationProperty::OrientationAware);
 
     let map = &mut eqmap.count_map;
-    let mut frag_lengths = vec![0u32; 65536];
-    let mut _unique_frags = 0u32;
+    let mut frag_lengths = vec![0u32; 65_536];
+    const TARGET_UNIQUE_FRAGS: u32 = 5_000;
+    let mut unique_frags = 0u32;
 
     let mut mapped_ori_count_global = vec![0u32; 7];
     let mut mapped_ori_count = vec![0u32; 7];
@@ -63,7 +64,7 @@ fn process<T: Read>(
 
             if nm == 1 {
                 frag_lengths[mappings.frag_lengths[0] as usize] += 1;
-                _unique_frags += 1;
+                unique_frags += 1;
             }
 
             // update global orientations
@@ -115,6 +116,10 @@ fn process<T: Read>(
         Table::new(count_table).with(Style::rounded()).to_string()
     );
 
+    if unique_frags < TARGET_UNIQUE_FRAGS {
+        warn!("Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution may not be robust",
+            unique_frags, TARGET_UNIQUE_FRAGS);
+    }
     let cond_means = conditional_means(&frag_lengths);
     (eqmap, cond_means)
 }

@@ -16,6 +16,45 @@ use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMa
 
 use crate::utils::em::OrientationProperty;
 
+#[derive(Tabled)]
+struct DirEntry {
+    name: &'static str,
+    count: u32,
+}
+
+fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirEntry> {
+    vec![
+        DirEntry {
+            name: "unknown",
+            count: mapped_ori_count_global[0],
+        },
+        DirEntry {
+            name: "f",
+            count: mapped_ori_count_global[1],
+        },
+        DirEntry {
+            name: "r",
+            count: mapped_ori_count_global[2],
+        },
+        DirEntry {
+            name: "fr",
+            count: mapped_ori_count_global[3],
+        },
+        DirEntry {
+            name: "rf",
+            count: mapped_ori_count_global[4],
+        },
+        DirEntry {
+            name: "ff",
+            count: mapped_ori_count_global[5],
+        },
+        DirEntry {
+            name: "rr",
+            count: mapped_ori_count_global[6],
+        },
+    ]
+}
+
 fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
@@ -74,42 +113,7 @@ fn process<T: Read>(
         }
     }
 
-    #[derive(Tabled)]
-    struct DirEntry {
-        name: &'static str,
-        count: u32,
-    }
-
-    let count_table = vec![
-        DirEntry {
-            name: "unknown",
-            count: mapped_ori_count_global[0],
-        },
-        DirEntry {
-            name: "f",
-            count: mapped_ori_count_global[1],
-        },
-        DirEntry {
-            name: "r",
-            count: mapped_ori_count_global[2],
-        },
-        DirEntry {
-            name: "fr",
-            count: mapped_ori_count_global[3],
-        },
-        DirEntry {
-            name: "rf",
-            count: mapped_ori_count_global[4],
-        },
-        DirEntry {
-            name: "ff",
-            count: mapped_ori_count_global[5],
-        },
-        DirEntry {
-            name: "rr",
-            count: mapped_ori_count_global[6],
-        },
-    ];
+    let count_table = build_ori_table(&mapped_ori_count_global);
 
     info!(
         "\n{}",
@@ -117,7 +121,7 @@ fn process<T: Read>(
     );
 
     if unique_frags < TARGET_UNIQUE_FRAGS {
-        warn!("Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution may not be robust",
+        warn!("Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution estimate may not be robust",
             unique_frags, TARGET_UNIQUE_FRAGS);
     }
     let cond_means = conditional_means(&frag_lengths);

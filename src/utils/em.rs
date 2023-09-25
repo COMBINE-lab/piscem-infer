@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use tracing::info;
 
 pub enum OrientationProperty {
     OrientationAware,
@@ -184,7 +185,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
         }
         niter += 1;
         if niter % 100 == 0 {
-            eprintln!("iteration {}; rel diff {}", niter, rel_diff);
+            info!("iteration {}; rel diff {:.3}", niter, rel_diff);
         }
         rel_diff = 0.0_f64;
     }

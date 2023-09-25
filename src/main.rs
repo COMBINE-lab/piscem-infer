@@ -213,19 +213,6 @@ fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     }
 
-    /*
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::CompactFormat::new(decorator)
-        /*.use_custom_timestamp(|out: &mut dyn std::io::Write| {
-            write!(out, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")).unwrap();
-            Ok(())
-        })*/
-        .build()
-        .fuse();
-    let mut drain = slog_async::Async::new(drain).build().fuse();
-    let log = slog::Logger::root(drain, o!());
-    */
-
     match cli_args.command {
         Commands::Quant {
             input,

@@ -15,7 +15,6 @@ use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::OrientationProperty;
-use crate::utils::map_record_types::MappedFragmentOrientation;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -113,21 +112,8 @@ fn process<T: Read>(
             dir_ints.clear();
 
             for (r, o) in mappings.refs.iter().zip(mappings.dirs.iter()) {
-                let mut y = u32::from(*o);
-                let mut o = o.clone();
-
-                // If these are paired end reads and this is an orphan, then
-                // change the MappedFragmentOrientation to be appropriate for
-                // a single read (rather than the pair).
-                if matches!(
-                    ft,
-                    MappingType::MappedFirstOrphan | MappingType::MappedSecondOrphan
-                ) {
-                    y &= 0b011;
-                    o = MappedFragmentOrientation::from(y as u32);
-                }
-
-                if lib_type.is_compatible_with(o) {
+                let y = u32::from(*o);
+                if lib_type.is_compatible_with(*o) {
                     mapped_ori_count[y as usize] += 1;
                     label_ints.push(*r);
                     dir_ints.push(y);
@@ -137,15 +123,6 @@ fn process<T: Read>(
             }
 
             label_ints.append(&mut dir_ints);
-            /*
-            // extend with the info on the mapping
-            // orientations
-            label_ints.extend(mappings.dirs.iter().map(|x| {
-                let y = u32::from(*x);
-                mapped_ori_count[y as usize] += 1;
-                y
-            }));
-            */
 
             let eql = EqLabel {
                 targets: label_ints.clone(),
@@ -162,9 +139,8 @@ fn process<T: Read>(
 
             // update global orientations
             for i in 0..mapped_ori_count.len() {
-                (*mapped_stats).mapped_ori_count[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
-                (*mapped_stats).filtered_ori_count[i] +=
-                    if filtered_ori_count[i] > 0 { 1 } else { 0 };
+                mapped_stats.mapped_ori_count[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
+                mapped_stats.filtered_ori_count[i] += if filtered_ori_count[i] > 0 { 1 } else { 0 };
             }
         }
     }

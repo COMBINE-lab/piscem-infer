@@ -121,7 +121,12 @@ impl MappedFragmentOrientation {
     pub fn from_u32_paired_status(n: u32, m: MappingType) -> Self {
         // if not paired, then we don't care about
         // the lowest order bit so shift it off
-        if m == MappingType::SingleMapped {
+        if matches!(
+            m,
+            MappingType::SingleMapped
+                | MappingType::MappedFirstOrphan
+                | MappingType::MappedSecondOrphan
+        ) {
             if (n & 0b10) == 2 {
                 MappedFragmentOrientation::Forward
             } else {

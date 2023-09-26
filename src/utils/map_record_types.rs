@@ -1,14 +1,13 @@
+use anyhow::bail;
 use libradicl::rad_types;
 use scroll::Pread;
 use std::io::Read;
 use std::str::FromStr;
-use anyhow::bail;
 
 use crate::utils::custom_rad_utils::*;
 
 const MASK_LOWER_30_BITS: u32 = 0xC0000000;
 const MASK_UPPER_2_BITS: u32 = 0x3FFFFFFF;
-
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum LibraryType {
@@ -18,7 +17,7 @@ pub enum LibraryType {
     InwardStrandedReverse,
     Unstranded,
     InwardUnstranded,
-    Any 
+    Any,
 }
 
 impl FromStr for LibraryType {
@@ -33,7 +32,7 @@ impl FromStr for LibraryType {
             "U" => Ok(Self::Unstranded),
             "IU" => Ok(Self::InwardUnstranded),
             "ANY" => Ok(Self::Any),
-            _ => bail!("{} is an unknown library type!", s)
+            _ => bail!("{} is an unknown library type!", s),
         }
     }
 }
@@ -41,29 +40,28 @@ impl FromStr for LibraryType {
 impl LibraryType {
     pub fn is_compatible_with(&self, fo: MappedFragmentOrientation) -> bool {
         match (&self, fo) {
-        (Self::StrandedForward, MappedFragmentOrientation::Forward) => true,
-        (Self::InwardStrandedForward, MappedFragmentOrientation::Forward) => true,
-        (Self::InwardStrandedForward, MappedFragmentOrientation::ForwardReverse) => true,
+            (Self::StrandedForward, MappedFragmentOrientation::Forward) => true,
+            (Self::InwardStrandedForward, MappedFragmentOrientation::Forward) => true,
+            (Self::InwardStrandedForward, MappedFragmentOrientation::ForwardReverse) => true,
 
-        (Self::StrandedReverse, MappedFragmentOrientation::Reverse) => true,
-        (Self::InwardStrandedReverse, MappedFragmentOrientation::Reverse) => true,
-        (Self::InwardStrandedReverse, MappedFragmentOrientation::ReverseForward) => true,
+            (Self::StrandedReverse, MappedFragmentOrientation::Reverse) => true,
+            (Self::InwardStrandedReverse, MappedFragmentOrientation::Reverse) => true,
+            (Self::InwardStrandedReverse, MappedFragmentOrientation::ReverseForward) => true,
 
-        (Self::Unstranded, MappedFragmentOrientation::Forward) => true,
-        (Self::Unstranded, MappedFragmentOrientation::Reverse) => true,
+            (Self::Unstranded, MappedFragmentOrientation::Forward) => true,
+            (Self::Unstranded, MappedFragmentOrientation::Reverse) => true,
 
-        (Self::InwardUnstranded, MappedFragmentOrientation::Forward) => true,
-        (Self::InwardUnstranded, MappedFragmentOrientation::Reverse) => true,
-        (Self::InwardUnstranded, MappedFragmentOrientation::ForwardReverse) => true,
-        (Self::InwardUnstranded, MappedFragmentOrientation::ReverseForward) => true,
+            (Self::InwardUnstranded, MappedFragmentOrientation::Forward) => true,
+            (Self::InwardUnstranded, MappedFragmentOrientation::Reverse) => true,
+            (Self::InwardUnstranded, MappedFragmentOrientation::ForwardReverse) => true,
+            (Self::InwardUnstranded, MappedFragmentOrientation::ReverseForward) => true,
 
-        (Self::Any, _) => true, 
+            (Self::Any, _) => true,
 
-        (_, _) => false
+            (_, _) => false,
         }
     }
 }
-
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum MappingType {
@@ -97,6 +95,14 @@ impl MappingType {
             // mate flag should be ignored.
             _ => 0b10,
         }
+    }
+
+    #[inline]
+    pub fn is_orphan(&self) -> bool {
+        matches!(
+            &self,
+            MappingType::MappedFirstOrphan | MappingType::MappedSecondOrphan
+        )
     }
 }
 
@@ -216,11 +222,10 @@ impl MetaReadRecord {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::LibraryType;
-    use anyhow::{Error, bail};
+    use anyhow::{bail, Error};
 
     #[test]
     fn lib_types_parse() {
@@ -232,7 +237,7 @@ mod tests {
             LibraryType::InwardStrandedReverse,
             LibraryType::Unstranded,
             LibraryType::InwardUnstranded,
-            LibraryType::Any
+            LibraryType::Any,
         ];
 
         for (ls, lt) in lss.iter().zip(lts.iter()) {
@@ -240,7 +245,6 @@ mod tests {
                 assert_eq!(*lt, pt);
             }
         }
-        
     }
 
     #[test]
@@ -248,8 +252,10 @@ mod tests {
         match "ABC".parse::<LibraryType>() {
             Err(x) => {
                 assert_eq!("ABC is an unknown library type!", format!("{}", x));
-            },
-            _ => { panic!("ABC should not parse!"); }
+            }
+            _ => {
+                panic!("ABC should not parse!");
+            }
         }
     }
 }

@@ -126,6 +126,9 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
     el
 }
 
+const ABSENCE_THRESH: f64 = 1e-8;
+const RELDIFF_THRESH: f64 = 1e-3;
+
 #[inline]
 fn m_step(eq_map: &EqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mut [f64]) {
     for (k, v) in eq_map.iter() {
@@ -171,7 +174,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
 
         //std::mem::swap(&)
         for i in 0..curr_counts.len() {
-            if prev_counts[i] > 1e-8 {
+            if prev_counts[i] > ABSENCE_THRESH {
                 let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
                 rel_diff = if rel_diff > rd { rel_diff } else { rd };
             }
@@ -180,7 +183,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
         std::mem::swap(&mut prev_counts, &mut curr_counts);
         curr_counts.fill(0.0_f64);
 
-        if rel_diff < 1e-3 {
+        if rel_diff < RELDIFF_THRESH {
             break;
         }
         niter += 1;
@@ -191,7 +194,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
     }
 
     prev_counts.iter_mut().for_each(|x| {
-        if *x < 1e-8 {
+        if *x < ABSENCE_THRESH {
             *x = 0.0
         }
     });

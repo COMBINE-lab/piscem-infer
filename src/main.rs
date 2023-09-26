@@ -208,7 +208,7 @@ fn write_results(
     ofile.write_all("target_name\teelen\tecount\n".to_string().as_bytes())?;
 
     for (i, name) in hdr.ref_names.iter().enumerate() {
-        let l = format!("{}\t{}\t{}\n", name, eff_lengths[i], e_counts[i]);
+        let l = format!("{}\t{:.3}\t{:.3}\n", name, eff_lengths[i], e_counts[i]);
         ofile.write_all(l.as_bytes())?;
     }
 

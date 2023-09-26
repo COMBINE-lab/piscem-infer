@@ -15,13 +15,14 @@ use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::OrientationProperty;
-use utils::map_record_types::LibraryType;
+use crate::utils::map_record_types::MappedFragmentOrientation;
+use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
     tot_mappings: usize,
     num_mapped_reads: usize,
     mapped_ori_count: [u32; 7],
-    filtered_ori_count: [u32; 7]
+    filtered_ori_count: [u32; 7],
 }
 
 impl MappedFragStats {
@@ -30,7 +31,7 @@ impl MappedFragStats {
             tot_mappings: 0,
             num_mapped_reads: 0,
             mapped_ori_count: [0u32; 7],
-            filtered_ori_count: [0u32; 7]
+            filtered_ori_count: [0u32; 7],
         }
     }
 }
@@ -79,7 +80,7 @@ fn process<T: Read>(
     nrec: usize,
     frag_map_t: &rad_types::RadIntId,
     lib_type: LibraryType,
-    mapped_stats: &mut MappedFragStats
+    mapped_stats: &mut MappedFragStats,
 ) -> (EqMap, Vec<f64>) {
     // true because it contains orientations
     let mut eqmap = EqMap::new(OrientationProperty::OrientationAware);
@@ -98,6 +99,7 @@ fn process<T: Read>(
     for _ in 0..nrec {
         let c = MetaChunk::from_bytes(br, frag_map_t);
         for mappings in &c.reads {
+            let ft = MappingType::from_u8(mappings.frag_type);
             let nm = mappings.positions.len();
 
             mapped_stats.tot_mappings += nm;
@@ -111,8 +113,21 @@ fn process<T: Read>(
             dir_ints.clear();
 
             for (r, o) in mappings.refs.iter().zip(mappings.dirs.iter()) {
-                let y = u32::from(*o);
-                if lib_type.is_compatible_with(*o) {
+                let mut y = u32::from(*o);
+                let mut o = o.clone();
+
+                // If these are paired end reads and this is an orphan, then
+                // change the MappedFragmentOrientation to be appropriate for
+                // a single read (rather than the pair).
+                if matches!(
+                    ft,
+                    MappingType::MappedFirstOrphan | MappingType::MappedSecondOrphan
+                ) {
+                    y &= 0b011;
+                    o = MappedFragmentOrientation::from(y as u32);
+                }
+
+                if lib_type.is_compatible_with(o) {
                     mapped_ori_count[y as usize] += 1;
                     label_ints.push(*r);
                     dir_ints.push(y);
@@ -140,7 +155,7 @@ fn process<T: Read>(
                 .and_modify(|counter| *counter += 1)
                 .or_insert(1);
 
-            if nm == 1 {
+            if nm == 1 && !ft.is_orphan() {
                 frag_lengths[mappings.frag_lengths[0] as usize] += 1;
                 unique_frags += 1;
             }
@@ -148,7 +163,8 @@ fn process<T: Read>(
             // update global orientations
             for i in 0..mapped_ori_count.len() {
                 (*mapped_stats).mapped_ori_count[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
-                (*mapped_stats).filtered_ori_count[i] += if filtered_ori_count[i] > 0 { 1 } else { 0 };
+                (*mapped_stats).filtered_ori_count[i] +=
+                    if filtered_ori_count[i] > 0 { 1 } else { 0 };
             }
         }
     }
@@ -156,13 +172,17 @@ fn process<T: Read>(
     let count_table_pass = build_ori_table(&mapped_stats.mapped_ori_count);
     info!(
         "mapping counts passing filtering\n{}\n",
-        Table::new(count_table_pass).with(Style::rounded()).to_string()
+        Table::new(count_table_pass)
+            .with(Style::rounded())
+            .to_string()
     );
 
     let count_table_filter = build_ori_table(&mapped_stats.filtered_ori_count);
     info!(
         "mapping counts failing filtering\n{}\n",
-        Table::new(count_table_filter).with(Style::rounded()).to_string()
+        Table::new(count_table_filter)
+            .with(Style::rounded())
+            .to_string()
     );
 
     if unique_frags < TARGET_UNIQUE_FRAGS {

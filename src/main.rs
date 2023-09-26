@@ -15,6 +15,25 @@ use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::OrientationProperty;
+use utils::map_record_types::LibraryType;
+
+struct MappedFragStats {
+    tot_mappings: usize,
+    num_mapped_reads: usize,
+    mapped_ori_count: [u32; 7],
+    filtered_ori_count: [u32; 7]
+}
+
+impl MappedFragStats {
+    pub fn new() -> Self {
+        Self {
+            tot_mappings: 0,
+            num_mapped_reads: 0,
+            mapped_ori_count: [0u32; 7],
+            filtered_ori_count: [0u32; 7]
+        }
+    }
+}
 
 #[derive(Tabled)]
 struct DirEntry {
@@ -59,8 +78,8 @@ fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
     frag_map_t: &rad_types::RadIntId,
-    tot_mappings: &mut usize,
-    num_mapped_reads: &mut usize,
+    lib_type: LibraryType,
+    mapped_stats: &mut MappedFragStats
 ) -> (EqMap, Vec<f64>) {
     // true because it contains orientations
     let mut eqmap = EqMap::new(OrientationProperty::OrientationAware);
@@ -70,21 +89,40 @@ fn process<T: Read>(
     const TARGET_UNIQUE_FRAGS: u32 = 5_000;
     let mut unique_frags = 0u32;
 
-    let mut mapped_ori_count_global = vec![0u32; 7];
     let mut mapped_ori_count = vec![0u32; 7];
+    let mut filtered_ori_count = vec![0u32; 7];
+
+    let mut label_ints = vec![];
+    let mut dir_ints = vec![];
     //let mut dir_vec = vec![0u32, 64];
     for _ in 0..nrec {
         let c = MetaChunk::from_bytes(br, frag_map_t);
         for mappings in &c.reads {
             let nm = mappings.positions.len();
 
-            *tot_mappings += nm;
-            *num_mapped_reads += 1;
-
-            let mut label_ints = mappings.refs.clone();
+            mapped_stats.tot_mappings += nm;
+            mapped_stats.num_mapped_reads += 1;
 
             // reset the counter
             mapped_ori_count.fill(0);
+            filtered_ori_count.fill(0);
+
+            label_ints.clear();
+            dir_ints.clear();
+
+            for (r, o) in mappings.refs.iter().zip(mappings.dirs.iter()) {
+                let y = u32::from(*o);
+                if lib_type.is_compatible_with(*o) {
+                    mapped_ori_count[y as usize] += 1;
+                    label_ints.push(*r);
+                    dir_ints.push(y);
+                } else {
+                    filtered_ori_count[y as usize] += 1;
+                }
+            }
+
+            label_ints.append(&mut dir_ints);
+            /*
             // extend with the info on the mapping
             // orientations
             label_ints.extend(mappings.dirs.iter().map(|x| {
@@ -92,9 +130,10 @@ fn process<T: Read>(
                 mapped_ori_count[y as usize] += 1;
                 y
             }));
+            */
 
             let eql = EqLabel {
-                targets: label_ints,
+                targets: label_ints.clone(),
             };
 
             map.entry(eql)
@@ -108,16 +147,22 @@ fn process<T: Read>(
 
             // update global orientations
             for i in 0..mapped_ori_count.len() {
-                mapped_ori_count_global[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
+                (*mapped_stats).mapped_ori_count[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
+                (*mapped_stats).filtered_ori_count[i] += if filtered_ori_count[i] > 0 { 1 } else { 0 };
             }
         }
     }
 
-    let count_table = build_ori_table(&mapped_ori_count_global);
-
+    let count_table_pass = build_ori_table(&mapped_stats.mapped_ori_count);
     info!(
-        "\n{}",
-        Table::new(count_table).with(Style::rounded()).to_string()
+        "mapping counts passing filtering\n{}\n",
+        Table::new(count_table_pass).with(Style::rounded()).to_string()
+    );
+
+    let count_table_filter = build_ori_table(&mapped_stats.filtered_ori_count);
+    info!(
+        "mapping counts failing filtering\n{}\n",
+        Table::new(count_table_filter).with(Style::rounded()).to_string()
     );
 
     if unique_frags < TARGET_UNIQUE_FRAGS {
@@ -182,6 +227,9 @@ enum Commands {
         /// input stem (i.e. without the .rad suffix)
         #[arg(short, long)]
         input: PathBuf,
+        /// the expected library type
+        #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
+        lib_type: LibraryType,
         /// where output should be written
         #[arg(short, long)]
         output: PathBuf,
@@ -216,6 +264,7 @@ fn main() -> anyhow::Result<()> {
     match cli_args.command {
         Commands::Quant {
             input,
+            lib_type,
             output,
             max_iter,
             convergence_thresh,
@@ -311,14 +360,14 @@ fn main() -> anyhow::Result<()> {
                 ftt.expect("no fragment mapping type description present."),
             )
             .context("unknown fragment mapping type id.")?;
-            let mut tot_mappings = 0usize;
-            let mut num_mapped_reads = 0usize;
+
+            let mut frag_stats = MappedFragStats::new();
             let (eq_map, cond_means) = process(
                 &mut br,
                 hdr.num_chunks as usize,
                 &frag_map_t,
-                &mut tot_mappings,
-                &mut num_mapped_reads,
+                lib_type,
+                &mut frag_stats,
             );
 
             let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
@@ -333,8 +382,8 @@ fn main() -> anyhow::Result<()> {
 
             write_results(output, &hdr, &em_res, &eff_lengths)?;
 
-            info!("num mapped reads = {}", num_mapped_reads);
-            info!("total mappings = {}", tot_mappings);
+            info!("num mapped reads = {}", frag_stats.num_mapped_reads);
+            info!("total mappings = {}", frag_stats.tot_mappings);
             info!("number of equivalence classes = {}", eq_map.len());
             let total_weight: usize = eq_map.count_map.values().sum();
             info!("total equivalence map weight = {}", total_weight);

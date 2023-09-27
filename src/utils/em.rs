@@ -102,6 +102,39 @@ pub fn conditional_means(freq: &[u32]) -> Vec<f64> {
     cond_means
 }
 
+/// Takes as input the parameters of a truncated Normal distribution
+/// with lower bound 0, upper bound `upper`, mean `mu` and standard
+/// deviation `sigma`, and returns the conditional mean of the fragment
+/// length distribution at every value 1 <= i <= `upper`
+pub fn conditional_means_from_params(mu: f64, sigma: f64, upper: usize) -> Vec<f64> {
+    let mut cond_means = vec![0.0f64; upper];
+    let mut vals = vec![0.0f64; upper];
+    let mut multiplicities = vec![0.0f64; upper];
+
+    let inv_sigma = 1.0 / sigma;
+    let denom_b = distrs::Normal::cdf(upper as f64, mu, sigma);
+    let denom_a = distrs::Normal::cdf(0.0_f64, mu, sigma);
+    let denom = denom_b - denom_a;
+    let inv_denom = 1.0_f64 / denom;
+
+    let trunc_pdf = |i: usize| -> f64 {
+        let x = i as f64;
+        inv_sigma * (distrs::Normal::pdf(x, mu, sigma) * inv_denom)
+    };
+
+    multiplicities[0] = trunc_pdf(0);
+    for i in 1..upper {
+        let v = trunc_pdf(i);
+        vals[i] = (v * i as f64) + vals[i - 1];
+        multiplicities[i] = v + multiplicities[i - 1];
+        if multiplicities[i] > 0.0f64 {
+            cond_means[i] = vals[i] / multiplicities[i];
+        }
+    }
+
+    cond_means
+}
+
 /// Go through the set of references (`ref_lens`), and adjust their lengths according to
 /// the computed conditional means `cond_means` of the fragment length distribution.
 pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {

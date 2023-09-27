@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use libradicl::exit_codes;
 use libradicl::rad_types;
@@ -14,6 +14,7 @@ mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
+use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::OrientationProperty;
 use utils::map_record_types::{LibraryType, MappingType};
 
@@ -80,7 +81,7 @@ fn process<T: Read>(
     frag_map_t: &rad_types::RadIntId,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
-) -> (EqMap, Vec<f64>) {
+) -> (EqMap, Vec<u32>) {
     // true because it contains orientations
     let mut eqmap = EqMap::new(OrientationProperty::OrientationAware);
 
@@ -133,7 +134,9 @@ fn process<T: Read>(
                 .or_insert(1);
 
             if nm == 1 && !ft.is_orphan() {
-                frag_lengths[mappings.frag_lengths[0] as usize] += 1;
+                if let Some(fl) = mappings.frag_lengths.first() {
+                    frag_lengths[*fl as usize] += 1;
+                }
                 unique_frags += 1;
             }
 
@@ -165,8 +168,8 @@ fn process<T: Read>(
         warn!("Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution estimate may not be robust",
             unique_frags, TARGET_UNIQUE_FRAGS);
     }
-    let cond_means = conditional_means(&frag_lengths);
-    (eqmap, cond_means)
+
+    (eqmap, frag_lengths)
 }
 
 /// Read the lengths of the reference sequences from the RAD file header.
@@ -235,6 +238,14 @@ enum Commands {
         /// convergence threshold for EM
         #[arg(long, default_value_t = 1e-3)]
         convergence_thresh: f64,
+        /// mean of fragment length distribution mean
+        /// (required, and used, only in the case of unpaired fragments).
+        #[arg(long, requires = "fld_sd")]
+        fld_mean: Option<f64>,
+        /// mean of fragment length distribution standard deviation
+        /// (required, and used, only in the case of unpaired fragments).
+        #[arg(long, requires = "fld_mean")]
+        fld_sd: Option<f64>,
     },
 }
 
@@ -264,15 +275,47 @@ fn main() -> anyhow::Result<()> {
             output,
             max_iter,
             convergence_thresh,
+            fld_mean,
+            fld_sd,
         } => {
             info!("path {:?}", input);
             let mut input_rad = input;
             input_rad.set_extension("rad");
-            let i_file = File::open(input_rad).context("could not open input rad file")?;
+            let i_file = File::open(&input_rad).context("could not open input rad file")?;
             let mut br = BufReader::new(i_file);
+
+            let paired_end: bool;
+            let mut fl_mean = 0_f64;
+            let mut fl_sd = 0_f64;
 
             let hdr = rad_types::RadHeader::from_bytes(&mut br);
             info!("read header!");
+            if hdr.is_paired > 0_u8 {
+                info!("fragments paired in sequencing");
+                paired_end = true;
+                if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
+                    warn!(concat!("provided fragment length distribution mean and sd ({}, {}), but ",
+                                  "the RAD file contains paired-end fragments, so these will be ignored ",
+                                  "and the fragment length distribution will be estimated."), flm, flsd);
+                }
+            } else {
+                info!("fragments unpaired in sequencing");
+                paired_end = false;
+                if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
+                    fl_mean = flm;
+                    fl_sd = flsd;
+                } else {
+                    bail!(
+                        concat!(
+                            "The input RAD file {} was for unpaired reads, so ",
+                            "a fragment length distribution mean and standard deviation ",
+                            "must be provided."
+                        ),
+                        &input_rad.display()
+                    );
+                }
+            }
+
             // file-level
             let fl_tags = rad_types::TagSection::from_bytes(&mut br);
             info!("read {:?} file-level tags", fl_tags.tags.len());
@@ -358,7 +401,7 @@ fn main() -> anyhow::Result<()> {
             .context("unknown fragment mapping type id.")?;
 
             let mut frag_stats = MappedFragStats::new();
-            let (eq_map, cond_means) = process(
+            let (eq_map, frag_lengths) = process(
                 &mut br,
                 hdr.num_chunks as usize,
                 &frag_map_t,
@@ -366,6 +409,11 @@ fn main() -> anyhow::Result<()> {
                 &mut frag_stats,
             );
 
+            let cond_means = if paired_end {
+                conditional_means(&frag_lengths)
+            } else {
+                conditional_means_from_params(fl_mean, fl_sd, 65_636_usize)
+            };
             let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
 
             let eminfo = EMInfo {

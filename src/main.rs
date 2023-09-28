@@ -14,9 +14,9 @@ mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
-use crate::utils::em::PackedEqMap;
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::OrientationProperty;
+use crate::utils::em::PackedEqMap;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -295,9 +295,14 @@ fn main() -> anyhow::Result<()> {
                 info!("fragments paired in sequencing");
                 paired_end = true;
                 if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
-                    warn!(concat!("provided fragment length distribution mean and sd ({}, {}), but ",
-                                  "the RAD file contains paired-end fragments, so these will be ignored ",
-                                  "and the fragment length distribution will be estimated."), flm, flsd);
+                    warn!(
+                        concat!(
+                            "provided fragment length distribution mean and sd ({}, {}), but ",
+                            "the RAD file contains paired-end fragments, so these will be ignored ",
+                            "and the fragment length distribution will be estimated."
+                        ),
+                        flm, flsd
+                    );
                 }
             } else {
                 info!("fragments unpaired in sequencing");

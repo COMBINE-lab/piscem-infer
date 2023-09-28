@@ -35,7 +35,6 @@ pub struct EqMap {
     pub contains_ori: bool,
 }
 
-
 pub struct PackedEqMap {
     /// the packed list of all equivalence class labels
     pub eq_labels: Vec<u32>,
@@ -47,17 +46,16 @@ pub struct PackedEqMap {
     pub eq_label_starts: Vec<u32>,
     /// the vector of counts for each equivalence class
     pub counts: Vec<usize>,
-    /// whether or not the underlying equivalence map was built 
+    /// whether or not the underlying equivalence map was built
     /// with orientation information encoded or not.
-    pub contains_ori: bool
+    pub contains_ori: bool,
 }
-
 
 impl PackedEqMap {
     pub fn from_eq_map(eqm: &EqMap) -> Self {
         let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
         let mut counts = Vec::<usize>::with_capacity(eqm.len());
-        let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.len()+1);
+        let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.len() + 1);
 
         eq_label_starts.push(0);
         for (eq_lab, count) in eqm.iter() {
@@ -70,34 +68,38 @@ impl PackedEqMap {
             eq_labels,
             eq_label_starts,
             counts,
-            contains_ori: eqm.contains_ori
+            contains_ori: eqm.contains_ori,
         }
     }
 
     pub fn refs_for_eqc(&self, idx: usize) -> &[u32] {
         let s: usize = self.eq_label_starts[idx] as usize;
         let e: usize = self.eq_label_starts[idx + 1] as usize;
-        // if we encode orientation, then it's the first half of the 
+        // if we encode orientation, then it's the first half of the
         // label, otherwise it's the whole label.
-        let l = if self.contains_ori { e - s } else { (e - s) >> 1 };
-        &self.eq_labels[s..(s+l)]
+        let l = if self.contains_ori {
+            e - s
+        } else {
+            (e - s) >> 1
+        };
+        &self.eq_labels[s..(s + l)]
     }
 
-    pub fn len(&self) -> usize { 
+    pub fn len(&self) -> usize {
         self.counts.len()
     }
 
     pub fn iter(&self) -> PackedEqEntryIter {
         PackedEqEntryIter {
             counter: 0,
-            underlying_packed_map: &self
+            underlying_packed_map: &self,
         }
     }
 
     pub fn iter_labels(&self) -> PackedEqLabelIter {
         PackedEqLabelIter {
             counter: 0,
-            underlying_packed_map: &self
+            underlying_packed_map: &self,
         }
     }
 }
@@ -131,7 +133,10 @@ impl<'a> Iterator for PackedEqEntryIter<'a> {
         let c = self.counter as usize;
         if c < self.underlying_packed_map.len() {
             self.counter += 1;
-            Some((self.underlying_packed_map.refs_for_eqc(c), &self.underlying_packed_map.counts[c]))
+            Some((
+                self.underlying_packed_map.refs_for_eqc(c),
+                &self.underlying_packed_map.counts[c],
+            ))
         } else {
             None
         }
@@ -266,8 +271,14 @@ const ABSENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 1e-3;
 
 #[inline]
-fn m_step(eq_map: &PackedEqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mut [f64]) {
-    for (k, v) in eq_map.iter() {
+fn m_step(
+    eq_map: &PackedEqMap,
+    eq_counts: &[usize],
+    prev_count: &[f64],
+    eff_lens: &[f64],
+    curr_counts: &mut [f64],
+) {
+    for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
         let mut denom = 0.0_f64;
         let count = *v as f64;
         for target_id in k {
@@ -306,7 +317,13 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
     let mut niter = 0_u32;
 
     while niter < max_iter {
-        m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
+        m_step(
+            eq_map,
+            &eq_map.counts,
+            &prev_counts,
+            eff_lens,
+            &mut curr_counts,
+        );
 
         //std::mem::swap(&)
         for i in 0..curr_counts.len() {
@@ -334,7 +351,13 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
             *x = 0.0
         }
     });
-    m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
+    m_step(
+        eq_map,
+        &eq_map.counts,
+        &prev_counts,
+        eff_lens,
+        &mut curr_counts,
+    );
 
     curr_counts
 }

@@ -4,11 +4,13 @@ use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
 use std::fs::File;
+use std::io::BufWriter;
 use std::io::Write;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use tabled::{settings::Style, Table, Tabled};
 use tracing::{error, info, warn, Level};
+use byteorder::{ByteOrder, LittleEndian};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
@@ -17,6 +19,7 @@ use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMa
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::OrientationProperty;
 use crate::utils::em::PackedEqMap;
+use crate::utils::em::do_bootstrap;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -247,6 +250,12 @@ enum Commands {
         /// (required, and used, only in the case of unpaired fragments).
         #[arg(long, requires = "fld_mean")]
         fld_sd: Option<f64>,
+        /// number of bootstrap replicates to perform. 
+        #[arg(long, default_value_t = 0)]
+        num_bootstraps: usize,
+        /// number of threads to use (only used for bootstrapping)
+        #[arg(long, default_value_t = 16)]
+        num_threads: usize,
     },
 }
 
@@ -278,6 +287,8 @@ fn main() -> anyhow::Result<()> {
             convergence_thresh,
             fld_mean,
             fld_sd,
+            num_bootstraps,
+            num_threads
         } => {
             info!("path {:?}", input);
             let mut input_rad = input;
@@ -432,13 +443,27 @@ fn main() -> anyhow::Result<()> {
             };
             let em_res = em(&eminfo);
 
-            write_results(output, &hdr, &em_res, &eff_lengths)?;
+            write_results(output.clone(), &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
             info!("total mappings = {}", frag_stats.tot_mappings);
             info!("number of equivalence classes = {}", eq_map.len());
             let total_weight: usize = eq_map.count_map.values().sum();
             info!("total equivalence map weight = {}", total_weight);
+
+            if num_bootstraps > 0 { 
+                info!("performing bootstraps");
+                let p = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
+                let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
+
+                let mut fname: String = output.clone().to_string_lossy().into();
+                let mut ofile = File::create(fname + ".boot")?;
+                let mut buff = vec![0_u8; 8*bootstraps[0].len()];
+                for b in &bootstraps {
+                    LittleEndian::write_f64_into(&b, &mut buff);
+                    ofile.write_all(&buff);
+                }
+            }
         }
     }
     Ok(())

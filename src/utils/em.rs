@@ -1,5 +1,9 @@
 use ahash::AHashMap;
 use tracing::info;
+use rand_distr::WeightedAliasIndex;
+use rand::prelude::*;
+use rayon::prelude::*;
+use rand::{Rng, thread_rng};
 
 pub enum OrientationProperty {
     OrientationAware,
@@ -300,6 +304,79 @@ pub struct EMInfo<'eqm, 'el> {
     pub eff_lens: &'el [f64],
     pub max_iter: u32,
     pub convergence_thresh: f64,
+}
+
+pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
+    let eq_map = em_info.eq_map;
+    let max_iter = em_info.max_iter;
+    let eff_lens = em_info.eff_lens;
+    let total_weight = em_info.eq_map.counts.iter().sum::<usize>();
+    // init
+    let avg = (total_weight as f64) / (eff_lens.len() as f64);
+    let dist = WeightedAliasIndex::new(em_info.eq_map.counts.clone()).unwrap();
+
+    //let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
+
+    let r = (0..num_boot)
+        .into_par_iter()
+        .map(|i| {
+            info!("evaluating bootstrap replicate {}", i);
+            let mut prev_counts = vec![avg; eff_lens.len()];
+            let mut curr_counts = vec![0.0f64; eff_lens.len()];
+
+            let mut rel_diff = 0.0_f64;
+            let mut niter = 0_u32;
+            let mut rng = thread_rng();
+            let mut base_counts = vec![0_usize; eq_map.counts.len()];
+            for _s in 0..total_weight {
+                base_counts[dist.sample(&mut rng)] += 1;
+            }
+
+            while niter < max_iter {
+                m_step(
+                    eq_map,
+                    &base_counts,
+                    &prev_counts,
+                    eff_lens,
+                    &mut curr_counts,
+                );
+
+                //std::mem::swap(&)
+                for i in 0..curr_counts.len() {
+                    if prev_counts[i] > ABSENCE_THRESH {
+                        let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
+                        rel_diff = if rel_diff > rd { rel_diff } else { rd };
+                    }
+                }
+
+                std::mem::swap(&mut prev_counts, &mut curr_counts);
+                curr_counts.fill(0.0_f64);
+
+                if rel_diff < RELDIFF_THRESH {
+                    break;
+                }
+                niter += 1;
+                rel_diff = 0.0_f64;
+            }
+
+            prev_counts.iter_mut().for_each(|x| {
+                if *x < ABSENCE_THRESH {
+                    *x = 0.0
+                }
+            });
+            m_step(
+                eq_map,
+                &base_counts,
+                &prev_counts,
+                eff_lens,
+                &mut curr_counts,
+            );
+
+            curr_counts
+        })
+        .collect();
+
+    r
 }
 
 pub fn em(em_info: &EMInfo) -> Vec<f64> {

@@ -14,6 +14,7 @@ mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
+use crate::utils::em::PackedEqMap;
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::OrientationProperty;
 use utils::map_record_types::{LibraryType, MappingType};
@@ -416,8 +417,10 @@ fn main() -> anyhow::Result<()> {
             };
             let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
 
+            let packed_eq_map = PackedEqMap::from_eq_map(&eq_map);
+
             let eminfo = EMInfo {
-                eq_map: &eq_map,
+                eq_map: &packed_eq_map,
                 eff_lens: &eff_lengths,
                 max_iter,
                 convergence_thresh,

@@ -1,10 +1,13 @@
 use anyhow::{bail, Context};
+use clap::Args;
 use clap::{Parser, Subcommand};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
+use serde::Serialize;
+use serde_json::json;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
@@ -223,41 +226,44 @@ fn write_results(
     Ok(())
 }
 
+#[derive(Args, Serialize, Clone, Debug)]
+pub struct QuantOpts {
+    /// input stem (i.e. without the .rad suffix)
+    #[arg(short, long)]
+    pub input: PathBuf,
+    /// the expected library type
+    #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
+    pub lib_type: LibraryType,
+    /// output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// max iterations to run the EM
+    #[arg(short, long, default_value_t = 1500)]
+    pub max_iter: u32,
+    /// convergence threshold for EM
+    #[arg(long, default_value_t = 1e-3)]
+    pub convergence_thresh: f64,
+    /// mean of fragment length distribution mean
+    /// (required, and used, only in the case of unpaired fragments).
+    #[arg(long, requires = "fld_sd")]
+    pub fld_mean: Option<f64>,
+    /// mean of fragment length distribution standard deviation
+    /// (required, and used, only in the case of unpaired fragments).
+    #[arg(long, requires = "fld_mean")]
+    pub fld_sd: Option<f64>,
+    /// number of bootstrap replicates to perform.
+    #[arg(long, default_value_t = 0)]
+    pub num_bootstraps: usize,
+    /// number of threads to use (only used for bootstrapping)
+    #[arg(long, default_value_t = 16)]
+    pub num_threads: usize,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// quantify from the rad file
     #[command(arg_required_else_help = true)]
-    Quant {
-        /// input stem (i.e. without the .rad suffix)
-        #[arg(short, long)]
-        input: PathBuf,
-        /// the expected library type
-        #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
-        lib_type: LibraryType,
-        /// output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
-        #[arg(short, long)]
-        output: PathBuf,
-        /// max iterations to run the EM
-        #[arg(short, long, default_value_t = 1500)]
-        max_iter: u32,
-        /// convergence threshold for EM
-        #[arg(long, default_value_t = 1e-3)]
-        convergence_thresh: f64,
-        /// mean of fragment length distribution mean
-        /// (required, and used, only in the case of unpaired fragments).
-        #[arg(long, requires = "fld_sd")]
-        fld_mean: Option<f64>,
-        /// mean of fragment length distribution standard deviation
-        /// (required, and used, only in the case of unpaired fragments).
-        #[arg(long, requires = "fld_mean")]
-        fld_sd: Option<f64>,
-        /// number of bootstrap replicates to perform.
-        #[arg(long, default_value_t = 0)]
-        num_bootstraps: usize,
-        /// number of threads to use (only used for bootstrapping)
-        #[arg(long, default_value_t = 16)]
-        num_threads: usize,
-    },
+    Quant(QuantOpts),
 }
 
 /// quantifying from a metagenomic rad file
@@ -296,17 +302,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli_args.command {
-        Commands::Quant {
-            input,
-            lib_type,
-            output,
-            max_iter,
-            convergence_thresh,
-            fld_mean,
-            fld_sd,
-            num_bootstraps,
-            num_threads,
-        } => {
+        Commands::Quant(quant_opts) => {
+            let input = quant_opts.input.clone();
+            let lib_type = quant_opts.lib_type;
+            let output = quant_opts.output.clone();
+            let max_iter = quant_opts.max_iter;
+            let convergence_thresh = quant_opts.convergence_thresh;
+            let fld_mean = quant_opts.fld_mean;
+            let fld_sd = quant_opts.fld_sd;
+            let num_bootstraps = quant_opts.num_bootstraps;
+            let num_threads = quant_opts.num_threads;
+
             info!("path {:?}", input);
             let mut input_rad = input;
             input_rad.set_extension("rad");
@@ -475,13 +481,21 @@ fn main() -> anyhow::Result<()> {
                     .num_threads(num_threads)
                     .build_global()?;
                 let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
-
                 let boot_output = append_to_path(output.clone(), ".infrep.gz");
                 let mut ofile = GzEncoder::new(File::create(boot_output)?, Compression::default());
                 for b in &bootstraps {
                     ofile.write_all(as_u8_slice(&b))?;
                 }
             }
+
+            let meta_info_output = append_to_path(output, ".meta_info.json");
+            let ofile = File::create(meta_info_output)?;
+            let meta_info = json!({
+                "quant_opts": quant_opts,
+                "num_bootstraps": num_bootstraps,
+                "num_targets": eff_lengths.len(),
+            });
+            serde_json::to_writer_pretty(ofile, &meta_info)?;
         }
     }
     Ok(())

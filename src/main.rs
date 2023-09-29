@@ -1,8 +1,8 @@
 use anyhow::{bail, Context};
 use arrow2::{
-    array::{Array, Float64Array, StructArray, UInt32Array},
+    array::{Float64Array, UInt32Array},
     chunk::Chunk,
-    datatypes::{DataType, Field, Schema},
+    datatypes::Field,
 };
 
 use clap::Args;
@@ -12,23 +12,22 @@ use libradicl::rad_types;
 use scroll::Pread;
 use serde::Serialize;
 use serde_json::json;
-use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tabled::{settings::Style, Table, Tabled};
 use tracing::{error, info, warn, Level};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
-use utils::parquet_utils::write_chunk_to_file;
 
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::do_bootstrap;
 use crate::utils::em::OrientationProperty;
 use crate::utils::em::PackedEqMap;
+use crate::utils::io;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -291,13 +290,6 @@ pub fn as_u8_slice<T: Sized>(p: &[T]) -> &[u8] {
     body
 }
 
-// from: https://stackoverflow.com/questions/74322541/how-to-append-to-pathbuf
-fn append_to_path(p: impl Into<OsString>, s: impl AsRef<OsStr>) -> PathBuf {
-    let mut p = p.into();
-    p.push(s);
-    p.into()
-}
-
 fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
     if cli_args.quiet {
@@ -317,6 +309,16 @@ fn main() -> anyhow::Result<()> {
             let fld_sd = quant_opts.fld_sd;
             let num_bootstraps = quant_opts.num_bootstraps;
             let num_threads = quant_opts.num_threads;
+
+            // if there is a parent directory
+            if let Some(p) = output.parent() {
+                // unless this was a relative path with one component,
+                // which we should treat as the file prefix, then grab
+                // the non-empty parent and create it.
+                if p != Path::new("") {
+                    create_dir_all(p)?;
+                }
+            }
 
             info!("path {:?}", input);
             let mut input_rad = input;
@@ -471,7 +473,7 @@ fn main() -> anyhow::Result<()> {
             };
             let em_res = em(&eminfo);
 
-            let quant_output = append_to_path(output.clone(), ".quant");
+            let quant_output = io::append_to_path(output.clone(), ".quant");
             write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
@@ -487,10 +489,7 @@ fn main() -> anyhow::Result<()> {
 
                 let chunk = Chunk::new(vec![fld_array.boxed()]);
                 let fields = vec![field];
-
-                let output_path = append_to_path(output.clone(), ".fld.pq");
-                let schema = Schema::from(fields);
-                write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)?;
+                io::write_fld_file(&output, fields, chunk)?;
             }
 
             if num_bootstraps > 0 {
@@ -500,31 +499,22 @@ fn main() -> anyhow::Result<()> {
                     .build_global()?;
                 let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
 
-                let output_path = append_to_path(output.clone(), ".infreps.pq");
                 let mut new_arrays = vec![];
                 let mut bs_fields = vec![];
-
                 for (i, b) in bootstraps.into_iter().enumerate() {
                     let bs_array = Float64Array::from_vec(b);
                     bs_fields.push(Field::new(
-                        format!("bootstrap_{}", i),
+                        format!("bootstrap.{}", i),
                         bs_array.data_type().clone(),
                         false,
                     ));
                     new_arrays.push(bs_array.boxed());
                 }
-                let struct_array = StructArray::new(DataType::Struct(bs_fields), new_arrays, None);
-                let fields = vec![Field::new(
-                    "bootstraps",
-                    struct_array.data_type().clone(),
-                    false,
-                )];
-                let chunk = Chunk::new(vec![struct_array.boxed()]);
-                let schema = Schema::from(fields);
-                write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)?;
+                let chunk = Chunk::new(new_arrays);
+                io::write_infrep_file(&output, bs_fields, chunk)?;
             }
 
-            let meta_info_output = append_to_path(output, ".meta_info.json");
+            let meta_info_output = io::append_to_path(output, ".meta_info.json");
             let ofile = File::create(meta_info_output)?;
             let meta_info = json!({
                 "quant_opts": quant_opts,

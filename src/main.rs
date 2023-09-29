@@ -1,8 +1,14 @@
 use anyhow::{bail, Context};
+use clap::Args;
 use clap::{Parser, Subcommand};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
+use serde::Serialize;
+use serde_json::json;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
 use std::io::{BufReader, Read};
@@ -15,7 +21,9 @@ use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::conditional_means_from_params;
+use crate::utils::em::do_bootstrap;
 use crate::utils::em::OrientationProperty;
+use crate::utils::em::PackedEqMap;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -218,35 +226,44 @@ fn write_results(
     Ok(())
 }
 
+#[derive(Args, Serialize, Clone, Debug)]
+pub struct QuantOpts {
+    /// input stem (i.e. without the .rad suffix)
+    #[arg(short, long)]
+    pub input: PathBuf,
+    /// the expected library type
+    #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
+    pub lib_type: LibraryType,
+    /// output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// max iterations to run the EM
+    #[arg(short, long, default_value_t = 1500)]
+    pub max_iter: u32,
+    /// convergence threshold for EM
+    #[arg(long, default_value_t = 1e-3)]
+    pub convergence_thresh: f64,
+    /// mean of fragment length distribution mean
+    /// (required, and used, only in the case of unpaired fragments).
+    #[arg(long, requires = "fld_sd")]
+    pub fld_mean: Option<f64>,
+    /// mean of fragment length distribution standard deviation
+    /// (required, and used, only in the case of unpaired fragments).
+    #[arg(long, requires = "fld_mean")]
+    pub fld_sd: Option<f64>,
+    /// number of bootstrap replicates to perform.
+    #[arg(long, default_value_t = 0)]
+    pub num_bootstraps: usize,
+    /// number of threads to use (only used for bootstrapping)
+    #[arg(long, default_value_t = 16)]
+    pub num_threads: usize,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// quantify from the rad file
     #[command(arg_required_else_help = true)]
-    Quant {
-        /// input stem (i.e. without the .rad suffix)
-        #[arg(short, long)]
-        input: PathBuf,
-        /// the expected library type
-        #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
-        lib_type: LibraryType,
-        /// where output should be written
-        #[arg(short, long)]
-        output: PathBuf,
-        /// max iterations to run the EM
-        #[arg(short, long, default_value_t = 1500)]
-        max_iter: u32,
-        /// convergence threshold for EM
-        #[arg(long, default_value_t = 1e-3)]
-        convergence_thresh: f64,
-        /// mean of fragment length distribution mean
-        /// (required, and used, only in the case of unpaired fragments).
-        #[arg(long, requires = "fld_sd")]
-        fld_mean: Option<f64>,
-        /// mean of fragment length distribution standard deviation
-        /// (required, and used, only in the case of unpaired fragments).
-        #[arg(long, requires = "fld_mean")]
-        fld_sd: Option<f64>,
-    },
+    Quant(QuantOpts),
 }
 
 /// quantifying from a metagenomic rad file
@@ -260,6 +277,22 @@ struct Cli {
     command: Commands,
 }
 
+/// https://github.com/polymonster/hotline/blob/05afabb353355e22afea3884bdf3da92bd572da4/src/gfx.rs#L1384
+/// Take any sized silce and convert to a slice of u8
+pub fn as_u8_slice<T: Sized>(p: &[T]) -> &[u8] {
+    let (prefix, body, suffix) = unsafe { p.align_to::<u8>() };
+    assert!(prefix.is_empty());
+    assert!(suffix.is_empty());
+    body
+}
+
+// from: https://stackoverflow.com/questions/74322541/how-to-append-to-pathbuf
+fn append_to_path(p: impl Into<OsString>, s: impl AsRef<OsStr>) -> PathBuf {
+    let mut p = p.into();
+    p.push(s);
+    p.into()
+}
+
 fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
     if cli_args.quiet {
@@ -269,15 +302,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli_args.command {
-        Commands::Quant {
-            input,
-            lib_type,
-            output,
-            max_iter,
-            convergence_thresh,
-            fld_mean,
-            fld_sd,
-        } => {
+        Commands::Quant(quant_opts) => {
+            let input = quant_opts.input.clone();
+            let lib_type = quant_opts.lib_type;
+            let output = quant_opts.output.clone();
+            let max_iter = quant_opts.max_iter;
+            let convergence_thresh = quant_opts.convergence_thresh;
+            let fld_mean = quant_opts.fld_mean;
+            let fld_sd = quant_opts.fld_sd;
+            let num_bootstraps = quant_opts.num_bootstraps;
+            let num_threads = quant_opts.num_threads;
+
             info!("path {:?}", input);
             let mut input_rad = input;
             input_rad.set_extension("rad");
@@ -294,9 +329,14 @@ fn main() -> anyhow::Result<()> {
                 info!("fragments paired in sequencing");
                 paired_end = true;
                 if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
-                    warn!(concat!("provided fragment length distribution mean and sd ({}, {}), but ",
-                                  "the RAD file contains paired-end fragments, so these will be ignored ",
-                                  "and the fragment length distribution will be estimated."), flm, flsd);
+                    warn!(
+                        concat!(
+                            "provided fragment length distribution mean and sd ({}, {}), but ",
+                            "the RAD file contains paired-end fragments, so these will be ignored ",
+                            "and the fragment length distribution will be estimated."
+                        ),
+                        flm, flsd
+                    );
                 }
             } else {
                 info!("fragments unpaired in sequencing");
@@ -416,21 +456,46 @@ fn main() -> anyhow::Result<()> {
             };
             let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
 
+            let packed_eq_map = PackedEqMap::from_eq_map(&eq_map);
+
             let eminfo = EMInfo {
-                eq_map: &eq_map,
+                eq_map: &packed_eq_map,
                 eff_lens: &eff_lengths,
                 max_iter,
                 convergence_thresh,
             };
             let em_res = em(&eminfo);
 
-            write_results(output, &hdr, &em_res, &eff_lengths)?;
+            let quant_output = append_to_path(output.clone(), ".quant");
+            write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
             info!("total mappings = {}", frag_stats.tot_mappings);
             info!("number of equivalence classes = {}", eq_map.len());
             let total_weight: usize = eq_map.count_map.values().sum();
             info!("total equivalence map weight = {}", total_weight);
+
+            if num_bootstraps > 0 {
+                info!("performing bootstraps");
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build_global()?;
+                let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
+                let boot_output = append_to_path(output.clone(), ".infrep.gz");
+                let mut ofile = GzEncoder::new(File::create(boot_output)?, Compression::default());
+                for b in &bootstraps {
+                    ofile.write_all(as_u8_slice(b))?;
+                }
+            }
+
+            let meta_info_output = append_to_path(output, ".meta_info.json");
+            let ofile = File::create(meta_info_output)?;
+            let meta_info = json!({
+                "quant_opts": quant_opts,
+                "num_bootstraps": num_bootstraps,
+                "num_targets": eff_lengths.len(),
+            });
+            serde_json::to_writer_pretty(ofile, &meta_info)?;
         }
     }
     Ok(())

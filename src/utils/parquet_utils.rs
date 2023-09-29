@@ -2,7 +2,6 @@ use arrow2::{
     array::Array,
     chunk::Chunk,
     datatypes::Schema,
-    error::Result,
     io::parquet::write::{
         transverse, CompressionOptions, Encoding, FileWriter, RowGroupIterator, Version,
         WriteOptions,
@@ -14,7 +13,7 @@ pub(crate) fn write_chunk_to_file(
     path: &str,
     schema: Schema,
     chunk: Chunk<Box<dyn Array>>,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let options = WriteOptions {
         write_statistics: true,
         compression: CompressionOptions::Zstd(None),

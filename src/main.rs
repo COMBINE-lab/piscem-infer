@@ -1,18 +1,21 @@
 use anyhow::{bail, Context};
+use arrow2::{
+    array::{Float64Array, UInt32Array},
+    chunk::Chunk,
+    datatypes::Field,
+};
+
 use clap::Args;
 use clap::{Parser, Subcommand};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
 use serde::Serialize;
 use serde_json::json;
-use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tabled::{settings::Style, Table, Tabled};
 use tracing::{error, info, warn, Level};
 
@@ -24,6 +27,7 @@ use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::do_bootstrap;
 use crate::utils::em::OrientationProperty;
 use crate::utils::em::PackedEqMap;
+use crate::utils::io;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -181,7 +185,7 @@ fn process<T: Read>(
 }
 
 /// Read the lengths of the reference sequences from the RAD file header.
-fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error> {
+fn read_ref_lengths<T: Read>(reader: &mut T) -> anyhow::Result<Vec<u32>> {
     let mut rbuf = [0u8; 8];
 
     // read type of length
@@ -286,13 +290,6 @@ pub fn as_u8_slice<T: Sized>(p: &[T]) -> &[u8] {
     body
 }
 
-// from: https://stackoverflow.com/questions/74322541/how-to-append-to-pathbuf
-fn append_to_path(p: impl Into<OsString>, s: impl AsRef<OsStr>) -> PathBuf {
-    let mut p = p.into();
-    p.push(s);
-    p.into()
-}
-
 fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
     if cli_args.quiet {
@@ -312,6 +309,16 @@ fn main() -> anyhow::Result<()> {
             let fld_sd = quant_opts.fld_sd;
             let num_bootstraps = quant_opts.num_bootstraps;
             let num_threads = quant_opts.num_threads;
+
+            // if there is a parent directory
+            if let Some(p) = output.parent() {
+                // unless this was a relative path with one component,
+                // which we should treat as the file prefix, then grab
+                // the non-empty parent and create it.
+                if p != Path::new("") {
+                    create_dir_all(p)?;
+                }
+            }
 
             info!("path {:?}", input);
             let mut input_rad = input;
@@ -466,7 +473,7 @@ fn main() -> anyhow::Result<()> {
             };
             let em_res = em(&eminfo);
 
-            let quant_output = append_to_path(output.clone(), ".quant");
+            let quant_output = io::append_to_path(output.clone(), ".quant");
             write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
@@ -475,20 +482,39 @@ fn main() -> anyhow::Result<()> {
             let total_weight: usize = eq_map.count_map.values().sum();
             info!("total equivalence map weight = {}", total_weight);
 
+            {
+                let fld_array = UInt32Array::from_vec(frag_lengths);
+                let field =
+                    Field::new("fragment_length_dist", fld_array.data_type().clone(), false);
+
+                let chunk = Chunk::new(vec![fld_array.boxed()]);
+                let fields = vec![field];
+                io::write_fld_file(&output, fields, chunk)?;
+            }
+
             if num_bootstraps > 0 {
                 info!("performing bootstraps");
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(num_threads)
                     .build_global()?;
                 let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
-                let boot_output = append_to_path(output.clone(), ".infrep.gz");
-                let mut ofile = GzEncoder::new(File::create(boot_output)?, Compression::default());
-                for b in &bootstraps {
-                    ofile.write_all(as_u8_slice(b))?;
+
+                let mut new_arrays = vec![];
+                let mut bs_fields = vec![];
+                for (i, b) in bootstraps.into_iter().enumerate() {
+                    let bs_array = Float64Array::from_vec(b);
+                    bs_fields.push(Field::new(
+                        format!("bootstrap.{}", i),
+                        bs_array.data_type().clone(),
+                        false,
+                    ));
+                    new_arrays.push(bs_array.boxed());
                 }
+                let chunk = Chunk::new(new_arrays);
+                io::write_infrep_file(&output, bs_fields, chunk)?;
             }
 
-            let meta_info_output = append_to_path(output, ".meta_info.json");
+            let meta_info_output = io::append_to_path(output, ".meta_info.json");
             let ofile = File::create(meta_info_output)?;
             let meta_info = json!({
                 "quant_opts": quant_opts,

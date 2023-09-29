@@ -281,8 +281,8 @@ struct Cli {
 /// Take any sized silce and convert to a slice of u8
 pub fn as_u8_slice<T: Sized>(p: &[T]) -> &[u8] {
     let (prefix, body, suffix) = unsafe { p.align_to::<u8>() };
-    assert!(prefix.len() == 0);
-    assert!(suffix.len() == 0);
+    assert!(prefix.is_empty());
+    assert!(suffix.is_empty());
     body
 }
 
@@ -477,14 +477,14 @@ fn main() -> anyhow::Result<()> {
 
             if num_bootstraps > 0 {
                 info!("performing bootstraps");
-                let _p = rayon::ThreadPoolBuilder::new()
+                rayon::ThreadPoolBuilder::new()
                     .num_threads(num_threads)
                     .build_global()?;
                 let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
                 let boot_output = append_to_path(output.clone(), ".infrep.gz");
                 let mut ofile = GzEncoder::new(File::create(boot_output)?, Compression::default());
                 for b in &bootstraps {
-                    ofile.write_all(as_u8_slice(&b))?;
+                    ofile.write_all(as_u8_slice(b))?;
                 }
             }
 

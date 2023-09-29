@@ -97,14 +97,14 @@ impl PackedEqMap {
     pub fn iter(&self) -> PackedEqEntryIter {
         PackedEqEntryIter {
             counter: 0,
-            underlying_packed_map: &self,
+            underlying_packed_map: self,
         }
     }
 
     pub fn iter_labels(&self) -> PackedEqLabelIter {
         PackedEqLabelIter {
             counter: 0,
-            underlying_packed_map: &self,
+            underlying_packed_map: self,
         }
     }
 }
@@ -316,9 +316,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
     let avg = (total_weight as f64) / (eff_lens.len() as f64);
     let dist = WeightedAliasIndex::new(em_info.eq_map.counts.clone()).unwrap();
 
-    //let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
-
-    let r = (0..num_boot)
+    (0..num_boot)
         .into_par_iter()
         .map(|i| {
             info!("evaluating bootstrap replicate {}", i);
@@ -375,9 +373,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
 
             curr_counts
         })
-        .collect();
-
-    r
+        .collect()
 }
 
 pub fn em(em_info: &EMInfo) -> Vec<f64> {

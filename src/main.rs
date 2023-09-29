@@ -13,7 +13,6 @@ use scroll::Pread;
 use serde::Serialize;
 use serde_json::json;
 use std::fs::{create_dir_all, File};
-use std::io::Write;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use tabled::{settings::Style, Table, Tabled};
@@ -30,6 +29,7 @@ use crate::utils::em::PackedEqMap;
 use crate::utils::io;
 use utils::map_record_types::{LibraryType, MappingType};
 
+#[derive(Serialize)]
 struct MappedFragStats {
     tot_mappings: usize,
     num_mapped_reads: usize,
@@ -210,24 +210,6 @@ fn read_ref_lengths<T: Read>(reader: &mut T) -> anyhow::Result<Vec<u32>> {
     }
 
     Ok(vec)
-}
-
-fn write_results(
-    output: PathBuf,
-    hdr: &rad_types::RadHeader,
-    e_counts: &[f64],
-    eff_lengths: &[f64],
-) -> anyhow::Result<()> {
-    let mut ofile = File::create(output)?;
-
-    ofile.write_all("target_name\teelen\tecount\n".to_string().as_bytes())?;
-
-    for (i, name) in hdr.ref_names.iter().enumerate() {
-        let l = format!("{}\t{:.3}\t{:.3}\n", name, eff_lengths[i], e_counts[i]);
-        ofile.write_all(l.as_bytes())?;
-    }
-
-    Ok(())
 }
 
 #[derive(Args, Serialize, Clone, Debug)]
@@ -474,7 +456,7 @@ fn main() -> anyhow::Result<()> {
             let em_res = em(&eminfo);
 
             let quant_output = io::append_to_path(output.clone(), ".quant");
-            write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
+            io::write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
             info!("total mappings = {}", frag_stats.tot_mappings);
@@ -518,6 +500,7 @@ fn main() -> anyhow::Result<()> {
             let ofile = File::create(meta_info_output)?;
             let meta_info = json!({
                 "quant_opts": quant_opts,
+                "mapped_frag_stats": frag_stats,
                 "num_bootstraps": num_bootstraps,
                 "num_targets": eff_lengths.len(),
             });

@@ -1,4 +1,8 @@
 use ahash::AHashMap;
+use rand::prelude::*;
+use rand::thread_rng;
+use rand_distr::WeightedAliasIndex;
+use rayon::prelude::*;
 use tracing::info;
 
 pub enum OrientationProperty {
@@ -33,6 +37,115 @@ impl EqLabel {
 pub struct EqMap {
     pub count_map: AHashMap<EqLabel, usize>,
     pub contains_ori: bool,
+}
+
+pub struct PackedEqMap {
+    /// the packed list of all equivalence class labels
+    pub eq_labels: Vec<u32>,
+    /// vector that deliniates where each equivalence class label
+    /// begins and ends.  The label for equivalence class i begins
+    /// at offset eq_label_starts[i], and it ends at
+    /// eq_label_starts[i+1].  The length of this vector is 1 greater
+    /// than the number of equivalence classes.
+    pub eq_label_starts: Vec<u32>,
+    /// the vector of counts for each equivalence class
+    pub counts: Vec<usize>,
+    /// whether or not the underlying equivalence map was built
+    /// with orientation information encoded or not.
+    pub contains_ori: bool,
+}
+
+impl PackedEqMap {
+    pub fn from_eq_map(eqm: &EqMap) -> Self {
+        let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
+        let mut counts = Vec::<usize>::with_capacity(eqm.len());
+        let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.len() + 1);
+
+        eq_label_starts.push(0);
+        for (eq_lab, count) in eqm.iter() {
+            eq_labels.extend_from_slice(eq_lab);
+            eq_label_starts.push(eq_labels.len() as u32);
+            counts.push(*count);
+        }
+
+        Self {
+            eq_labels,
+            eq_label_starts,
+            counts,
+            contains_ori: eqm.contains_ori,
+        }
+    }
+
+    pub fn refs_for_eqc(&self, idx: usize) -> &[u32] {
+        let s: usize = self.eq_label_starts[idx] as usize;
+        let e: usize = self.eq_label_starts[idx + 1] as usize;
+        // if we encode orientation, then it's the first half of the
+        // label, otherwise it's the whole label.
+        let l = if self.contains_ori {
+            e - s
+        } else {
+            (e - s) >> 1
+        };
+        &self.eq_labels[s..(s + l)]
+    }
+
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn iter(&self) -> PackedEqEntryIter {
+        PackedEqEntryIter {
+            counter: 0,
+            underlying_packed_map: self,
+        }
+    }
+
+    pub fn iter_labels(&self) -> PackedEqLabelIter {
+        PackedEqLabelIter {
+            counter: 0,
+            underlying_packed_map: self,
+        }
+    }
+}
+
+pub struct PackedEqLabelIter<'a> {
+    counter: u32,
+    underlying_packed_map: &'a PackedEqMap,
+}
+
+impl<'a> Iterator for PackedEqLabelIter<'a> {
+    type Item = &'a [u32];
+    fn next(&mut self) -> Option<Self::Item> {
+        let c = self.counter as usize;
+        if c < self.underlying_packed_map.len() {
+            self.counter += 1;
+            Some(self.underlying_packed_map.refs_for_eqc(c))
+        } else {
+            None
+        }
+    }
+}
+
+pub struct PackedEqEntryIter<'a> {
+    counter: u32,
+    underlying_packed_map: &'a PackedEqMap,
+}
+
+impl<'a> Iterator for PackedEqEntryIter<'a> {
+    type Item = (&'a [u32], &'a usize);
+    fn next(&mut self) -> Option<Self::Item> {
+        let c = self.counter as usize;
+        if c < self.underlying_packed_map.len() {
+            self.counter += 1;
+            Some((
+                self.underlying_packed_map.refs_for_eqc(c),
+                &self.underlying_packed_map.counts[c],
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 impl EqMap {
@@ -163,8 +276,14 @@ const ABSENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 1e-3;
 
 #[inline]
-fn m_step(eq_map: &EqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mut [f64]) {
-    for (k, v) in eq_map.iter() {
+fn m_step(
+    eq_map: &PackedEqMap,
+    eq_counts: &[usize],
+    prev_count: &[f64],
+    eff_lens: &[f64],
+    curr_counts: &mut [f64],
+) {
+    for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
         let mut denom = 0.0_f64;
         let count = *v as f64;
         for target_id in k {
@@ -182,17 +301,86 @@ fn m_step(eq_map: &EqMap, prev_count: &[f64], eff_lens: &[f64], curr_counts: &mu
 
 /// Holds the info relevant for running the EM algorithm
 pub struct EMInfo<'eqm, 'el> {
-    pub eq_map: &'eqm EqMap,
+    pub eq_map: &'eqm PackedEqMap,
     pub eff_lens: &'el [f64],
     pub max_iter: u32,
     pub convergence_thresh: f64,
+}
+
+pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
+    let eq_map = em_info.eq_map;
+    let max_iter = em_info.max_iter;
+    let eff_lens = em_info.eff_lens;
+    let total_weight = em_info.eq_map.counts.iter().sum::<usize>();
+    // init
+    let avg = (total_weight as f64) / (eff_lens.len() as f64);
+    let dist = WeightedAliasIndex::new(em_info.eq_map.counts.clone()).unwrap();
+
+    (0..num_boot)
+        .into_par_iter()
+        .map(|i| {
+            info!("evaluating bootstrap replicate {}", i);
+            let mut prev_counts = vec![avg; eff_lens.len()];
+            let mut curr_counts = vec![0.0f64; eff_lens.len()];
+
+            let mut rel_diff = 0.0_f64;
+            let mut niter = 0_u32;
+            let mut rng = thread_rng();
+            let mut base_counts = vec![0_usize; eq_map.counts.len()];
+            for _s in 0..total_weight {
+                base_counts[dist.sample(&mut rng)] += 1;
+            }
+
+            while niter < max_iter {
+                m_step(
+                    eq_map,
+                    &base_counts,
+                    &prev_counts,
+                    eff_lens,
+                    &mut curr_counts,
+                );
+
+                //std::mem::swap(&)
+                for i in 0..curr_counts.len() {
+                    if prev_counts[i] > ABSENCE_THRESH {
+                        let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
+                        rel_diff = if rel_diff > rd { rel_diff } else { rd };
+                    }
+                }
+
+                std::mem::swap(&mut prev_counts, &mut curr_counts);
+                curr_counts.fill(0.0_f64);
+
+                if rel_diff < RELDIFF_THRESH {
+                    break;
+                }
+                niter += 1;
+                rel_diff = 0.0_f64;
+            }
+
+            prev_counts.iter_mut().for_each(|x| {
+                if *x < ABSENCE_THRESH {
+                    *x = 0.0
+                }
+            });
+            m_step(
+                eq_map,
+                &base_counts,
+                &prev_counts,
+                eff_lens,
+                &mut curr_counts,
+            );
+
+            curr_counts
+        })
+        .collect()
 }
 
 pub fn em(em_info: &EMInfo) -> Vec<f64> {
     let eq_map = em_info.eq_map;
     let eff_lens = em_info.eff_lens;
     let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.count_map.values().sum::<usize>() as f64;
+    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
 
     // init
     let avg = total_weight / (eff_lens.len() as f64);
@@ -203,7 +391,13 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
     let mut niter = 0_u32;
 
     while niter < max_iter {
-        m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
+        m_step(
+            eq_map,
+            &eq_map.counts,
+            &prev_counts,
+            eff_lens,
+            &mut curr_counts,
+        );
 
         //std::mem::swap(&)
         for i in 0..curr_counts.len() {
@@ -231,7 +425,13 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
             *x = 0.0
         }
     });
-    m_step(eq_map, &prev_counts, eff_lens, &mut curr_counts);
+    m_step(
+        eq_map,
+        &eq_map.counts,
+        &prev_counts,
+        eff_lens,
+        &mut curr_counts,
+    );
 
     curr_counts
 }

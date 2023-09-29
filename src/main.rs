@@ -1,25 +1,26 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::BufWriter;
 use std::io::Write;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use tabled::{settings::Style, Table, Tabled};
 use tracing::{error, info, warn, Level};
-use byteorder::{ByteOrder, LittleEndian};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::conditional_means_from_params;
+use crate::utils::em::do_bootstrap;
 use crate::utils::em::OrientationProperty;
 use crate::utils::em::PackedEqMap;
-use crate::utils::em::do_bootstrap;
 use utils::map_record_types::{LibraryType, MappingType};
 
 struct MappedFragStats {
@@ -233,7 +234,7 @@ enum Commands {
         /// the expected library type
         #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
         lib_type: LibraryType,
-        /// where output should be written
+        /// output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
         #[arg(short, long)]
         output: PathBuf,
         /// max iterations to run the EM
@@ -250,7 +251,7 @@ enum Commands {
         /// (required, and used, only in the case of unpaired fragments).
         #[arg(long, requires = "fld_mean")]
         fld_sd: Option<f64>,
-        /// number of bootstrap replicates to perform. 
+        /// number of bootstrap replicates to perform.
         #[arg(long, default_value_t = 0)]
         num_bootstraps: usize,
         /// number of threads to use (only used for bootstrapping)
@@ -268,6 +269,22 @@ struct Cli {
     quiet: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+/// https://github.com/polymonster/hotline/blob/05afabb353355e22afea3884bdf3da92bd572da4/src/gfx.rs#L1384
+/// Take any sized silce and convert to a slice of u8
+pub fn as_u8_slice<T: Sized>(p: &[T]) -> &[u8] {
+    let (prefix, body, suffix) = unsafe { p.align_to::<u8>() };
+    assert!(prefix.len() == 0);
+    assert!(suffix.len() == 0);
+    body
+}
+
+// from: https://stackoverflow.com/questions/74322541/how-to-append-to-pathbuf
+fn append_to_path(p: impl Into<OsString>, s: impl AsRef<OsStr>) -> PathBuf {
+    let mut p = p.into();
+    p.push(s);
+    p.into()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -288,7 +305,7 @@ fn main() -> anyhow::Result<()> {
             fld_mean,
             fld_sd,
             num_bootstraps,
-            num_threads
+            num_threads,
         } => {
             info!("path {:?}", input);
             let mut input_rad = input;
@@ -443,7 +460,8 @@ fn main() -> anyhow::Result<()> {
             };
             let em_res = em(&eminfo);
 
-            write_results(output.clone(), &hdr, &em_res, &eff_lengths)?;
+            let quant_output = append_to_path(output.clone(), ".quant");
+            write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
             info!("total mappings = {}", frag_stats.tot_mappings);
@@ -451,17 +469,17 @@ fn main() -> anyhow::Result<()> {
             let total_weight: usize = eq_map.count_map.values().sum();
             info!("total equivalence map weight = {}", total_weight);
 
-            if num_bootstraps > 0 { 
+            if num_bootstraps > 0 {
                 info!("performing bootstraps");
-                let p = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
+                let _p = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build_global()?;
                 let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
 
-                let mut fname: String = output.clone().to_string_lossy().into();
-                let mut ofile = File::create(fname + ".boot")?;
-                let mut buff = vec![0_u8; 8*bootstraps[0].len()];
+                let boot_output = append_to_path(output.clone(), ".infrep.gz");
+                let mut ofile = GzEncoder::new(File::create(boot_output)?, Compression::default());
                 for b in &bootstraps {
-                    LittleEndian::write_f64_into(&b, &mut buff);
-                    ofile.write_all(&buff);
+                    ofile.write_all(as_u8_slice(&b))?;
                 }
             }
         }

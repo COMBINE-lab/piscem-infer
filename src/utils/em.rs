@@ -1,9 +1,9 @@
 use ahash::AHashMap;
-use tracing::info;
-use rand_distr::WeightedAliasIndex;
 use rand::prelude::*;
+use rand::thread_rng;
+use rand_distr::WeightedAliasIndex;
 use rayon::prelude::*;
-use rand::{Rng, thread_rng};
+use tracing::info;
 
 pub enum OrientationProperty {
     OrientationAware,
@@ -93,6 +93,7 @@ impl PackedEqMap {
         self.counts.len()
     }
 
+    #[allow(dead_code)]
     pub fn iter(&self) -> PackedEqEntryIter {
         PackedEqEntryIter {
             counter: 0,

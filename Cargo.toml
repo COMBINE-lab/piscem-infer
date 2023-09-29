@@ -20,7 +20,7 @@ tabled = "0.12.2"
 rayon = "1.8.0"
 rand_distr = "0.4.3"
 rand = "0.8.5"
-byteorder = "1.4.3"
+flate2 = "1.0.27"
 
 [[bin]]
 name = "piscem-infer"

@@ -1,8 +1,12 @@
 use anyhow::{bail, Context};
+use arrow2::{
+    array::{Array, Float64Array, StructArray, UInt32Array},
+    chunk::Chunk,
+    datatypes::{DataType, Field, Schema},
+};
+
 use clap::Args;
 use clap::{Parser, Subcommand};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use libradicl::exit_codes;
 use libradicl::rad_types;
 use scroll::Pread;
@@ -19,6 +23,7 @@ use tracing::{error, info, warn, Level};
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
 use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
+use utils::parquet_utils::write_chunk_to_file;
 
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::do_bootstrap;
@@ -181,7 +186,7 @@ fn process<T: Read>(
 }
 
 /// Read the lengths of the reference sequences from the RAD file header.
-fn read_ref_lengths<T: Read>(reader: &mut T) -> Result<Vec<u32>, std::io::Error> {
+fn read_ref_lengths<T: Read>(reader: &mut T) -> anyhow::Result<Vec<u32>> {
     let mut rbuf = [0u8; 8];
 
     // read type of length
@@ -475,17 +480,48 @@ fn main() -> anyhow::Result<()> {
             let total_weight: usize = eq_map.count_map.values().sum();
             info!("total equivalence map weight = {}", total_weight);
 
+            {
+                let fld_array = UInt32Array::from_vec(frag_lengths);
+                let field =
+                    Field::new("fragment_length_dist", fld_array.data_type().clone(), false);
+
+                let chunk = Chunk::new(vec![fld_array.boxed()]);
+                let fields = vec![field];
+
+                let output_path = append_to_path(output.clone(), ".fld.pq");
+                let schema = Schema::from(fields);
+                write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)?;
+            }
+
             if num_bootstraps > 0 {
                 info!("performing bootstraps");
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(num_threads)
                     .build_global()?;
                 let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
-                let boot_output = append_to_path(output.clone(), ".infrep.gz");
-                let mut ofile = GzEncoder::new(File::create(boot_output)?, Compression::default());
-                for b in &bootstraps {
-                    ofile.write_all(as_u8_slice(b))?;
+
+                let output_path = append_to_path(output.clone(), ".infreps.pq");
+                let mut new_arrays = vec![];
+                let mut bs_fields = vec![];
+
+                for (i, b) in bootstraps.into_iter().enumerate() {
+                    let bs_array = Float64Array::from_vec(b);
+                    bs_fields.push(Field::new(
+                        format!("bootstrap_{}", i),
+                        bs_array.data_type().clone(),
+                        false,
+                    ));
+                    new_arrays.push(bs_array.boxed());
                 }
+                let struct_array = StructArray::new(DataType::Struct(bs_fields), new_arrays, None);
+                let fields = vec![Field::new(
+                    "bootstraps",
+                    struct_array.data_type().clone(),
+                    false,
+                )];
+                let chunk = Chunk::new(vec![struct_array.boxed()]);
+                let schema = Schema::from(fields);
+                write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)?;
             }
 
             let meta_info_output = append_to_path(output, ".meta_info.json");

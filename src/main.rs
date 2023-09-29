@@ -29,6 +29,7 @@ use crate::utils::em::PackedEqMap;
 use crate::utils::io;
 use utils::map_record_types::{LibraryType, MappingType};
 
+#[derive(Serialize)]
 struct MappedFragStats {
     tot_mappings: usize,
     num_mapped_reads: usize,
@@ -499,6 +500,7 @@ fn main() -> anyhow::Result<()> {
             let ofile = File::create(meta_info_output)?;
             let meta_info = json!({
                 "quant_opts": quant_opts,
+                "mapped_frag_stats": frag_stats,
                 "num_bootstraps": num_bootstraps,
                 "num_targets": eff_lengths.len(),
             });

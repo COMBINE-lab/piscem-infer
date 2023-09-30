@@ -50,7 +50,7 @@ Once you have it installed, you can build the index with:
 Obtaining the reads
 ~~~~~~~~~~~~~~~~~~~
 
-To obtain some sample read data, we'll use the excellent `fastq-dl <https://github.com/rpetit3/fastq-dl>`_ tool that you can install 
+To obtain some sample read data, we'll use the excellent ```fastq-dl`` <https://github.com/rpetit3/fastq-dl>`_ tool that you can install 
 via either ``pip`` or bioconda (through ``conda`` or ``mamba``).
 
 .. code-block:: console

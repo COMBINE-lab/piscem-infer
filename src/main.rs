@@ -9,6 +9,7 @@ use clap::Args;
 use clap::{Parser, Subcommand};
 use libradicl::exit_codes;
 use libradicl::rad_types;
+use path_tools::WithAdditionalExtension;
 use scroll::Pread;
 use serde::Serialize;
 use serde_json::json;
@@ -282,15 +283,16 @@ fn main() -> anyhow::Result<()> {
 
     match cli_args.command {
         Commands::Quant(quant_opts) => {
-            let input = quant_opts.input.clone();
-            let lib_type = quant_opts.lib_type;
-            let output = quant_opts.output.clone();
-            let max_iter = quant_opts.max_iter;
-            let convergence_thresh = quant_opts.convergence_thresh;
-            let fld_mean = quant_opts.fld_mean;
-            let fld_sd = quant_opts.fld_sd;
-            let num_bootstraps = quant_opts.num_bootstraps;
-            let num_threads = quant_opts.num_threads;
+            let qo = quant_opts.clone();
+            let input = qo.input;
+            let lib_type = qo.lib_type;
+            let output = qo.output;
+            let max_iter = qo.max_iter;
+            let convergence_thresh = qo.convergence_thresh;
+            let fld_mean = qo.fld_mean;
+            let fld_sd = qo.fld_sd;
+            let num_bootstraps = qo.num_bootstraps;
+            let num_threads = qo.num_threads;
 
             // if there is a parent directory
             if let Some(p) = output.parent() {
@@ -455,8 +457,8 @@ fn main() -> anyhow::Result<()> {
             };
             let em_res = em(&eminfo);
 
-            let quant_output = io::append_to_path(output.clone(), ".quant");
-            io::write_results(quant_output, &hdr, &em_res, &eff_lengths)?;
+            let quant_output = output.with_additional_extension(".quant");
+            io::write_results(&quant_output, &hdr, &em_res, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
             info!("total mappings = {}", frag_stats.tot_mappings);
@@ -496,7 +498,7 @@ fn main() -> anyhow::Result<()> {
                 io::write_infrep_file(&output, bs_fields, chunk)?;
             }
 
-            let meta_info_output = io::append_to_path(output, ".meta_info.json");
+            let meta_info_output = output.with_additional_extension(".meta_info.json");
             let ofile = File::create(meta_info_output)?;
             let meta_info = json!({
                 "quant_opts": quant_opts,

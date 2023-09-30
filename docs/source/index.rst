@@ -4,7 +4,7 @@ Welcome to piscem-infers's documentation!
 What is `piscem-infer`?
 -----------------------
 
-`piscem-infer` is a tool to consume bulk-RAD files (produced by [`piscem`](https://github.com/COMBINE-lab/piscem) or [`piscem-cpp`](https://github.com/COMBINE-lab/piscem-cpp)) 
+``piscem-infer`` is a tool to consume bulk-RAD files (produced by `piscem <https://github.com/COMBINE-lab/piscem>`_ or `piscem-cpp <https://github.com/COMBINE-lab/piscem-cpp)`_) 
 and to produce from them abundance estimates of the targets against which the reads were mapped.  For example, a basic RNA-seq pipeline could consist of mapping the reads 
 against the transcriptome using `piscem`, and then quantifying transcript abundance using `piscem-infer`.  Likewise, one could use the pair of tools on metagenomic index and 
 metagenomic sequencing reads to perform taxonomic abundance estimation.  The main goal of `piscem-infer` is to separate the statistical inference algorithms and code from the 

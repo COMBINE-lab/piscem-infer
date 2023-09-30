@@ -6,7 +6,7 @@ Usage
 Installation
 ------------
 
-To install piscem-infer, use [``cargo``](https://github.com/rust-lang/cargo):
+To install piscem-infer, use `cargo <https://github.com/rust-lang/cargo>`_:
 
 .. code-block:: console
 
@@ -40,7 +40,7 @@ Building the index
 
 Next, we'll build the index. You'll only have to do this once (or whenever you want to update the annotation you're using). To 
 build the index and map the reads, we'll need ``piscem``. You can either build it from source according to the instructions 
-on the [``GitHub page``](https://github.com/COMBINE-lab/piscem), or you can install it from ``biconda`` using ``conda install piscem``. 
+on the `GitHub page <https://github.com/COMBINE-lab/piscem>`_, or you can install it from ``biconda`` using ``conda install piscem``. 
 Once you have it installed, you can build the index with:
 
 .. code-block:: console
@@ -50,7 +50,7 @@ Once you have it installed, you can build the index with:
 Obtaining the reads
 ~~~~~~~~~~~~~~~~~~~
 
-To obtain some sample read data, we'll use the excellent [``fastq-dl``](https://github.com/rpetit3/fastq-dl) tool that you can install 
+To obtain some sample read data, we'll use the excellent `fastq-dl <https://github.com/rpetit3/fastq-dl>`_ tool that you can install 
 via either ``pip`` or bioconda (through ``conda`` or ``mamba``).
 
 .. code-block:: console
@@ -82,7 +82,7 @@ case we can also request the use of multiple threads, but here we just invoke th
 Note that we pass to the ``-o`` flag a file *stem* prefixed with a path (in this case ``quant``). This is because ``piscem-infer``
 will produce several output files.  All of them will share the same *stem*.  If we pass a stem that is prefixed with some path 
 (e.g. a directory) then this directory will be created if it doesn't exist. We also let ``piscem-infer`` know the library type 
-(i.e. how we expect the reads to map), where ``piscem-infer`` uses [``salmon``'s library type specification](https://salmon.readthedocs.io/en/latest/salmon.html#what-s-this-libtype).
+(i.e. how we expect the reads to map), where ``piscem-infer`` uses `salmon's library type specification <https://salmon.readthedocs.io/en/latest/salmon.html#what-s-this-libtype>`_.
 Here we expect the library to be unstranded and the paired-end reads to map "inward" (i.e. facing each other).
 
 .. code-block:: console

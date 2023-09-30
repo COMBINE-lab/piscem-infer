@@ -53,12 +53,16 @@ Once you have it installed, you can build the index with:
 Obtaining the reads
 ~~~~~~~~~~~~~~~~~~~
 
-To obtain some sample read data, we'll use the excellent `|fastqdl| <https://github.com/rpetit3/fastq-dl>`_ tool that you can install 
+To obtain some sample read data, we'll use the excellent |fastqdl|_ tool that you can install 
 via either ``pip`` or bioconda (through ``conda`` or ``mamba``).
 
 .. code-block:: console
 
    $ fastq-dl -a SRR1039508
+
+
+.. |fastqdl| replace:: ``fastq-dl``
+.. _fastqdl: https://github.com/rpetit3/fastq-dl
 
 Mapping the reads
 ~~~~~~~~~~~~~~~~~

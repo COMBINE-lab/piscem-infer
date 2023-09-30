@@ -25,6 +25,7 @@ serde = { version = "1.0.188", features = ["serde_derive", "derive"] }
 arrow2 = { version = "0.18.0", features = ["io_parquet", "io_parquet_gzip", "io_parquet_zstd", "io_parquet_snappy"] }
 scroll = "0.11.0"
 snap = "1.1.0"
+path-tools = "0.1.0"
 
 [[bin]]
 name = "piscem-infer"

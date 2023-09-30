@@ -60,10 +60,6 @@ via either ``pip`` or bioconda (through ``conda`` or ``mamba``).
 
    $ fastq-dl -a SRR1039508
 
-
-.. |fastqdl| replace:: ``fastq-dl``
-.. _fastqdl: https://github.com/rpetit3/fastq-dl
-
 Mapping the reads
 ~~~~~~~~~~~~~~~~~
 
@@ -100,4 +96,9 @@ Here we expect the library to be unstranded and the paired-end reads to map "inw
     .rw-rw-r--@  33M rob 30 Sep 12:33 SRR1039508.quant
 
 The file ``SRR1039508.quant`` contains the quantification estimates, and is of a very similar format to e.g. a ``salmon`` ("quant.sf") format file.
+
+
+
+.. |fastqdl| replace:: ``fastq-dl``
+.. _fastqdl: https://github.com/rpetit3/fastq-dl
 

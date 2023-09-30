@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/COMBINE-lab/piscem-infer/compare/v0.1.0...v0.1.1) (2023-09-30)
+
+
+### Bug Fixes
+
+* missing file ([0118da7](https://github.com/COMBINE-lab/piscem-infer/commit/0118da7dc79078d313d783ab9e352f398f9b93ce))
+
 ## 0.1.0 (2023-09-30)
 
 

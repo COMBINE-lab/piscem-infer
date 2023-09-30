@@ -47,9 +47,6 @@ Once you have it installed, you can build the index with:
 
     $ piscem build -s gencode.v44.transcripts.fa.gz -k 31 -m 19 -t 16 -o gencode_v44_idx
 
-.. |fastqdl| replace:: ``fastq-dl``
-.. _fastqdl:
-
 Obtaining the reads
 ~~~~~~~~~~~~~~~~~~~
 

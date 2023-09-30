@@ -2,7 +2,14 @@
 name = "piscem-infer"
 version = "0.1.0"
 edition = "2021"
-
+license = "BSD-3-Clause-Attribution"
+keywords = ["science", "RNA-seq", "RAD-file"]
+categories = ["command-line-utilities", "science"]
+repository = "https://github.com/COMBINE-lab/piscem-infer/"
+homepage = "https://github.com/COMBINE-lab/piscem-infer/"
+readme = "README.md"
+description = "A flexible tool to perform target quantification from bulk-sequencing data"
+authors = ["Rob Patro", "Rob Patro <rob@cs.umd.edu>"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

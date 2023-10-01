@@ -7,8 +7,8 @@ copyright = '2022-, Rob Patro'
 author = 'Rob Patro'
 master_doc = 'index'
 
-release = '0.1'
-version = '0.1.1'
+release = '0.2'
+version = '0.2.0'
 
 # -- General configuration
 

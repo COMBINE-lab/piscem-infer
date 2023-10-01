@@ -11,6 +11,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use tracing::warn;
+
 pub(crate) fn write_results(
     output: &Path,
     hdr: &rad_types::RadHeader,
@@ -19,10 +21,37 @@ pub(crate) fn write_results(
 ) -> anyhow::Result<()> {
     let mut ofile = File::create(output)?;
 
-    ofile.write_all("target_name\teelen\tecount\n".to_string().as_bytes())?;
+    ofile.write_all("target_name\teelen\ttpm\tecount\n".to_string().as_bytes())?;
+
+    const ONE_MILLION: f64 = 1_000_000.0;
+    let denom: f64 = e_counts
+        .iter()
+        .zip(eff_lengths.iter())
+        .map(|(c, l)| if *l > 0.0 { c / l } else { 0.0_f64 })
+        .sum::<f64>();
+    let inv_denom: f64 = if denom > 0.0 {
+        ONE_MILLION / denom
+    } else {
+        warn!("The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!");
+        0.0
+    };
+    let tpms: Vec<f64> = e_counts
+        .iter()
+        .zip(eff_lengths.iter())
+        .map(|(c, l)| {
+            if *l > 0.0 {
+                inv_denom * (c / l)
+            } else {
+                0.0_f64
+            }
+        })
+        .collect();
 
     for (i, name) in hdr.ref_names.iter().enumerate() {
-        let l = format!("{}\t{:.3}\t{:.3}\n", name, eff_lengths[i], e_counts[i]);
+        let l = format!(
+            "{}\t{:.3}\t{:.3}\t{:.3}\n",
+            name, eff_lengths[i], tpms[i], e_counts[i]
+        );
         ofile.write_all(l.as_bytes())?;
     }
 

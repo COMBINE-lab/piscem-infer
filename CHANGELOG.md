@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.2.0...v0.3.0) (2023-10-02)
+
+
+### Features
+
+* propagate reference provanence signatures through quant if they exist ([890c652](https://github.com/COMBINE-lab/piscem-infer/commit/890c6523e587027a3c4b811d5d0046cf3fff63d1))
+
 ## [0.2.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.1.1...v0.2.0) (2023-10-01)
 
 

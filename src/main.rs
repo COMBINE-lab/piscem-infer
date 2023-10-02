@@ -12,7 +12,7 @@ use libradicl::rad_types;
 use path_tools::WithAdditionalExtension;
 use scroll::Pread;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -305,6 +305,31 @@ fn main() -> anyhow::Result<()> {
             }
 
             info!("path {:?}", input);
+            let ref_sig_json;
+            {
+                let mut input_map_info = input.clone();
+                input_map_info.set_extension("map_info.json");
+                if !input_map_info.exists() {
+                    ref_sig_json = None;
+                    warn!(concat!("Expected the mapping info file {:?} to exist, but it doesn't. ",
+                          "This is bad, and means that reference provenance signatures cannot be ",
+                          "propagated to the output of piscem-infer. It is strongly recommended ",
+                          "that you investigate why this file does not exist at the expected location."),
+                        input_map_info);
+                } else {
+                    let map_info_str = std::fs::read_to_string(&input_map_info)
+                        .expect(&format!("Couldn't open {:?}.", &input_map_info));
+                    let v: Value = serde_json::from_str(&map_info_str)?;
+                    if let Some(sigs) = v.get("signatures") {
+                        ref_sig_json = Some(sigs.clone());
+                    } else {
+                        warn!("The file {:?} exists, but has no \"signatures\" entry holding the reference provenance signatures",
+                            input_map_info);
+                        ref_sig_json = None;
+                    }
+                }
+            }
+
             let mut input_rad = input;
             input_rad.set_extension("rad");
             let i_file = File::open(&input_rad).context("could not open input rad file")?;
@@ -505,6 +530,7 @@ fn main() -> anyhow::Result<()> {
                 "mapped_frag_stats": frag_stats,
                 "num_bootstraps": num_bootstraps,
                 "num_targets": eff_lengths.len(),
+                "signatures": ref_sig_json
             });
             serde_json::to_writer_pretty(ofile, &meta_info)?;
         }

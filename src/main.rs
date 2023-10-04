@@ -483,7 +483,7 @@ fn main() -> anyhow::Result<()> {
             let em_res = em(&eminfo);
 
             let quant_output = output.with_additional_extension(".quant");
-            io::write_results(&quant_output, &hdr, &em_res, &eff_lengths)?;
+            io::write_results(&quant_output, &hdr, &em_res, &ref_lengths, &eff_lengths)?;
 
             info!("num mapped reads = {}", frag_stats.num_mapped_reads);
             info!("total mappings = {}", frag_stats.tot_mappings);

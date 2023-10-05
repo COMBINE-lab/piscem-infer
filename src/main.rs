@@ -318,7 +318,7 @@ fn main() -> anyhow::Result<()> {
                         input_map_info);
                 } else {
                     let map_info_str = std::fs::read_to_string(&input_map_info)
-                        .expect(&format!("Couldn't open {:?}.", &input_map_info));
+                        .unwrap_or_else(|_| panic!("Couldn't open {:?}.", &input_map_info));
                     let v: Value = serde_json::from_str(&map_info_str)?;
                     if let Some(sigs) = v.get("signatures") {
                         ref_sig_json = Some(sigs.clone());

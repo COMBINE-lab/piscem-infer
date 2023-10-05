@@ -92,8 +92,7 @@ Here we expect the library to be unstranded and the paired-end reads to map "inw
     .rw-rw-r--@  628 rob 30 Sep 12:33 SRR1039508.meta_info.json
     .rw-rw-r--@  33M rob 30 Sep 12:33 SRR1039508.quant
 
-The file ``SRR1039508.quant`` contains the quantification estimates, and is of a very similar format to e.g. a ``salmon`` ("quant.sf") format file.
-
+The file ``SRR1039508.quant`` contains the quantification estimates, and is of a very similar format to e.g. a ``salmon`` ("quant.sf") format file.  The file format for the quantification result, as well as that of other outputs, is described in the :ref:`format section of this documentation<Quantification output>`.
 
 
 .. |fastqdl| replace:: ``fastq-dl``

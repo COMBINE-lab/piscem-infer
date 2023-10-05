@@ -17,11 +17,16 @@ pub(crate) fn write_results(
     output: &Path,
     hdr: &rad_types::RadHeader,
     e_counts: &[f64],
+    lengths: &[u32],
     eff_lengths: &[f64],
 ) -> anyhow::Result<()> {
     let mut ofile = File::create(output)?;
 
-    ofile.write_all("target_name\teelen\ttpm\tecount\n".to_string().as_bytes())?;
+    ofile.write_all(
+        "target_name\tlen\teelen\ttpm\tecount\n"
+            .to_string()
+            .as_bytes(),
+    )?;
 
     const ONE_MILLION: f64 = 1_000_000.0;
     let denom: f64 = e_counts
@@ -49,8 +54,8 @@ pub(crate) fn write_results(
 
     for (i, name) in hdr.ref_names.iter().enumerate() {
         let l = format!(
-            "{}\t{:.3}\t{:.3}\t{:.3}\n",
-            name, eff_lengths[i], tpms[i], e_counts[i]
+            "{}\t{}\t{:.3}\t{:.3}\t{:.3}\n",
+            name, lengths[i], eff_lengths[i], tpms[i], e_counts[i]
         );
         ofile.write_all(l.as_bytes())?;
     }

@@ -22,7 +22,11 @@ pub(crate) fn write_results(
 ) -> anyhow::Result<()> {
     let mut ofile = File::create(output)?;
 
-    ofile.write_all("target_name\tlen\teelen\ttpm\tecount\n".to_string().as_bytes())?;
+    ofile.write_all(
+        "target_name\tlen\teelen\ttpm\tecount\n"
+            .to_string()
+            .as_bytes(),
+    )?;
 
     const ONE_MILLION: f64 = 1_000_000.0;
     let denom: f64 = e_counts

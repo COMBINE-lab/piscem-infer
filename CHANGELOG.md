@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.3.0...v0.4.0) (2023-10-05)
+
+
+### Features
+
+* add length to output file ([6a6a6b0](https://github.com/COMBINE-lab/piscem-infer/commit/6a6a6b06dcc452251aee64e2a2ff413a13e68bc3))
+
 ## [0.3.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.2.0...v0.3.0) (2023-10-02)
 
 

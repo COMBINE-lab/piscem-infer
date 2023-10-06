@@ -66,5 +66,3 @@ like to have provided, please let us know.
 
 .. autosummary::
    :toctree: generated
-
-    piscem-infer

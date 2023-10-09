@@ -125,6 +125,11 @@ impl<'a> Iterator for PackedEqLabelIter<'a> {
             None
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.underlying_packed_map.len() - self.counter as usize;
+        (rem, Some(rem))
+    }
 }
 
 pub struct PackedEqEntryIter<'a> {
@@ -145,6 +150,12 @@ impl<'a> Iterator for PackedEqEntryIter<'a> {
         } else {
             None
         }
+    }
+}
+
+impl<'a> ExactSizeIterator for PackedEqEntryIter<'a> {
+    fn len(&self) -> usize {
+        self.underlying_packed_map.len() - self.counter as usize
     }
 }
 
@@ -280,22 +291,27 @@ fn m_step(
     eq_map: &PackedEqMap,
     eq_counts: &[usize],
     prev_count: &[f64],
-    eff_lens: &[f64],
+    inv_eff_lens: &[f64],
     curr_counts: &mut [f64],
 ) {
-    for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
-        let mut denom = 0.0_f64;
-        let count = *v as f64;
-        for target_id in k {
-            denom += prev_count[*target_id as usize] / eff_lens[*target_id as usize];
-        }
+    let mut weights: Vec<f64> = Vec::with_capacity(64);
 
+    for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
+        let count = *v as f64;
+
+        let mut denom = 0.0_f64;
+        for e in k.iter() {
+            let w = prev_count[*e as usize] * inv_eff_lens[*e as usize];
+            weights.push(w);
+            denom += w;
+        }
         if denom > 1e-8 {
-            for target_id in k {
-                curr_counts[*target_id as usize] += count
-                    * ((prev_count[*target_id as usize] / eff_lens[*target_id as usize]) / denom);
+            let count_over_denom = count / denom;
+            for (target_id, w) in k.iter().zip(weights.iter()) {
+                curr_counts[*target_id as usize] += count_over_denom * w;
             }
         }
+        weights.clear();
     }
 }
 
@@ -311,6 +327,17 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
     let eq_map = em_info.eq_map;
     let max_iter = em_info.max_iter;
     let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = eff_lens
+        .iter()
+        .map(|x| {
+            let y = 1.0_f64 / *x;
+            if y.is_finite() {
+                y
+            } else {
+                0_f64
+            }
+        })
+        .collect::<Vec<f64>>();
     let total_weight = em_info.eq_map.counts.iter().sum::<usize>();
     // init
     let avg = (total_weight as f64) / (eff_lens.len() as f64);
@@ -336,7 +363,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
                     eq_map,
                     &base_counts,
                     &prev_counts,
-                    eff_lens,
+                    &inv_eff_lens,
                     &mut curr_counts,
                 );
 
@@ -367,7 +394,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
                 eq_map,
                 &base_counts,
                 &prev_counts,
-                eff_lens,
+                &inv_eff_lens,
                 &mut curr_counts,
             );
 
@@ -379,6 +406,17 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
 pub fn em(em_info: &EMInfo) -> Vec<f64> {
     let eq_map = em_info.eq_map;
     let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = eff_lens
+        .iter()
+        .map(|x| {
+            let y = 1.0_f64 / *x;
+            if y.is_finite() {
+                y
+            } else {
+                0_f64
+            }
+        })
+        .collect::<Vec<f64>>();
     let max_iter = em_info.max_iter;
     let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
 
@@ -395,7 +433,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
             eq_map,
             &eq_map.counts,
             &prev_counts,
-            eff_lens,
+            &inv_eff_lens,
             &mut curr_counts,
         );
 
@@ -429,7 +467,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
         eq_map,
         &eq_map.counts,
         &prev_counts,
-        eff_lens,
+        &inv_eff_lens,
         &mut curr_counts,
     );
 

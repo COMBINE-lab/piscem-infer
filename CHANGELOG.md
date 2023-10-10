@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.4.0...v0.5.0) (2023-10-10)
+
+
+### Features
+
+* speed up EM ([7602253](https://github.com/COMBINE-lab/piscem-infer/commit/7602253c656664561b0e03db58c4a94e2d883683))
+
 ## [0.4.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.3.0...v0.4.0) (2023-10-05)
 
 

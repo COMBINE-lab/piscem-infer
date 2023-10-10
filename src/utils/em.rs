@@ -294,6 +294,7 @@ fn m_step(
     inv_eff_lens: &[f64],
     curr_counts: &mut [f64],
 ) {
+    // TODO: is there a better way to set this capacity?
     let mut weights: Vec<f64> = Vec::with_capacity(64);
 
     for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {

@@ -103,8 +103,8 @@ fn process<T: Read>(
     const TARGET_UNIQUE_FRAGS: u32 = 5_000;
     let mut unique_frags = 0u32;
 
-    let mut mapped_ori_count = vec![0u32; 7];
-    let mut filtered_ori_count = vec![0u32; 7];
+    let mut mapped_ori_count = [0u32; 7];
+    let mut filtered_ori_count = [0u32; 7];
 
     let mut label_ints = vec![];
     let mut dir_ints = vec![];

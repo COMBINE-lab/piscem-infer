@@ -68,7 +68,6 @@ pub(crate) fn write_fld_file(
     chunk: Chunk<Box<dyn Array>>,
 ) -> Result<()> {
     let output_path = output_path
-        .clone()
         .to_path_buf()
         .with_additional_extension(".fld.pq");
     let schema = Schema::from(fields);
@@ -81,7 +80,6 @@ pub(crate) fn write_infrep_file(
     chunk: Chunk<Box<dyn Array>>,
 ) -> Result<()> {
     let output_path = output_path
-        .clone()
         .to_path_buf()
         .with_additional_extension(".infreps.pq");
     let schema = Schema::from(fields);

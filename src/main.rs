@@ -253,7 +253,7 @@ enum Commands {
     Quant(QuantOpts),
 }
 
-/// quantifying from a metagenomic rad file
+/// quantify target abundance from bulk-sequencing data
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 #[command(propagate_version = true)]

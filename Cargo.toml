@@ -13,7 +13,7 @@ authors = ["Rob Patro", "Rob Patro <rob@cs.umd.edu>"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libradicl = { git = "https://github.com/COMBINE-lab/libradicl", version = "0.6.0" }
+libradicl = { git = "https://github.com/COMBINE-lab/libradicl", branch = "develop", version = "0.6.0" }
 ahash = "0.8.8"
 distrs = "0.2.1"
 anyhow = "1.0.79"

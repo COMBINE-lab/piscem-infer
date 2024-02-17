@@ -21,7 +21,7 @@ use tracing::{error, info, warn, Level};
 
 mod utils;
 use utils::custom_rad_utils::MetaChunk;
-use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
+use utils::em::{adjust_ref_lengths, conditional_means, em, em_par, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::do_bootstrap;
@@ -241,7 +241,7 @@ pub struct QuantOpts {
     /// number of bootstrap replicates to perform.
     #[arg(long, default_value_t = 0)]
     pub num_bootstraps: usize,
-    /// number of threads to use (only used for bootstrapping)
+    /// number of threads to use (used during the EM and for bootstrapping)
     #[arg(long, default_value_t = 16)]
     pub num_threads: usize,
 }
@@ -480,7 +480,12 @@ fn main() -> anyhow::Result<()> {
                 max_iter,
                 convergence_thresh,
             };
-            let em_res = em(&eminfo);
+
+            let em_res = if num_threads > 1 {
+                em_par(&eminfo, num_threads)
+            } else {
+                em(&eminfo)
+            };
 
             let quant_output = output.with_additional_extension(".quant");
             io::write_results(&quant_output, &hdr, &em_res, &ref_lengths, &eff_lengths)?;

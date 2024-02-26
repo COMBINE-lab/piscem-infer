@@ -7,7 +7,12 @@ use arrow2::{
 
 use clap::Args;
 use clap::{Parser, Subcommand};
-use libradicl::rad_types::{self, RecordContext};
+use libradicl::rad_types::{self};
+use libradicl::{
+    chunk,
+    header::RadPrelude,
+    record::{PiscemBulkReadRecord, PiscemBulkRecordContext, RecordContext},
+};
 use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
@@ -89,7 +94,7 @@ fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirEntry> {
 fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
-    record_context: &rad_types::PiscemBulkRecordContext,
+    record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
 ) -> (EqMap, Vec<u32>) {
@@ -108,7 +113,7 @@ fn process<T: Read>(
     let mut dir_ints = vec![];
     //let mut dir_vec = vec![0u32, 64];
     for _ in 0..nrec {
-        let c = rad_types::Chunk::<rad_types::PiscemBulkReadRecord>::from_bytes(br, record_context);
+        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
         for mappings in &c.reads {
             let ft = rad_types::MappingType::from_u8(mappings.frag_type);
             let nm = mappings.positions.len();
@@ -310,7 +315,7 @@ fn main() -> anyhow::Result<()> {
             let mut fl_sd = 0_f64;
 
             // read the header and tag sections from the rad file
-            let prelude = rad_types::RadPrelude::from_bytes(&mut br)?;
+            let prelude = RadPrelude::from_bytes(&mut br)?;
 
             info!("read header!");
             if prelude.hdr.is_paired > 0_u8 {
@@ -430,7 +435,7 @@ fn main() -> anyhow::Result<()> {
             );
 
             // extract whatever context we'll need to read the records
-            let tag_context = rad_types::PiscemBulkRecordContext::get_context_from_tag_section(
+            let tag_context = PiscemBulkRecordContext::get_context_from_tag_section(
                 &prelude.file_tags,
                 &prelude.read_tags,
                 &prelude.aln_tags,
@@ -450,7 +455,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 conditional_means_from_params(fl_mean, fl_sd, 65_636_usize)
             };
-            let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
+            let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
 
             let packed_eq_map = PackedEqMap::from_eq_map(&eq_map);
 
@@ -472,7 +477,7 @@ fn main() -> anyhow::Result<()> {
                 &quant_output,
                 &prelude.hdr,
                 &em_res,
-                ref_lengths,
+                &ref_lengths,
                 &eff_lengths,
             )?;
 

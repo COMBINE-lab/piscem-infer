@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.5.2...v0.6.0) (2024-02-26)
+
+
+### Features
+
+* working using new libradicl ([72120a6](https://github.com/COMBINE-lab/piscem-infer/commit/72120a69dea72c823719495d77e9c2fe3fd934c7))
+
 ## [0.5.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.4.0...v0.5.0) (2023-10-10)
 
 

@@ -5,7 +5,7 @@ use arrow2::{
     chunk::Chunk,
     datatypes::{Field, Schema},
 };
-use libradicl::rad_types;
+use libradicl::header;
 use path_tools::WithAdditionalExtension;
 use std::fs::File;
 use std::io::Write;
@@ -15,7 +15,7 @@ use tracing::warn;
 
 pub(crate) fn write_results(
     output: &Path,
-    hdr: &rad_types::RadHeader,
+    hdr: &header::RadHeader,
     e_counts: &[f64],
     lengths: &[u32],
     eff_lengths: &[f64],

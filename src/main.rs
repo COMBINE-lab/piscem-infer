@@ -8,6 +8,7 @@ use arrow2::{
 use clap::Args;
 use clap::{Parser, Subcommand};
 use libradicl::rad_types::{self, RecordContext};
+use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -341,15 +342,13 @@ fn main() -> anyhow::Result<()> {
 
             // file-level
             info!("read {:?} file-level tags", prelude.file_tags.tags.len());
+            // parse actual tags
+            for ft in &prelude.file_tags.tags {
+                info!("\tfile-level tag {}", ft.name);
+            }
 
             // read-level
             info!("read {:?} read-level tags", prelude.read_tags.tags.len());
-
-            // alignment-level
-            info!(
-                "read {:?} alignemnt-level tags",
-                prelude.aln_tags.tags.len()
-            );
 
             // required read-level tag
             const FRAG_TYPE_NAME: &str = "frag_map_type";
@@ -364,6 +363,12 @@ fn main() -> anyhow::Result<()> {
             if !had_frag_map_type {
                 bail!("read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed.");
             }
+
+            // alignment-level
+            info!(
+                "read {:?} alignemnt-level tags",
+                prelude.aln_tags.tags.len()
+            );
 
             // required alignment level tags
             const REF_ORI_NAME: &str = "compressed_ori_ref";
@@ -419,7 +424,10 @@ fn main() -> anyhow::Result<()> {
 
             let ref_lengths =
                 ref_lengths.expect("was not able to read reference lengths from file!");
-            info!("read {} reference lengths", ref_lengths.len());
+            info!(
+                "read {} reference lengths",
+                ref_lengths.len().to_formatted_string(&Locale::en)
+            );
 
             // extract whatever context we'll need to read the records
             let tag_context = rad_types::PiscemBulkRecordContext::get_context_from_tag_section(
@@ -468,11 +476,23 @@ fn main() -> anyhow::Result<()> {
                 &eff_lengths,
             )?;
 
-            info!("num mapped reads = {}", frag_stats.num_mapped_reads);
-            info!("total mappings = {}", frag_stats.tot_mappings);
-            info!("number of equivalence classes = {}", eq_map.len());
+            info!(
+                "num mapped reads = {}",
+                frag_stats.num_mapped_reads.to_formatted_string(&Locale::en)
+            );
+            info!(
+                "total mappings = {}",
+                frag_stats.tot_mappings.to_formatted_string(&Locale::en)
+            );
+            info!(
+                "number of equivalence classes = {}",
+                eq_map.len().to_formatted_string(&Locale::en)
+            );
             let total_weight: usize = eq_map.count_map.values().sum();
-            info!("total equivalence map weight = {}", total_weight);
+            info!(
+                "total equivalence map weight = {}",
+                total_weight.to_formatted_string(&Locale::en)
+            );
 
             {
                 let fld_array = UInt32Array::from_vec(frag_lengths);

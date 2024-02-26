@@ -42,6 +42,7 @@ scroll = "0.12.0"
 snap = "1.1.1"
 path-tools = "0.1.0"
 atomic_float = "0.1.0"
+num-format = "0.4.4"
 
 [[bin]]
 name = "piscem-infer"

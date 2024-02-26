@@ -7,7 +7,6 @@ use arrow2::{
 
 use clap::Args;
 use clap::{Parser, Subcommand};
-use libradicl::exit_codes;
 use libradicl::rad_types::{self, RecordContext};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
@@ -16,7 +15,7 @@ use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use tabled::{settings::Style, Table, Tabled};
-use tracing::{error, info, warn, Level};
+use tracing::{info, warn, Level};
 
 mod utils;
 use utils::em::{adjust_ref_lengths, conditional_means, em, em_par, EMInfo, EqLabel, EqMap};
@@ -309,18 +308,18 @@ fn main() -> anyhow::Result<()> {
             let mut fl_mean = 0_f64;
             let mut fl_sd = 0_f64;
 
+            // read the header and tag sections from the rad file
             let prelude = rad_types::RadPrelude::from_bytes(&mut br)?;
+
             info!("read header!");
             if prelude.hdr.is_paired > 0_u8 {
                 info!("fragments paired in sequencing");
                 paired_end = true;
                 if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
                     warn!(
-                        concat!(
-                            "provided fragment length distribution mean and sd ({}, {}), but ",
-                            "the RAD file contains paired-end fragments, so these will be ignored ",
-                            "and the fragment length distribution will be estimated."
-                        ),
+                        "provided fragment length distribution mean and sd ({}, {}), but \
+                         the RAD file contains paired-end fragments, so these will be ignored \"
+                         and the fragment length distribution will be estimated.",
                         flm, flsd
                     );
                 }
@@ -332,11 +331,9 @@ fn main() -> anyhow::Result<()> {
                     fl_sd = flsd;
                 } else {
                     bail!(
-                        concat!(
-                            "The input RAD file {} was for unpaired reads, so ",
-                            "a fragment length distribution mean and standard deviation ",
-                            "must be provided."
-                        ),
+                        "The input RAD file {} was for unpaired reads, so \
+                         a fragment length distribution mean and standard deviation \
+                         must be provided.",
                         &input_rad.display()
                     );
                 }
@@ -354,43 +351,40 @@ fn main() -> anyhow::Result<()> {
                 prelude.aln_tags.tags.len()
             );
 
+            // required read-level tag
             const FRAG_TYPE_NAME: &str = "frag_map_type";
-            let mut _ftt: Option<rad_types::RadType> = None;
+            let mut had_frag_map_type = false;
             // parse actual tags
             for rt in &prelude.read_tags.tags {
-                if !rt.typeid.is_int_type() {
-                    error!("currently only RAD types 1--4 are supported for 'b' and 'u' tags.");
-                    std::process::exit(exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
-                }
                 info!("\tread-level tag {}", rt.name);
                 if rt.name == FRAG_TYPE_NAME {
-                    _ftt = Some(rt.typeid);
+                    had_frag_map_type = true;
                 }
             }
+            if !had_frag_map_type {
+                bail!("read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed.");
+            }
 
+            // required alignment level tags
             const REF_ORI_NAME: &str = "compressed_ori_ref";
             const POS_NAME: &str = "pos";
             const FRAGLEN_NAME: &str = "frag_len";
 
-            let mut ref_ori_t: Option<rad_types::RadType> = None;
-            let mut pos_t: Option<rad_types::RadType> = None;
-            let mut fraglen_t: Option<rad_types::RadType> = None;
+            let mut found_ref_ori_t = false;
+            let mut found_pos_t = false;
+            let mut found_fraglen_t = false;
             // parse actual tags
             for at in &prelude.aln_tags.tags {
-                if !at.typeid.is_int_type() {
-                    error!("currently only RAD types 1--4 are supported for 'b' and 'u' tags.");
-                    std::process::exit(exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
-                }
                 info!("\talignment-level tag {}", at.name);
                 match at.name.as_str() {
                     REF_ORI_NAME => {
-                        ref_ori_t = Some(at.typeid);
+                        found_ref_ori_t = true;
                     }
                     POS_NAME => {
-                        pos_t = Some(at.typeid);
+                        found_pos_t = true;
                     }
                     FRAGLEN_NAME => {
-                        fraglen_t = Some(at.typeid);
+                        found_fraglen_t = true;
                     }
                     _ => {
                         info!("unknown alignment-level tag {}", at.name);
@@ -398,14 +392,26 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             // ensure the tags we expect are found
-            assert!(ref_ori_t.is_some());
-            assert!(pos_t.is_some());
-            assert!(fraglen_t.is_some());
+            assert!(
+                found_ref_ori_t,
+                "required alignment-level tag \"{}\" is missing",
+                REF_ORI_NAME
+            );
+            assert!(
+                found_pos_t,
+                "required alignment-level tag \"{}\" is missing",
+                POS_NAME
+            );
+            assert!(
+                found_fraglen_t,
+                "required alignment-level tag \"{}\" is missing",
+                FRAGLEN_NAME
+            );
 
-            // parse the file-level tags
+            // parse the actual file-level tags
             const REF_LENGTHS_NAME: &str = "ref_lengths";
             let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
-
+            // get the reference lengths from the tag map
             let ref_lengths = match file_tag_map.get(REF_LENGTHS_NAME) {
                 Some(rad_types::TagValue::ArrayU32(v)) => Some(v),
                 _ => None,
@@ -415,6 +421,7 @@ fn main() -> anyhow::Result<()> {
                 ref_lengths.expect("was not able to read reference lengths from file!");
             info!("read {} reference lengths", ref_lengths.len());
 
+            // extract whatever context we'll need to read the records
             let tag_context = rad_types::PiscemBulkRecordContext::get_context_from_tag_section(
                 &prelude.file_tags,
                 &prelude.read_tags,

@@ -286,10 +286,10 @@ fn main() -> anyhow::Result<()> {
                 input_map_info.set_extension("map_info.json");
                 if !input_map_info.exists() {
                     ref_sig_json = None;
-                    warn!(concat!("Expected the mapping info file {:?} to exist, but it doesn't. ",
-                          "This is bad, and means that reference provenance signatures cannot be ",
-                          "propagated to the output of piscem-infer. It is strongly recommended ",
-                          "that you investigate why this file does not exist at the expected location."),
+                    warn!("Expected the mapping info file {:?} to exist, but it doesn't. \
+                           This is bad, and means that reference provenance signatures cannot be \
+                           propagated to the output of piscem-infer. It is strongly recommended \
+                           that you investigate why this file does not exist at the expected location.",
                         input_map_info);
                 } else {
                     let map_info_str = std::fs::read_to_string(&input_map_info)

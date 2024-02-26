@@ -11,7 +11,7 @@ use libradicl::rad_types::{self};
 use libradicl::{
     chunk,
     header::RadPrelude,
-    record::{PiscemBulkReadRecord, PiscemBulkRecordContext, RecordContext},
+    record::{PiscemBulkReadRecord, PiscemBulkRecordContext},
 };
 use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
@@ -435,11 +435,7 @@ fn main() -> anyhow::Result<()> {
             );
 
             // extract whatever context we'll need to read the records
-            let tag_context = PiscemBulkRecordContext::get_context_from_tag_section(
-                &prelude.file_tags,
-                &prelude.read_tags,
-                &prelude.aln_tags,
-            )?;
+            let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
             let mut frag_stats = MappedFragStats::new();
             let (eq_map, frag_lengths) = process(

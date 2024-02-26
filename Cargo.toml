@@ -1,38 +1,48 @@
 [package]
 name = "piscem-infer"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2021"
-license = "BSD-3-Clause-Attribution"
-keywords = ["science", "RNA-seq", "RAD-file"]
+readme = "README.md"
+license-file = "LICENSE"
+keywords = ["science", "RNA-seq", "quantification", "RAD-file"]
 categories = ["command-line-utilities", "science"]
 repository = "https://github.com/COMBINE-lab/piscem-infer/"
-homepage = "https://github.com/COMBINE-lab/piscem-infer/"
-readme = "README.md"
+homepage = "https://piscem-infer.readthedocs.io/"
 description = "A flexible tool to perform target quantification from bulk-sequencing data"
 authors = ["Rob Patro", "Rob Patro <rob@cs.umd.edu>"]
+include = [
+  "/src/*.rs",
+  "/src/utils/*.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE"
+]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libradicl = { git = "https://github.com/COMBINE-lab/libradicl", version = "0.6.0" }
-ahash = "0.8.3"
+libradicl = { git = "https://github.com/COMBINE-lab/libradicl", branch = "develop", version = "0.8.0" }
+ahash = "0.8.9"
 distrs = "0.2.1"
-anyhow = "1.0.71"
+anyhow = "1.0.80"
 bincode = "1.3.3"
-bstr = "1.5.0"
-clap = { version = "4.3.10", features = ["derive", "wrap_help", "cargo", "help", "usage", "error-context"] }
-tracing = "0.1.37"
-tracing-subscriber = { version = "0.3.17", default-features = true, features = ["env-filter"] }
-tabled = "0.12.2"
-rayon = "1.8.0"
+bstr = "1.9.1"
+clap = { version = "4.5.1", features = ["derive", "wrap_help", "cargo", "help", "usage", "error-context"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", default-features = true, features = ["env-filter"] }
+tabled = "0.15.0"
+rayon = "1.8.1"
 rand_distr = "0.4.3"
 rand = "0.8.5"
-serde_json = "1.0.107"
-serde_derive = "1.0.188"
-serde = { version = "1.0.188", features = ["serde_derive", "derive"] }
+serde_json = "1.0.114"
+serde_derive = "1.0.197"
+serde = { version = "1.0.197", features = ["serde_derive", "derive"] }
 arrow2 = { version = "0.18.0", features = ["io_parquet", "io_parquet_gzip", "io_parquet_zstd", "io_parquet_snappy"] }
-scroll = "0.11.0"
-snap = "1.1.0"
+scroll = "0.12.0"
+snap = "1.1.1"
 path-tools = "0.1.0"
+atomic_float = "0.1.0"
+num-format = "0.4.4"
 
 [[bin]]
 name = "piscem-infer"
@@ -42,3 +52,24 @@ path = "src/main.rs"
 debug-assertions = false
 lto = "thin"
 panic = "abort"
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'cargo dist'
+[workspace.metadata.dist]
+# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.10.0"
+# CI backends to support
+ci = ["github"]
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Publish jobs to run in CI
+pr-run-mode = "plan"
+
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-14"

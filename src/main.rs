@@ -7,28 +7,31 @@ use arrow2::{
 
 use clap::Args;
 use clap::{Parser, Subcommand};
-use libradicl::exit_codes;
-use libradicl::rad_types;
+use libradicl::rad_types::{self};
+use libradicl::{
+    chunk,
+    header::RadPrelude,
+    record::{PiscemBulkReadRecord, PiscemBulkRecordContext},
+};
+use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
-use scroll::Pread;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use tabled::{settings::Style, Table, Tabled};
-use tracing::{error, info, warn, Level};
+use tracing::{info, warn, Level};
 
 mod utils;
-use utils::custom_rad_utils::MetaChunk;
-use utils::em::{adjust_ref_lengths, conditional_means, em, EMInfo, EqLabel, EqMap};
+use utils::em::{adjust_ref_lengths, conditional_means, em, em_par, EMInfo, EqLabel, EqMap};
 
 use crate::utils::em::conditional_means_from_params;
 use crate::utils::em::do_bootstrap;
 use crate::utils::em::OrientationProperty;
 use crate::utils::em::PackedEqMap;
 use crate::utils::io;
-use utils::map_record_types::{LibraryType, MappingType};
+use utils::map_record_types::LibraryType;
 
 #[derive(Serialize)]
 struct MappedFragStats {
@@ -91,7 +94,7 @@ fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirEntry> {
 fn process<T: Read>(
     br: &mut BufReader<T>,
     nrec: usize,
-    frag_map_t: &rad_types::RadIntId,
+    record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
 ) -> (EqMap, Vec<u32>) {
@@ -103,16 +106,16 @@ fn process<T: Read>(
     const TARGET_UNIQUE_FRAGS: u32 = 5_000;
     let mut unique_frags = 0u32;
 
-    let mut mapped_ori_count = vec![0u32; 7];
-    let mut filtered_ori_count = vec![0u32; 7];
+    let mut mapped_ori_count = [0u32; 7];
+    let mut filtered_ori_count = [0u32; 7];
 
     let mut label_ints = vec![];
     let mut dir_ints = vec![];
     //let mut dir_vec = vec![0u32, 64];
     for _ in 0..nrec {
-        let c = MetaChunk::from_bytes(br, frag_map_t);
+        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
         for mappings in &c.reads {
-            let ft = MappingType::from_u8(mappings.frag_type);
+            let ft = rad_types::MappingType::from_u8(mappings.frag_type);
             let nm = mappings.positions.len();
 
             mapped_stats.tot_mappings += nm;
@@ -185,34 +188,6 @@ fn process<T: Read>(
     (eqmap, frag_lengths)
 }
 
-/// Read the lengths of the reference sequences from the RAD file header.
-fn read_ref_lengths<T: Read>(reader: &mut T) -> anyhow::Result<Vec<u32>> {
-    let mut rbuf = [0u8; 8];
-
-    // read type of length
-    reader.read_exact(&mut rbuf[0..1])?;
-    let lt = rbuf.pread::<u8>(0).unwrap() as u64;
-    assert_eq!(lt, 3);
-
-    // read length of the array
-    reader.read_exact(&mut rbuf[0..4])?;
-    let len = rbuf.pread::<u32>(0).unwrap() as usize;
-
-    // read type of entry
-    reader.read_exact(&mut rbuf[0..1])?;
-    let et = rbuf.pread::<u8>(0).unwrap() as u64;
-    assert_eq!(et, 3);
-
-    let mut vec = Vec::<u32>::with_capacity(len);
-    for _ in 0..len {
-        reader.read_exact(&mut rbuf[0..4])?;
-        let v = rbuf.pread::<u32>(0).unwrap();
-        vec.push(v);
-    }
-
-    Ok(vec)
-}
-
 #[derive(Args, Serialize, Clone, Debug)]
 pub struct QuantOpts {
     /// input stem (i.e. without the .rad suffix)
@@ -241,7 +216,7 @@ pub struct QuantOpts {
     /// number of bootstrap replicates to perform.
     #[arg(long, default_value_t = 0)]
     pub num_bootstraps: usize,
-    /// number of threads to use (only used for bootstrapping)
+    /// number of threads to use (used during the EM and for bootstrapping)
     #[arg(long, default_value_t = 16)]
     pub num_threads: usize,
 }
@@ -253,7 +228,7 @@ enum Commands {
     Quant(QuantOpts),
 }
 
-/// quantifying from a metagenomic rad file
+/// quantify target abundance from bulk-sequencing data
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 #[command(propagate_version = true)]
@@ -339,18 +314,18 @@ fn main() -> anyhow::Result<()> {
             let mut fl_mean = 0_f64;
             let mut fl_sd = 0_f64;
 
-            let hdr = rad_types::RadHeader::from_bytes(&mut br);
+            // read the header and tag sections from the rad file
+            let prelude = RadPrelude::from_bytes(&mut br)?;
+
             info!("read header!");
-            if hdr.is_paired > 0_u8 {
+            if prelude.hdr.is_paired > 0_u8 {
                 info!("fragments paired in sequencing");
                 paired_end = true;
                 if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
                     warn!(
-                        concat!(
-                            "provided fragment length distribution mean and sd ({}, {}), but ",
-                            "the RAD file contains paired-end fragments, so these will be ignored ",
-                            "and the fragment length distribution will be estimated."
-                        ),
+                        "provided fragment length distribution mean and sd ({}, {}), but \
+                         the RAD file contains paired-end fragments, so these will be ignored \"
+                         and the fragment length distribution will be estimated.",
                         flm, flsd
                     );
                 }
@@ -362,65 +337,64 @@ fn main() -> anyhow::Result<()> {
                     fl_sd = flsd;
                 } else {
                     bail!(
-                        concat!(
-                            "The input RAD file {} was for unpaired reads, so ",
-                            "a fragment length distribution mean and standard deviation ",
-                            "must be provided."
-                        ),
+                        "The input RAD file {} was for unpaired reads, so \
+                         a fragment length distribution mean and standard deviation \
+                         must be provided.",
                         &input_rad.display()
                     );
                 }
             }
 
             // file-level
-            let fl_tags = rad_types::TagSection::from_bytes(&mut br);
-            info!("read {:?} file-level tags", fl_tags.tags.len());
+            info!("read {:?} file-level tags", prelude.file_tags.tags.len());
+            // parse actual tags
+            for ft in &prelude.file_tags.tags {
+                info!("\tfile-level tag {}", ft.name);
+            }
 
             // read-level
-            let rl_tags = rad_types::TagSection::from_bytes(&mut br);
-            info!("read {:?} read-level tags", rl_tags.tags.len());
+            info!("read {:?} read-level tags", prelude.read_tags.tags.len());
 
+            // required read-level tag
             const FRAG_TYPE_NAME: &str = "frag_map_type";
-            let mut ftt: Option<u8> = None;
+            let mut had_frag_map_type = false;
             // parse actual tags
-            for rt in &rl_tags.tags {
-                if rad_types::decode_int_type_tag(rt.typeid).is_none() {
-                    error!("currently only RAD types 1--4 are supported for 'b' and 'u' tags.");
-                    std::process::exit(exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
-                }
+            for rt in &prelude.read_tags.tags {
                 info!("\tread-level tag {}", rt.name);
                 if rt.name == FRAG_TYPE_NAME {
-                    ftt = Some(rt.typeid);
+                    had_frag_map_type = true;
                 }
+            }
+            if !had_frag_map_type {
+                bail!("read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed.");
             }
 
             // alignment-level
-            let al_tags = rad_types::TagSection::from_bytes(&mut br);
-            info!("read {:?} alignemnt-level tags", al_tags.tags.len());
+            info!(
+                "read {:?} alignemnt-level tags",
+                prelude.aln_tags.tags.len()
+            );
 
+            // required alignment level tags
             const REF_ORI_NAME: &str = "compressed_ori_ref";
             const POS_NAME: &str = "pos";
             const FRAGLEN_NAME: &str = "frag_len";
 
-            let mut ref_ori_t: Option<u8> = None;
-            let mut pos_t: Option<u8> = None;
-            let mut fraglen_t: Option<u8> = None;
+            let mut found_ref_ori_t = false;
+            let mut found_pos_t = false;
+            let mut found_fraglen_t = false;
             // parse actual tags
-            for at in &al_tags.tags {
-                if rad_types::decode_int_type_tag(at.typeid).is_none() {
-                    error!("currently only RAD types 1--4 are supported for 'b' and 'u' tags.");
-                    std::process::exit(exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
-                }
+            for at in &prelude.aln_tags.tags {
                 info!("\talignment-level tag {}", at.name);
                 match at.name.as_str() {
                     REF_ORI_NAME => {
-                        ref_ori_t = Some(at.typeid);
+                        found_ref_ori_t = true;
                     }
                     POS_NAME => {
-                        pos_t = Some(at.typeid);
+                        found_pos_t = true;
                     }
                     FRAGLEN_NAME => {
-                        fraglen_t = Some(at.typeid);
+                        found_fraglen_t = true;
                     }
                     _ => {
                         info!("unknown alignment-level tag {}", at.name);
@@ -428,39 +402,46 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             // ensure the tags we expect are found
-            assert!(ref_ori_t.is_some());
-            assert!(pos_t.is_some());
-            assert!(fraglen_t.is_some());
+            assert!(
+                found_ref_ori_t,
+                "required alignment-level tag \"{}\" is missing",
+                REF_ORI_NAME
+            );
+            assert!(
+                found_pos_t,
+                "required alignment-level tag \"{}\" is missing",
+                POS_NAME
+            );
+            assert!(
+                found_fraglen_t,
+                "required alignment-level tag \"{}\" is missing",
+                FRAGLEN_NAME
+            );
 
-            // parse the file-level tags
+            // parse the actual file-level tags
             const REF_LENGTHS_NAME: &str = "ref_lengths";
-            let mut ref_lengths: Option<Vec<u32>> = None;
-            for ft in &fl_tags.tags {
-                if ft.name == REF_LENGTHS_NAME {
-                    if ft.typeid != 7 {
-                        error!("expected array type (7) but found, {}", ft.typeid);
-                    }
-                    info!("found frag_length file-level tag");
-
-                    let v = read_ref_lengths(&mut br)?;
-                    ref_lengths = Some(v);
-                }
-            }
+            let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
+            // get the reference lengths from the tag map
+            let ref_lengths = match file_tag_map.get(REF_LENGTHS_NAME) {
+                Some(rad_types::TagValue::ArrayU32(v)) => Some(v),
+                _ => None,
+            };
 
             let ref_lengths =
                 ref_lengths.expect("was not able to read reference lengths from file!");
-            info!("read {} reference lengths", ref_lengths.len());
+            info!(
+                "read {} reference lengths",
+                ref_lengths.len().to_formatted_string(&Locale::en)
+            );
 
-            let frag_map_t = rad_types::decode_int_type_tag(
-                ftt.expect("no fragment mapping type description present."),
-            )
-            .context("unknown fragment mapping type id.")?;
+            // extract whatever context we'll need to read the records
+            let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
             let mut frag_stats = MappedFragStats::new();
             let (eq_map, frag_lengths) = process(
                 &mut br,
-                hdr.num_chunks as usize,
-                &frag_map_t,
+                prelude.hdr.num_chunks as usize,
+                &tag_context,
                 lib_type,
                 &mut frag_stats,
             );
@@ -480,16 +461,39 @@ fn main() -> anyhow::Result<()> {
                 max_iter,
                 convergence_thresh,
             };
-            let em_res = em(&eminfo);
+
+            let em_res = if num_threads > 1 {
+                em_par(&eminfo, num_threads)
+            } else {
+                em(&eminfo)
+            };
 
             let quant_output = output.with_additional_extension(".quant");
-            io::write_results(&quant_output, &hdr, &em_res, &ref_lengths, &eff_lengths)?;
+            io::write_results(
+                &quant_output,
+                &prelude.hdr,
+                &em_res,
+                &ref_lengths,
+                &eff_lengths,
+            )?;
 
-            info!("num mapped reads = {}", frag_stats.num_mapped_reads);
-            info!("total mappings = {}", frag_stats.tot_mappings);
-            info!("number of equivalence classes = {}", eq_map.len());
+            info!(
+                "num mapped reads = {}",
+                frag_stats.num_mapped_reads.to_formatted_string(&Locale::en)
+            );
+            info!(
+                "total mappings = {}",
+                frag_stats.tot_mappings.to_formatted_string(&Locale::en)
+            );
+            info!(
+                "number of equivalence classes = {}",
+                eq_map.len().to_formatted_string(&Locale::en)
+            );
             let total_weight: usize = eq_map.count_map.values().sum();
-            info!("total equivalence map weight = {}", total_weight);
+            info!(
+                "total equivalence map weight = {}",
+                total_weight.to_formatted_string(&Locale::en)
+            );
 
             {
                 let fld_array = UInt32Array::from_vec(frag_lengths);

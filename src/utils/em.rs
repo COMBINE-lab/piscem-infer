@@ -1,8 +1,10 @@
 use ahash::AHashMap;
+use atomic_float::AtomicF64;
 use rand::prelude::*;
 use rand::thread_rng;
 use rand_distr::WeightedAliasIndex;
 use rayon::prelude::*;
+use std::sync::atomic::Ordering;
 use tracing::info;
 
 pub enum OrientationProperty {
@@ -116,6 +118,8 @@ pub struct PackedEqLabelIter<'a> {
 
 impl<'a> Iterator for PackedEqLabelIter<'a> {
     type Item = &'a [u32];
+
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let c = self.counter as usize;
         if c < self.underlying_packed_map.len() {
@@ -139,6 +143,8 @@ pub struct PackedEqEntryIter<'a> {
 
 impl<'a> Iterator for PackedEqEntryIter<'a> {
     type Item = (&'a [u32], &'a usize);
+
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let c = self.counter as usize;
         if c < self.underlying_packed_map.len() {
@@ -196,6 +202,8 @@ pub struct EqEntryIter<'a> {
 
 impl<'a> Iterator for EqEntryIter<'a> {
     type Item = (&'a [u32], &'a usize);
+
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying_iter.next() {
             Some((k, v)) => Some((k.target_labels(self.contains_ori), v)),
@@ -287,6 +295,38 @@ const ABSENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 1e-3;
 
 #[inline]
+fn m_step_par(
+    eq_iterates: &[(&[u32], &usize)],
+    prev_count: &mut [AtomicF64],
+    inv_eff_lens: &[f64],
+    curr_counts: &mut [AtomicF64],
+) {
+    // TODO: is there a better way to set the capacity on
+    // this Vec?
+    eq_iterates.par_iter().for_each_with(
+        (&curr_counts, Vec::with_capacity(64)),
+        |(curr_counts, weights), (k, v)| {
+            let count = **v as f64;
+
+            let mut denom = 0.0_f64;
+            for e in k.iter() {
+                let w = prev_count[*e as usize].load(Ordering::Relaxed) * inv_eff_lens[*e as usize];
+                weights.push(w);
+                denom += w;
+            }
+            if denom > 1e-8 {
+                let count_over_denom = count / denom;
+                for (target_id, w) in k.iter().zip(weights.iter()) {
+                    let inc = count_over_denom * w;
+                    curr_counts[*target_id as usize].fetch_add(inc, Ordering::AcqRel);
+                }
+            }
+            weights.clear();
+        },
+    );
+}
+
+#[inline]
 fn m_step(
     eq_map: &PackedEqMap,
     eq_counts: &[usize],
@@ -294,7 +334,8 @@ fn m_step(
     inv_eff_lens: &[f64],
     curr_counts: &mut [f64],
 ) {
-    // TODO: is there a better way to set this capacity?
+    // TODO: is there a better way to set the capacity on
+    // this Vec?
     let mut weights: Vec<f64> = Vec::with_capacity(64);
 
     for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
@@ -402,6 +443,98 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
             curr_counts
         })
         .collect()
+}
+
+pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
+    let eq_map = em_info.eq_map;
+    let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = eff_lens
+        .iter()
+        .map(|x| {
+            let y = 1.0_f64 / *x;
+            if y.is_finite() {
+                y
+            } else {
+                0_f64
+            }
+        })
+        .collect::<Vec<f64>>();
+    let max_iter = em_info.max_iter;
+    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+
+    // init
+    let avg = total_weight / (eff_lens.len() as f64);
+    let mut prev_counts: Vec<AtomicF64> = vec![avg; eff_lens.len()]
+        .iter()
+        .map(|x| AtomicF64::new(*x))
+        .collect();
+    let mut curr_counts: Vec<AtomicF64> = vec![0.0f64; eff_lens.len()]
+        .iter()
+        .map(|x| AtomicF64::new(*x))
+        .collect();
+
+    let eq_iterates: Vec<(&[u32], &usize)> = eq_map.iter_labels().zip(&eq_map.counts).collect();
+
+    let mut rel_diff = 0.0_f64;
+    let mut niter = 0_u32;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(nthreads)
+        .build()
+        .unwrap();
+
+    pool.install(|| {
+        while niter < max_iter {
+            m_step_par(
+                &eq_iterates,
+                &mut prev_counts,
+                &inv_eff_lens,
+                &mut curr_counts,
+            );
+
+            //std::mem::swap(&)
+            for i in 0..curr_counts.len() {
+                let pci = prev_counts[i].load(Ordering::Relaxed);
+                if pci > ABSENCE_THRESH {
+                    let cci = curr_counts[i].load(Ordering::Relaxed);
+                    let rd = (cci - pci) / pci;
+                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
+                }
+            }
+
+            std::mem::swap(&mut prev_counts, &mut curr_counts);
+            // zero out the vector
+            curr_counts
+                .par_iter()
+                .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
+
+            if rel_diff < RELDIFF_THRESH {
+                break;
+            }
+            niter += 1;
+            if niter % 100 == 0 {
+                info!("iteration {}; rel diff {:.3}", niter, rel_diff);
+            }
+            rel_diff = 0.0_f64;
+        }
+
+        prev_counts.iter_mut().for_each(|x| {
+            if x.load(Ordering::Relaxed) < ABSENCE_THRESH {
+                x.store(0.0, Ordering::Relaxed);
+            }
+        });
+        m_step_par(
+            &eq_iterates,
+            &mut prev_counts,
+            &inv_eff_lens,
+            &mut curr_counts,
+        );
+    });
+
+    curr_counts
+        .iter()
+        .map(|x| x.load(Ordering::Relaxed))
+        .collect::<Vec<f64>>()
 }
 
 pub fn em(em_info: &EMInfo) -> Vec<f64> {

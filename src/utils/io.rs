@@ -5,7 +5,7 @@ use arrow2::{
     chunk::Chunk,
     datatypes::{Field, Schema},
 };
-use libradicl::rad_types;
+use libradicl::header;
 use path_tools::WithAdditionalExtension;
 use std::fs::File;
 use std::io::Write;
@@ -15,7 +15,7 @@ use tracing::warn;
 
 pub(crate) fn write_results(
     output: &Path,
-    hdr: &rad_types::RadHeader,
+    hdr: &header::RadHeader,
     e_counts: &[f64],
     lengths: &[u32],
     eff_lengths: &[f64],
@@ -68,7 +68,6 @@ pub(crate) fn write_fld_file(
     chunk: Chunk<Box<dyn Array>>,
 ) -> Result<()> {
     let output_path = output_path
-        .clone()
         .to_path_buf()
         .with_additional_extension(".fld.pq");
     let schema = Schema::from(fields);
@@ -81,7 +80,6 @@ pub(crate) fn write_infrep_file(
     chunk: Chunk<Box<dyn Array>>,
 ) -> Result<()> {
     let output_path = output_path
-        .clone()
         .to_path_buf()
         .with_additional_extension(".infreps.pq");
     let schema = Schema::from(fields);

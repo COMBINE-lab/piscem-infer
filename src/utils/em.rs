@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use atomic_float::AtomicF64;
 use rand::prelude::*;
-use rand::thread_rng;
+use rand::rng;
 use rand_distr::weighted::WeightedAliasIndex;
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
@@ -366,6 +366,7 @@ pub struct EMInfo<'eqm, 'el> {
 }
 
 pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
+    let converge_thresh = em_info.convergence_thresh;
     let eq_map = em_info.eq_map;
     let max_iter = em_info.max_iter;
     let eff_lens = em_info.eff_lens;
@@ -394,7 +395,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
 
             let mut rel_diff = 0.0_f64;
             let mut niter = 0_u32;
-            let mut rng = thread_rng();
+            let mut rng = rng();
             let mut base_counts = vec![0_usize; eq_map.counts.len()];
             for _s in 0..total_weight {
                 base_counts[dist.sample(&mut rng)] += 1;
@@ -420,7 +421,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
                 std::mem::swap(&mut prev_counts, &mut curr_counts);
                 curr_counts.fill(0.0_f64);
 
-                if rel_diff < RELDIFF_THRESH {
+                if rel_diff < converge_thresh {
                     break;
                 }
                 niter += 1;
@@ -446,6 +447,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
 }
 
 pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
+    let converge_thresh = em_info.convergence_thresh;
     let eq_map = em_info.eq_map;
     let eff_lens = em_info.eff_lens;
     let inv_eff_lens = eff_lens
@@ -508,7 +510,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
                 .par_iter()
                 .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
 
-            if rel_diff < RELDIFF_THRESH {
+            if rel_diff < converge_thresh {
                 break;
             }
             niter += 1;

@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use atomic_float::AtomicF64;
 use rand::prelude::*;
 use rand::thread_rng;
-use rand_distr::WeightedAliasIndex;
+use rand_distr::weighted::WeightedAliasIndex;
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
 use tracing::info;

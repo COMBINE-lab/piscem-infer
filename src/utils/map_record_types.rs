@@ -66,8 +66,8 @@ mod tests {
 
     #[test]
     fn lib_types_parse() {
-        let lss = vec!["SF", "ISF", "SR", "ISR", "U", "IU", "ANY"];
-        let lts = vec![
+        let lss = ["SF", "ISF", "SR", "ISR", "U", "IU", "ANY"];
+        let lts = [
             LibraryType::StrandedForward,
             LibraryType::InwardStrandedForward,
             LibraryType::StrandedReverse,
@@ -88,7 +88,7 @@ mod tests {
     fn bad_lib_fails() {
         match "ABC".parse::<LibraryType>() {
             Err(x) => {
-                assert_eq!("ABC is an unknown library type!", format!("{}", x));
+                assert_eq!("ABC is an unknown library type!", format!("{x}"));
             }
             _ => {
                 panic!("ABC should not parse!");

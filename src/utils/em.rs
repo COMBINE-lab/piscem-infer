@@ -111,6 +111,8 @@ impl PackedEqMap {
     }
 }
 
+/// An iterator over the labels of the
+/// `PackedEqMap`.
 pub struct PackedEqLabelIter<'a> {
     counter: u32,
     underlying_packed_map: &'a PackedEqMap,
@@ -136,6 +138,10 @@ impl<'a> Iterator for PackedEqLabelIter<'a> {
     }
 }
 
+impl<'a> ExactSizeIterator for PackedEqLabelIter<'a> {}
+
+/// An iterator over the equivalence classes of the
+/// `PackedEqMap`.
 pub struct PackedEqEntryIter<'a> {
     counter: u32,
     underlying_packed_map: &'a PackedEqMap,
@@ -157,13 +163,14 @@ impl<'a> Iterator for PackedEqEntryIter<'a> {
             None
         }
     }
-}
 
-impl<'a> ExactSizeIterator for PackedEqEntryIter<'a> {
-    fn len(&self) -> usize {
-        self.underlying_packed_map.len() - self.counter as usize
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.underlying_packed_map.len() - self.counter as usize;
+        (rem, Some(rem))
     }
 }
+
+impl<'a> ExactSizeIterator for PackedEqEntryIter<'a> {}
 
 impl EqMap {
     /// Create a new equivalence class map, if
@@ -210,7 +217,13 @@ impl<'a> Iterator for EqEntryIter<'a> {
             None => None,
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.underlying_iter.size_hint()
+    }
 }
+
+impl<'a> ExactSizeIterator for EqEntryIter<'a> {}
 
 /// Takes as input `freq`, the frequency of occurrence of
 /// fragments of each observed length, and returns

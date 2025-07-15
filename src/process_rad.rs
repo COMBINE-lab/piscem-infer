@@ -15,13 +15,13 @@ use std::path::Path;
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
-use crate::LibraryType;
 use crate::prog_opts::QuantOpts;
 use crate::utils::em::{
     EMInfo, EqLabel, EqMap, OrientationProperty, PackedEqMap, adjust_ref_lengths,
     conditional_means, conditional_means_from_params, do_bootstrap, em, em_par,
 };
 use crate::utils::io;
+use crate::utils::map_record_types::LibraryType;
 
 use libradicl::rad_types::{self};
 use libradicl::{
@@ -118,11 +118,10 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         if !input_map_info.exists() {
             ref_sig_json = None;
             warn!(
-                "Expected the mapping info file {:?} to exist, but it doesn't. \
+                "Expected the mapping info file {input_map_info:?} to exist, but it doesn't. \
                     This is bad, and means that reference provenance signatures cannot be \
                     propagated to the output of piscem-infer. It is strongly recommended \
-                    that you investigate why this file does not exist at the expected location.",
-                input_map_info
+                    that you investigate why this file does not exist at the expected location."
             );
         } else {
             let map_info_str = std::fs::read_to_string(&input_map_info)
@@ -132,8 +131,7 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
                 ref_sig_json = Some(sigs.clone());
             } else {
                 warn!(
-                    "The file {:?} exists, but has no \"signatures\" entry holding the reference provenance signatures",
-                    input_map_info
+                    "The file {input_map_info:?} exists, but has no \"signatures\" entry holding the reference provenance signatures"
                 );
                 ref_sig_json = None;
             }
@@ -158,10 +156,9 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         paired_end = true;
         if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
             warn!(
-                "provided fragment length distribution mean and sd ({}, {}), but \
+                "provided fragment length distribution mean and sd ({flm}, {flsd}), but \
                     the RAD file contains paired-end fragments, so these will be ignored \"
-                    and the fragment length distribution will be estimated.",
-                flm, flsd
+                    and the fragment length distribution will be estimated."
             );
         }
     } else {

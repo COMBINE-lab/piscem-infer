@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use arrow2::{
     array::{Float64Array, UInt32Array},
     chunk::Chunk,
@@ -16,20 +16,20 @@ use libradicl::{
 use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
-use serde_json::{json, Value};
-use std::fs::{create_dir_all, File};
+use serde_json::{Value, json};
+use std::fs::{File, create_dir_all};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use tabled::{settings::Style, Table, Tabled};
-use tracing::{info, warn, Level};
+use tabled::{Table, Tabled, settings::Style};
+use tracing::{Level, info, warn};
 
 mod utils;
-use utils::em::{adjust_ref_lengths, conditional_means, em, em_par, EMInfo, EqLabel, EqMap};
+use utils::em::{EMInfo, EqLabel, EqMap, adjust_ref_lengths, conditional_means, em, em_par};
 
-use crate::utils::em::conditional_means_from_params;
-use crate::utils::em::do_bootstrap;
 use crate::utils::em::OrientationProperty;
 use crate::utils::em::PackedEqMap;
+use crate::utils::em::conditional_means_from_params;
+use crate::utils::em::do_bootstrap;
 use crate::utils::io;
 use utils::map_record_types::LibraryType;
 
@@ -181,8 +181,10 @@ fn process<T: Read>(
     );
 
     if unique_frags < TARGET_UNIQUE_FRAGS {
-        warn!("Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution estimate may not be robust",
-            unique_frags, TARGET_UNIQUE_FRAGS);
+        warn!(
+            "Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution estimate may not be robust",
+            unique_frags, TARGET_UNIQUE_FRAGS
+        );
     }
 
     (eqmap, frag_lengths)
@@ -286,11 +288,13 @@ fn main() -> anyhow::Result<()> {
                 input_map_info.set_extension("map_info.json");
                 if !input_map_info.exists() {
                     ref_sig_json = None;
-                    warn!("Expected the mapping info file {:?} to exist, but it doesn't. \
+                    warn!(
+                        "Expected the mapping info file {:?} to exist, but it doesn't. \
                            This is bad, and means that reference provenance signatures cannot be \
                            propagated to the output of piscem-infer. It is strongly recommended \
                            that you investigate why this file does not exist at the expected location.",
-                        input_map_info);
+                        input_map_info
+                    );
                 } else {
                     let map_info_str = std::fs::read_to_string(&input_map_info)
                         .unwrap_or_else(|_| panic!("Couldn't open {:?}.", &input_map_info));
@@ -298,8 +302,10 @@ fn main() -> anyhow::Result<()> {
                     if let Some(sigs) = v.get("signatures") {
                         ref_sig_json = Some(sigs.clone());
                     } else {
-                        warn!("The file {:?} exists, but has no \"signatures\" entry holding the reference provenance signatures",
-                            input_map_info);
+                        warn!(
+                            "The file {:?} exists, but has no \"signatures\" entry holding the reference provenance signatures",
+                            input_map_info
+                        );
                         ref_sig_json = None;
                     }
                 }
@@ -366,7 +372,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if !had_frag_map_type {
-                bail!("read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed.");
+                bail!(
+                    "read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed."
+                );
             }
 
             // alignment-level

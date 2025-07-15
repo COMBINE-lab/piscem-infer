@@ -412,18 +412,15 @@ fn main() -> anyhow::Result<()> {
             // ensure the tags we expect are found
             assert!(
                 found_ref_ori_t,
-                "required alignment-level tag \"{}\" is missing",
-                REF_ORI_NAME
+                "required alignment-level tag \"{REF_ORI_NAME}\" is missing"
             );
             assert!(
                 found_pos_t,
-                "required alignment-level tag \"{}\" is missing",
-                POS_NAME
+                "required alignment-level tag \"{POS_NAME}\" is missing"
             );
             assert!(
                 found_fraglen_t,
-                "required alignment-level tag \"{}\" is missing",
-                FRAGLEN_NAME
+                "required alignment-level tag \"{FRAGLEN_NAME}\" is missing"
             );
 
             // parse the actual file-level tags
@@ -459,7 +456,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 conditional_means_from_params(fl_mean, fl_sd, 65_636_usize)
             };
-            let eff_lengths = adjust_ref_lengths(&ref_lengths, &cond_means);
+            let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
 
             let packed_eq_map = PackedEqMap::from_eq_map(&eq_map);
 
@@ -481,7 +478,7 @@ fn main() -> anyhow::Result<()> {
                 &quant_output,
                 &prelude.hdr,
                 &em_res,
-                &ref_lengths,
+                ref_lengths,
                 &eff_lengths,
             )?;
 
@@ -525,7 +522,7 @@ fn main() -> anyhow::Result<()> {
                 for (i, b) in bootstraps.into_iter().enumerate() {
                     let bs_array = Float64Array::from_vec(b);
                     bs_fields.push(Field::new(
-                        format!("bootstrap.{}", i),
+                        format!("bootstrap.{i}"),
                         bs_array.data_type().clone(),
                         false,
                     ));

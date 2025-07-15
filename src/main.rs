@@ -8,7 +8,6 @@ mod utils;
 use prog_opts::{Cli, Commands};
 
 use crate::process_rad::process_bulk;
-use utils::map_record_types::LibraryType;
 
 fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();

@@ -271,7 +271,7 @@ pub fn conditional_means_from_params(mu: f64, sigma: f64, upper: usize) -> Vec<f
 /// the computed conditional means `cond_means` of the fragment length distribution.
 pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
     let tmean = cond_means.last().unwrap();
-    let el = ref_lens
+    ref_lens
         .iter()
         .map(|rli| {
             let rl = *rli as usize;
@@ -280,15 +280,9 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
             } else {
                 (rl as f64) - cond_means[rl]
             };
-            if adj_len >= 1.0 {
-                adj_len
-            } else {
-                rl as f64
-            }
+            if adj_len >= 1.0 { adj_len } else { rl as f64 }
         })
-        .collect::<Vec<f64>>();
-
-    el
+        .collect::<Vec<f64>>()
 }
 
 const ABSENCE_THRESH: f64 = 1e-8;
@@ -374,11 +368,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
         .iter()
         .map(|x| {
             let y = 1.0_f64 / *x;
-            if y.is_finite() {
-                y
-            } else {
-                0_f64
-            }
+            if y.is_finite() { y } else { 0_f64 }
         })
         .collect::<Vec<f64>>();
     let total_weight = em_info.eq_map.counts.iter().sum::<usize>();
@@ -454,11 +444,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
         .iter()
         .map(|x| {
             let y = 1.0_f64 / *x;
-            if y.is_finite() {
-                y
-            } else {
-                0_f64
-            }
+            if y.is_finite() { y } else { 0_f64 }
         })
         .collect::<Vec<f64>>();
     let max_iter = em_info.max_iter;
@@ -546,11 +532,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
         .iter()
         .map(|x| {
             let y = 1.0_f64 / *x;
-            if y.is_finite() {
-                y
-            } else {
-                0_f64
-            }
+            if y.is_finite() { y } else { 0_f64 }
         })
         .collect::<Vec<f64>>();
     let max_iter = em_info.max_iter;

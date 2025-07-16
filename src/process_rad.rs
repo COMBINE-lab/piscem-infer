@@ -95,6 +95,7 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     let output = qo.output;
     let max_iter = qo.max_iter;
     let convergence_thresh = qo.convergence_thresh;
+    let presence_thresh = qo.presence_thresh;
     let fld_mean = qo.fld_mean;
     let fld_sd = qo.fld_sd;
     let num_bootstraps = qo.num_bootstraps;
@@ -290,6 +291,7 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         eff_lens: &eff_lengths,
         max_iter,
         convergence_thresh,
+        presence_thresh,
     };
 
     let em_res = if num_threads > 1 {

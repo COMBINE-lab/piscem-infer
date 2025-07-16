@@ -298,9 +298,6 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
         .collect::<Vec<f64>>()
 }
 
-const ABSENCE_THRESH: f64 = 1e-8;
-const RELDIFF_THRESH: f64 = 1e-3;
-
 #[inline]
 fn m_step_par(
     eq_iterates: &[(&[u32], &usize)],
@@ -370,10 +367,12 @@ pub struct EMInfo<'eqm, 'el> {
     pub eff_lens: &'el [f64],
     pub max_iter: u32,
     pub convergence_thresh: f64,
+    pub presence_thresh: f64,
 }
 
 pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
     let converge_thresh = em_info.convergence_thresh;
+    let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
     let max_iter = em_info.max_iter;
     let eff_lens = em_info.eff_lens;
@@ -415,7 +414,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
 
                 //std::mem::swap(&)
                 for i in 0..curr_counts.len() {
-                    if prev_counts[i] > ABSENCE_THRESH {
+                    if prev_counts[i] > presence_thresh {
                         let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
                         rel_diff = if rel_diff > rd { rel_diff } else { rd };
                     }
@@ -432,7 +431,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
             }
 
             prev_counts.iter_mut().for_each(|x| {
-                if *x < ABSENCE_THRESH {
+                if *x < presence_thresh {
                     *x = 0.0
                 }
             });
@@ -451,6 +450,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
 
 pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
+    let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
     let eff_lens = em_info.eff_lens;
     let inv_eff_lens = eff_lens
@@ -496,7 +496,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
             //std::mem::swap(&)
             for i in 0..curr_counts.len() {
                 let pci = prev_counts[i].load(Ordering::Relaxed);
-                if pci > ABSENCE_THRESH {
+                if pci > presence_thresh {
                     let cci = curr_counts[i].load(Ordering::Relaxed);
                     let rd = (cci - pci) / pci;
                     rel_diff = if rel_diff > rd { rel_diff } else { rd };
@@ -520,7 +520,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
         }
 
         prev_counts.iter_mut().for_each(|x| {
-            if x.load(Ordering::Relaxed) < ABSENCE_THRESH {
+            if x.load(Ordering::Relaxed) < presence_thresh {
                 x.store(0.0, Ordering::Relaxed);
             }
         });
@@ -539,6 +539,8 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
 }
 
 pub fn em(em_info: &EMInfo) -> Vec<f64> {
+    let converge_thresh = em_info.convergence_thresh;
+    let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
     let eff_lens = em_info.eff_lens;
     let inv_eff_lens = eff_lens
@@ -570,7 +572,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
 
         //std::mem::swap(&)
         for i in 0..curr_counts.len() {
-            if prev_counts[i] > ABSENCE_THRESH {
+            if prev_counts[i] > presence_thresh {
                 let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
                 rel_diff = if rel_diff > rd { rel_diff } else { rd };
             }
@@ -579,7 +581,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
         std::mem::swap(&mut prev_counts, &mut curr_counts);
         curr_counts.fill(0.0_f64);
 
-        if rel_diff < RELDIFF_THRESH {
+        if rel_diff < converge_thresh {
             break;
         }
         niter += 1;
@@ -590,7 +592,7 @@ pub fn em(em_info: &EMInfo) -> Vec<f64> {
     }
 
     prev_counts.iter_mut().for_each(|x| {
-        if *x < ABSENCE_THRESH {
+        if *x < presence_thresh {
             *x = 0.0
         }
     });

@@ -17,9 +17,10 @@ use tracing::{info, warn};
 
 use crate::prog_opts::QuantOpts;
 use crate::utils::em::{
-    EMInfo, EqLabel, EqMap, OrientationProperty, PackedEqMap, adjust_ref_lengths,
-    conditional_means, conditional_means_from_params, do_bootstrap, em, em_par,
+    EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap, em,
+    em_par,
 };
+use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap};
 use crate::utils::io;
 use crate::utils::map_record_types::LibraryType;
 
@@ -50,38 +51,38 @@ impl MappedFragStats {
 }
 
 #[derive(Tabled)]
-struct DirEntry {
+struct DirectionalEntry {
     name: &'static str,
     count: u32,
 }
 
-fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirEntry> {
+fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirectionalEntry> {
     vec![
-        DirEntry {
+        DirectionalEntry {
             name: "unknown",
             count: mapped_ori_count_global[0],
         },
-        DirEntry {
+        DirectionalEntry {
             name: "f",
             count: mapped_ori_count_global[1],
         },
-        DirEntry {
+        DirectionalEntry {
             name: "r",
             count: mapped_ori_count_global[2],
         },
-        DirEntry {
+        DirectionalEntry {
             name: "fr",
             count: mapped_ori_count_global[3],
         },
-        DirEntry {
+        DirectionalEntry {
             name: "rf",
             count: mapped_ori_count_global[4],
         },
-        DirEntry {
+        DirectionalEntry {
             name: "ff",
             count: mapped_ori_count_global[5],
         },
-        DirEntry {
+        DirectionalEntry {
             name: "rr",
             count: mapped_ori_count_global[6],
         },

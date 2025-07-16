@@ -772,7 +772,6 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 [[package]]
 name = "libradicl"
 version = "0.10.0"
-source = "git+https://github.com/COMBINE-lab/libradicl?branch=develop#07d42bedf341f43d9388e27dab3eb370589389ab"
 dependencies = [
  "ahash",
  "anyhow",

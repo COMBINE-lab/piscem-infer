@@ -9,9 +9,12 @@ use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::fs::{File, create_dir_all};
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::{
+    fs::{File, create_dir_all},
+    io::Seek,
+};
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
@@ -270,6 +273,42 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
     let mut frag_stats = MappedFragStats::new();
+    let est_frag_lengths: Option<Vec<u32>>;
+    if paired_end {
+        let mut temp_frag_lengths = vec![0u32; 65_536];
+        let mut rem_mappings_for_estimate = 500_000_isize;
+        let file_offset = br.stream_position()?;
+
+        'estimate_fld: for _ in 0..(prelude.hdr.num_chunks as usize) {
+            let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(&mut br, &tag_context);
+            for mappings in &c.reads {
+                let ft = rad_types::MappingType::from_u8(mappings.frag_type);
+                let nm = mappings.positions.len();
+                if nm == 1 && !ft.is_orphan() {
+                    let o = mappings.dirs.first().expect("at least one mapping");
+                    if lib_type.is_compatible_with(*o) {
+                        if let Some(fl) = mappings.frag_lengths.first() {
+                            temp_frag_lengths[*fl as usize] += 1;
+                            rem_mappings_for_estimate -= 1;
+                            if rem_mappings_for_estimate <= 0 {
+                                break 'estimate_fld;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        br.seek(std::io::SeekFrom::Start(file_offset))?;
+        let cmeans = conditional_means(&temp_frag_lengths);
+        eprintln!(
+            "computed conditional means ... last is {}",
+            cmeans.last().expect("present")
+        );
+        est_frag_lengths = Some(temp_frag_lengths);
+    } else {
+        est_frag_lengths = None;
+    }
+
     let (eq_map, frag_lengths) = process(
         &mut br,
         prelude.hdr.num_chunks as usize,

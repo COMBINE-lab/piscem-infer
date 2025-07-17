@@ -18,14 +18,17 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
-use crate::prog_opts::QuantOpts;
-use crate::utils::em::{
-    EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap, em,
-    em_par,
-};
 use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap};
 use crate::utils::io;
 use crate::utils::map_record_types::LibraryType;
+use crate::{fld::FldPDF, prog_opts::QuantOpts};
+use crate::{
+    fld::{EmpiricalPDF, ParametricFLD},
+    utils::em::{
+        EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
+        em, em_par,
+    },
+};
 
 use libradicl::rad_types::{self};
 use libradicl::{
@@ -90,6 +93,71 @@ fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirectionalEntry> {
             count: mapped_ori_count_global[6],
         },
     ]
+}
+
+fn compute_fld_from_sample<T: Read>(
+    br: &mut BufReader<T>,
+    nchunk: usize,
+    record_context: &PiscemBulkRecordContext,
+    lib_type: LibraryType,
+    mut param_est_frags: isize,
+) -> anyhow::Result<Vec<u32>> {
+    let mut temp_frag_lengths = vec![0u32; 65_536];
+    let mut sufficient_samples = false;
+    let requested_samples = param_est_frags;
+
+    'estimate_fld: for _ in 0..nchunk {
+        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
+        for mappings in &c.reads {
+            let ft = rad_types::MappingType::from_u8(mappings.frag_type);
+            let nm = mappings.positions.len();
+            if nm == 1 && !ft.is_orphan() {
+                let o = mappings.dirs.first().expect("at least one mapping");
+                if lib_type.is_compatible_with(*o) {
+                    if let Some(fl) = mappings.frag_lengths.first() {
+                        temp_frag_lengths[*fl as usize] += 1;
+                        param_est_frags -= 1;
+                        if param_est_frags <= 0 {
+                            sufficient_samples = true;
+                            break 'estimate_fld;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if sufficient_samples {
+        let cmeans = conditional_means(&temp_frag_lengths);
+        info!(
+            "computed conditional means ... last is {}",
+            cmeans.last().expect("present")
+        );
+    } else {
+        let nseen = requested_samples - param_est_frags;
+        warn!(
+            "insufficient uniquely mapped reads from which to estimate the fragment length distribution. {requested_samples} requested but only {nseen} were observed!"
+        );
+    }
+    Ok(temp_frag_lengths)
+}
+
+#[allow(dead_code)]
+fn compute_fld_from_params(mu: f64, sigma: f64, weight: usize, upper: usize) -> Vec<u32> {
+    let inv_sigma = 1.0 / sigma;
+    let denom_b = distrs::Normal::cdf(upper as f64, mu, sigma);
+    let denom_a = distrs::Normal::cdf(0.0_f64, mu, sigma);
+    let denom = denom_b - denom_a;
+    let inv_denom = 1.0_f64 / denom;
+
+    let trunc_pdf = |i: usize| -> f64 {
+        let x = i as f64;
+        inv_sigma * (distrs::Normal::pdf(x, mu, sigma) * inv_denom)
+    };
+
+    (0..upper)
+        .map(|i| (trunc_pdf(i) * weight as f64).round() as u32)
+        .collect()
 }
 
 pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
@@ -273,54 +341,48 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
     let mut frag_stats = MappedFragStats::new();
-    let est_frag_lengths: Option<Vec<u32>>;
-    if paired_end {
-        let mut temp_frag_lengths = vec![0u32; 65_536];
-        let mut rem_mappings_for_estimate = 500_000_isize;
+    let est_frag_lengths: Option<Vec<u32>> = if paired_end {
         let file_offset = br.stream_position()?;
-
-        'estimate_fld: for _ in 0..(prelude.hdr.num_chunks as usize) {
-            let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(&mut br, &tag_context);
-            for mappings in &c.reads {
-                let ft = rad_types::MappingType::from_u8(mappings.frag_type);
-                let nm = mappings.positions.len();
-                if nm == 1 && !ft.is_orphan() {
-                    let o = mappings.dirs.first().expect("at least one mapping");
-                    if lib_type.is_compatible_with(*o) {
-                        if let Some(fl) = mappings.frag_lengths.first() {
-                            temp_frag_lengths[*fl as usize] += 1;
-                            rem_mappings_for_estimate -= 1;
-                            if rem_mappings_for_estimate <= 0 {
-                                break 'estimate_fld;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let temp_frag_lens = compute_fld_from_sample(
+            &mut br,
+            prelude.hdr.num_chunks as usize,
+            &tag_context,
+            lib_type,
+            qo.param_est_frags,
+        )?;
+        // reset the stream to the start of the chunks
         br.seek(std::io::SeekFrom::Start(file_offset))?;
-        let cmeans = conditional_means(&temp_frag_lengths);
-        eprintln!(
-            "computed conditional means ... last is {}",
-            cmeans.last().expect("present")
-        );
-        est_frag_lengths = Some(temp_frag_lengths);
+        Some(temp_frag_lens)
     } else {
-        est_frag_lengths = None;
-    }
+        None
+    };
 
-    let (eq_map, frag_lengths) = process(
-        &mut br,
-        prelude.hdr.num_chunks as usize,
-        &tag_context,
-        lib_type,
-        &mut frag_stats,
-    );
+    let (eq_map, frag_lengths) = if let Some(est_frag_lengths) = est_frag_lengths {
+        let pdf = EmpiricalPDF::new(est_frag_lengths, f64::MIN_POSITIVE);
+        process(
+            &mut br,
+            prelude.hdr.num_chunks as usize,
+            &tag_context,
+            lib_type,
+            &mut frag_stats,
+            pdf,
+        )
+    } else {
+        let pdf = ParametricFLD::new(fl_mean, fl_sd, 65_536_usize);
+        process(
+            &mut br,
+            prelude.hdr.num_chunks as usize,
+            &tag_context,
+            lib_type,
+            &mut frag_stats,
+            pdf,
+        )
+    };
 
     let cond_means = if paired_end {
         conditional_means(&frag_lengths)
     } else {
-        conditional_means_from_params(fl_mean, fl_sd, 65_636_usize)
+        conditional_means_from_params(fl_mean, fl_sd, 65_536_usize)
     };
     let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
 
@@ -411,12 +473,13 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process<T: Read>(
+fn process<T: Read, D: FldPDF>(
     br: &mut BufReader<T>,
     nrec: usize,
     record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
+    fld_pdf: D,
 ) -> (EqMap, Vec<u32>) {
     // true because it contains orientations
     let mut eqmap = EqMap::new(OrientationProperty::OrientationAware);

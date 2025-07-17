@@ -30,6 +30,11 @@ pub struct QuantOpts {
     /// presence threshold for EM
     #[arg(long, default_value_t = PRESENCE_THRESH)]
     pub presence_thresh: f64,
+    /// number of (unique) mappings to use to perform initial coarse-grained
+    /// estimation of the fragment length distribution. These fragments will have
+    /// to be read from the file and interrogated twice.
+    #[arg(long, default_value_t = 500_000_isize)]
+    pub param_est_frags: isize,
     /// mean of fragment length distribution mean
     /// (required, and used, only in the case of unpaired fragments).
     #[arg(long, requires = "fld_sd")]

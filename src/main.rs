@@ -2,6 +2,7 @@ use clap::Parser;
 
 use tracing::Level;
 
+mod fld;
 mod process_rad;
 mod prog_opts;
 mod utils;

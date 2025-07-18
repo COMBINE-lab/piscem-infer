@@ -6,7 +6,10 @@ use rayon::prelude::*;
 use std::sync::atomic::Ordering;
 use tracing::info;
 
-use crate::utils::eq_maps::PackedEqMap;
+use crate::utils::eq_maps::{PackedEqMap, TargetLabels};
+
+use super::eq_maps::BasicEqLabelRef;
+use super::eq_maps::RangeFactorizedEqLabelRef;
 
 /// Takes as input `freq`, the frequency of occurrence of
 /// fragments of each observed length, and returns
@@ -83,7 +86,7 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 
 #[inline]
 fn m_step_par(
-    eq_iterates: &[(&[u32], &usize)],
+    eq_iterates: &[(RangeFactorizedEqLabelRef, &usize)],
     prev_count: &mut [AtomicF64],
     inv_eff_lens: &[f64],
     curr_counts: &mut [AtomicF64],
@@ -96,14 +99,20 @@ fn m_step_par(
             let count = **v as f64;
 
             let mut denom = 0.0_f64;
-            for e in k.iter() {
-                let w = prev_count[*e as usize].load(Ordering::Relaxed) * inv_eff_lens[*e as usize];
+            for (e, cond_prob) in k
+                .target_labels(k.contains_ori)
+                .iter()
+                .zip(k.target_probs(k.contains_ori))
+            {
+                let w = cond_prob
+                    * prev_count[*e as usize].load(Ordering::Relaxed)
+                    * inv_eff_lens[*e as usize];
                 weights.push(w);
                 denom += w;
             }
             if denom > 1e-8 {
                 let count_over_denom = count / denom;
-                for (target_id, w) in k.iter().zip(weights.iter()) {
+                for (target_id, w) in k.target_labels(k.contains_ori).iter().zip(weights.iter()) {
                     let inc = count_over_denom * w;
                     curr_counts[*target_id as usize].fetch_add(inc, Ordering::AcqRel);
                 }
@@ -129,14 +138,18 @@ fn m_step(
         let count = *v as f64;
 
         let mut denom = 0.0_f64;
-        for e in k.iter() {
-            let w = prev_count[*e as usize] * inv_eff_lens[*e as usize];
+        for (e, cond_prob) in k
+            .target_labels(k.contains_ori)
+            .iter()
+            .zip(k.target_probs(k.contains_ori))
+        {
+            let w = cond_prob * prev_count[*e as usize] * inv_eff_lens[*e as usize];
             weights.push(w);
             denom += w;
         }
         if denom > 1e-8 {
             let count_over_denom = count / denom;
-            for (target_id, w) in k.iter().zip(weights.iter()) {
+            for (target_id, w) in k.target_labels(k.contains_ori).iter().zip(weights.iter()) {
                 curr_counts[*target_id as usize] += count_over_denom * w;
             }
         }
@@ -257,7 +270,9 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
         .map(|x| AtomicF64::new(*x))
         .collect();
 
-    let eq_iterates: Vec<(&[u32], &usize)> = eq_map.iter_labels().zip(&eq_map.counts).collect();
+    let contains_ori = eq_map.contains_ori;
+    let eq_iterates: Vec<(RangeFactorizedEqLabelRef, &usize)> =
+        eq_map.iter_labels().zip(&eq_map.counts).collect();
 
     let mut rel_diff = 0.0_f64;
     let mut niter = 0_u32;

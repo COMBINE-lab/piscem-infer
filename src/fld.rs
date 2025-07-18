@@ -1,3 +1,8 @@
+pub enum FLD {
+    Empirical(EmpiricalFLD),
+    Parametric(ParametricFLD),
+}
+
 pub trait FldPDF {
     fn pdf(&self, i: usize) -> f64;
 }
@@ -33,12 +38,12 @@ impl FldPDF for ParametricFLD {
     }
 }
 
-pub struct EmpiricalPDF {
+pub struct EmpiricalFLD {
     probs: Vec<f64>,
     epsilon: f64,
 }
 
-impl EmpiricalPDF {
+impl EmpiricalFLD {
     pub fn new(counts: Vec<u32>, eps: f64) -> Self {
         let tot_eps = eps * counts.len() as f64;
         let tot_mass = tot_eps + counts.iter().fold(0.0, |acc, x| acc + *x as f64);
@@ -54,7 +59,7 @@ impl EmpiricalPDF {
     }
 }
 
-impl FldPDF for EmpiricalPDF {
+impl FldPDF for EmpiricalFLD {
     fn pdf(&self, i: usize) -> f64 {
         *self.probs.get(i).unwrap_or(&self.epsilon)
     }

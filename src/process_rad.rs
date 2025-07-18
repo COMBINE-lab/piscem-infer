@@ -18,12 +18,15 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
-use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap};
+use crate::utils::eq_maps::{
+    BasicEqLabel, BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap,
+    RangeFactorizedEqMap,
+};
 use crate::utils::io;
 use crate::utils::map_record_types::LibraryType;
 use crate::{fld::FldPDF, prog_opts::QuantOpts};
 use crate::{
-    fld::{EmpiricalPDF, ParametricFLD},
+    fld::{EmpiricalFLD, FLD, ParametricFLD},
     utils::em::{
         EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
         em, em_par,
@@ -357,27 +360,21 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         None
     };
 
-    let (eq_map, frag_lengths) = if let Some(est_frag_lengths) = est_frag_lengths {
-        let pdf = EmpiricalPDF::new(est_frag_lengths, f64::MIN_POSITIVE);
-        process(
-            &mut br,
-            prelude.hdr.num_chunks as usize,
-            &tag_context,
-            lib_type,
-            &mut frag_stats,
-            pdf,
-        )
+    let fld: FLD = if let Some(est_frag_lengths) = est_frag_lengths {
+        FLD::Empirical(EmpiricalFLD::new(est_frag_lengths, f64::MIN_POSITIVE))
     } else {
-        let pdf = ParametricFLD::new(fl_mean, fl_sd, 65_536_usize);
-        process(
-            &mut br,
-            prelude.hdr.num_chunks as usize,
-            &tag_context,
-            lib_type,
-            &mut frag_stats,
-            pdf,
-        )
+        FLD::Parametric(ParametricFLD::new(fl_mean, fl_sd, 65_536_usize))
     };
+
+    let (packed_eq_map, frag_lengths) = process(
+        &mut br,
+        prelude.hdr.num_chunks as usize,
+        &tag_context,
+        lib_type,
+        &mut frag_stats,
+        EqMapType::RangeFactorizedEqMap,
+        fld,
+    );
 
     let cond_means = if paired_end {
         conditional_means(&frag_lengths)
@@ -385,8 +382,6 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         conditional_means_from_params(fl_mean, fl_sd, 65_536_usize)
     };
     let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
-
-    let packed_eq_map = PackedEqMap::from_eq_map(&eq_map);
 
     let eminfo = EMInfo {
         eq_map: &packed_eq_map,
@@ -421,9 +416,9 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     );
     info!(
         "number of equivalence classes = {}",
-        eq_map.len().to_formatted_string(&Locale::en)
+        packed_eq_map.len().to_formatted_string(&Locale::en)
     );
-    let total_weight: usize = eq_map.count_map.values().sum();
+    let total_weight: usize = packed_eq_map.total_weight();
     info!(
         "total equivalence map weight = {}",
         total_weight.to_formatted_string(&Locale::en)
@@ -473,16 +468,70 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process<T: Read, D: FldPDF>(
+fn process<T: Read>(
+    br: &mut BufReader<T>,
+    nrec: usize,
+    record_context: &PiscemBulkRecordContext,
+    lib_type: LibraryType,
+    mapped_stats: &mut MappedFragStats,
+    eq_map_t: EqMapType,
+    fld_pdf: FLD,
+) -> (PackedEqMap, Vec<u32>) {
+    let eqmap_orientation_status = OrientationProperty::OrientationAware;
+    match (fld_pdf, eq_map_t) {
+        (FLD::Empirical(f), EqMapType::BasicEqMap) => process_dispatch(
+            br,
+            nrec,
+            record_context,
+            lib_type,
+            mapped_stats,
+            f,
+            BasicEqMap::new(eqmap_orientation_status),
+        ),
+        (FLD::Empirical(f), EqMapType::RangeFactorizedEqMap) => process_dispatch(
+            br,
+            nrec,
+            record_context,
+            lib_type,
+            mapped_stats,
+            f,
+            RangeFactorizedEqMap::new(eqmap_orientation_status),
+        ),
+        (FLD::Parametric(f), EqMapType::BasicEqMap) => process_dispatch(
+            br,
+            nrec,
+            record_context,
+            lib_type,
+            mapped_stats,
+            f,
+            BasicEqMap::new(eqmap_orientation_status),
+        ),
+        (FLD::Parametric(f), EqMapType::RangeFactorizedEqMap) => process_dispatch(
+            br,
+            nrec,
+            record_context,
+            lib_type,
+            mapped_stats,
+            f,
+            RangeFactorizedEqMap::new(eqmap_orientation_status),
+        ),
+    }
+}
+
+fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     br: &mut BufReader<T>,
     nrec: usize,
     record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
     fld_pdf: D,
-) -> (EqMap, Vec<u32>) {
-    // true because it contains orientations
-    let mut eqmap = EqMap::new(OrientationProperty::OrientationAware);
+    mut eqmap: EqMap<EqLabelT>,
+) -> (PackedEqMap, Vec<u32>) {
+    let eqmap_orientation_status = if eqmap.contains_ori {
+        OrientationProperty::OrientationAware
+    } else {
+        OrientationProperty::OrientationAgnostic
+    };
 
     let map = &mut eqmap.count_map;
     let mut frag_lengths = vec![0u32; 65_536];
@@ -494,6 +543,7 @@ fn process<T: Read, D: FldPDF>(
 
     let mut label_ints = vec![];
     let mut dir_ints = vec![];
+    let mut probs = vec![];
     //let mut dir_vec = vec![0u32, 64];
     for _ in 0..nrec {
         let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
@@ -510,23 +560,27 @@ fn process<T: Read, D: FldPDF>(
 
             label_ints.clear();
             dir_ints.clear();
+            probs.clear();
 
-            for (r, o) in mappings.refs.iter().zip(mappings.dirs.iter()) {
+            for ((r, o), l) in mappings
+                .refs
+                .iter()
+                .zip(mappings.dirs.iter())
+                .zip(mappings.frag_lengths.iter())
+            {
                 let y = u32::from(*o);
                 if lib_type.is_compatible_with(*o) {
                     mapped_ori_count[y as usize] += 1;
                     label_ints.push(*r);
                     dir_ints.push(y);
+                    probs.push(fld_pdf.pdf(*l as usize))
                 } else {
                     filtered_ori_count[y as usize] += 1;
                 }
             }
 
             label_ints.append(&mut dir_ints);
-
-            let eql = EqLabel {
-                targets: label_ints.clone(),
-            };
+            let eql = EqLabelT::new(&label_ints, Some(&probs));
 
             map.entry(eql)
                 .and_modify(|counter| *counter += 1)
@@ -570,5 +624,8 @@ fn process<T: Read, D: FldPDF>(
         );
     }
 
-    (eqmap, frag_lengths)
+    let packed_eq_map = PackedEqMap::from_eq_map(&eqmap);
+    drop(eqmap);
+
+    (packed_eq_map, frag_lengths)
 }

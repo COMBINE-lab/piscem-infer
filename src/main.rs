@@ -26,6 +26,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 EqMapType::BasicEqMap
             };
+            crate::utils::eq_maps::NUM_BINS.get_or_init(|| quant_opts.factorized_eqc_bins as f64);
             process_bulk(quant_opts, eqc_type)?
         }
     }

@@ -6,10 +6,7 @@ use rayon::prelude::*;
 use std::sync::atomic::Ordering;
 use tracing::info;
 
-use crate::utils::eq_maps::{PackedEqMap, TargetLabels};
-
-use super::eq_maps::BasicEqLabelRef;
-use super::eq_maps::RangeFactorizedEqLabelRef;
+use crate::utils::eq_maps::{EqLabel, PackedEqMap, TargetLabelsRef};
 
 /// Takes as input `freq`, the frequency of occurrence of
 /// fragments of each observed length, and returns
@@ -85,8 +82,8 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 }
 
 #[inline]
-fn m_step_par(
-    eq_iterates: &[(RangeFactorizedEqLabelRef, &usize)],
+fn m_step_par<EqLabelT: EqLabel>(
+    eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
     prev_count: &mut [AtomicF64],
     inv_eff_lens: &[f64],
     curr_counts: &mut [AtomicF64],
@@ -99,11 +96,7 @@ fn m_step_par(
             let count = **v as f64;
 
             let mut denom = 0.0_f64;
-            for (e, cond_prob) in k
-                .target_labels(k.contains_ori)
-                .iter()
-                .zip(k.target_probs(k.contains_ori))
-            {
+            for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
                 let w = cond_prob
                     * prev_count[*e as usize].load(Ordering::Relaxed)
                     * inv_eff_lens[*e as usize];
@@ -112,7 +105,7 @@ fn m_step_par(
             }
             if denom > 1e-8 {
                 let count_over_denom = count / denom;
-                for (target_id, w) in k.target_labels(k.contains_ori).iter().zip(weights.iter()) {
+                for (target_id, w) in k.target_labels().iter().zip(weights.iter()) {
                     let inc = count_over_denom * w;
                     curr_counts[*target_id as usize].fetch_add(inc, Ordering::AcqRel);
                 }
@@ -123,8 +116,8 @@ fn m_step_par(
 }
 
 #[inline]
-fn m_step(
-    eq_map: &PackedEqMap,
+fn m_step<EqLabelT: EqLabel>(
+    eq_map: &PackedEqMap<EqLabelT>,
     eq_counts: &[usize],
     prev_count: &[f64],
     inv_eff_lens: &[f64],
@@ -138,18 +131,14 @@ fn m_step(
         let count = *v as f64;
 
         let mut denom = 0.0_f64;
-        for (e, cond_prob) in k
-            .target_labels(k.contains_ori)
-            .iter()
-            .zip(k.target_probs(k.contains_ori))
-        {
+        for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
             let w = cond_prob * prev_count[*e as usize] * inv_eff_lens[*e as usize];
             weights.push(w);
             denom += w;
         }
         if denom > 1e-8 {
             let count_over_denom = count / denom;
-            for (target_id, w) in k.target_labels(k.contains_ori).iter().zip(weights.iter()) {
+            for (target_id, w) in k.target_labels().iter().zip(weights.iter()) {
                 curr_counts[*target_id as usize] += count_over_denom * w;
             }
         }
@@ -158,15 +147,18 @@ fn m_step(
 }
 
 /// Holds the info relevant for running the EM algorithm
-pub struct EMInfo<'eqm, 'el> {
-    pub eq_map: &'eqm PackedEqMap,
+pub struct EMInfo<'eqm, 'el, EqLabelT> {
+    pub eq_map: &'eqm PackedEqMap<EqLabelT>,
     pub eff_lens: &'el [f64],
     pub max_iter: u32,
     pub convergence_thresh: f64,
     pub presence_thresh: f64,
 }
 
-pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
+pub fn do_bootstrap<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    num_boot: usize,
+) -> Vec<Vec<f64>> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
@@ -244,7 +236,7 @@ pub fn do_bootstrap(em_info: &EMInfo, num_boot: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
-pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
+pub fn em_par<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>, nthreads: usize) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
@@ -270,8 +262,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
         .map(|x| AtomicF64::new(*x))
         .collect();
 
-    let contains_ori = eq_map.contains_ori;
-    let eq_iterates: Vec<(RangeFactorizedEqLabelRef, &usize)> =
+    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
         eq_map.iter_labels().zip(&eq_map.counts).collect();
 
     let mut rel_diff = 0.0_f64;
@@ -284,7 +275,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
 
     pool.install(|| {
         while niter < max_iter {
-            m_step_par(
+            m_step_par::<EqLabelT>(
                 &eq_iterates,
                 &mut prev_counts,
                 &inv_eff_lens,
@@ -322,7 +313,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
                 x.store(0.0, Ordering::Relaxed);
             }
         });
-        m_step_par(
+        m_step_par::<EqLabelT>(
             &eq_iterates,
             &mut prev_counts,
             &inv_eff_lens,
@@ -336,7 +327,7 @@ pub fn em_par(em_info: &EMInfo, nthreads: usize) -> Vec<f64> {
         .collect::<Vec<f64>>()
 }
 
-pub fn em(em_info: &EMInfo) -> Vec<f64> {
+pub fn em<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;

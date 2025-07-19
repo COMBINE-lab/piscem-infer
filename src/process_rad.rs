@@ -19,21 +19,20 @@ use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
 use crate::utils::eq_maps::{
-    BasicEqLabel, BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap,
-    RangeFactorizedEqMap,
+    BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
 };
 use crate::utils::io;
 use crate::utils::map_record_types::LibraryType;
 use crate::{fld::FldPDF, prog_opts::QuantOpts};
 use crate::{
-    fld::{EmpiricalFLD, FLD, ParametricFLD},
+    fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
         EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
         em, em_par,
     },
 };
 
-use libradicl::rad_types::{self};
+use libradicl::rad_types::{self, MappedFragmentOrientation};
 use libradicl::{
     chunk,
     header::RadPrelude,
@@ -163,7 +162,23 @@ fn compute_fld_from_params(mu: f64, sigma: f64, weight: usize, upper: usize) -> 
         .collect()
 }
 
-pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
+pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Result<()> {
+    let eqmap_orientation_status = OrientationProperty::OrientationAware;
+    match eq_map_t {
+        EqMapType::BasicEqMap => {
+            process_bulk_dispatch(quant_opts, BasicEqMap::new(eqmap_orientation_status))
+        }
+        EqMapType::RangeFactorizedEqMap => process_bulk_dispatch(
+            quant_opts,
+            RangeFactorizedEqMap::new(eqmap_orientation_status),
+        ),
+    }
+}
+
+pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
+    quant_opts: QuantOpts,
+    eqc_map: EqMap<EqLabelT>,
+) -> anyhow::Result<()> {
     let qo = quant_opts.clone();
     let input = qo.input;
     let lib_type = qo.lib_type;
@@ -360,10 +375,10 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         None
     };
 
-    let fld: FLD = if let Some(est_frag_lengths) = est_frag_lengths {
-        FLD::Empirical(EmpiricalFLD::new(est_frag_lengths, f64::MIN_POSITIVE))
+    let fld: Fld = if let Some(est_frag_lengths) = est_frag_lengths {
+        Fld::Empirical(EmpiricalFLD::new(est_frag_lengths, f64::MIN_POSITIVE))
     } else {
-        FLD::Parametric(ParametricFLD::new(fl_mean, fl_sd, 65_536_usize))
+        Fld::Parametric(ParametricFLD::new(fl_mean, fl_sd, 65_536_usize))
     };
 
     let (packed_eq_map, frag_lengths) = process(
@@ -372,7 +387,8 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
         &tag_context,
         lib_type,
         &mut frag_stats,
-        EqMapType::RangeFactorizedEqMap,
+        &ref_lengths,
+        eqc_map,
         fld,
     );
 
@@ -468,52 +484,36 @@ pub fn process_bulk(quant_opts: QuantOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process<T: Read>(
+fn process<T: Read, EqLabelT: EqLabel>(
     br: &mut BufReader<T>,
     nrec: usize,
     record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
-    eq_map_t: EqMapType,
-    fld_pdf: FLD,
-) -> (PackedEqMap, Vec<u32>) {
-    let eqmap_orientation_status = OrientationProperty::OrientationAware;
-    match (fld_pdf, eq_map_t) {
-        (FLD::Empirical(f), EqMapType::BasicEqMap) => process_dispatch(
+    ref_lengths: &[u32],
+    eq_map: EqMap<EqLabelT>,
+    fld_pdf: Fld,
+) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
+    match fld_pdf {
+        Fld::Empirical(f) => process_dispatch(
             br,
             nrec,
             record_context,
             lib_type,
             mapped_stats,
+            ref_lengths,
             f,
-            BasicEqMap::new(eqmap_orientation_status),
+            eq_map,
         ),
-        (FLD::Empirical(f), EqMapType::RangeFactorizedEqMap) => process_dispatch(
+        Fld::Parametric(f) => process_dispatch(
             br,
             nrec,
             record_context,
             lib_type,
             mapped_stats,
+            ref_lengths,
             f,
-            RangeFactorizedEqMap::new(eqmap_orientation_status),
-        ),
-        (FLD::Parametric(f), EqMapType::BasicEqMap) => process_dispatch(
-            br,
-            nrec,
-            record_context,
-            lib_type,
-            mapped_stats,
-            f,
-            BasicEqMap::new(eqmap_orientation_status),
-        ),
-        (FLD::Parametric(f), EqMapType::RangeFactorizedEqMap) => process_dispatch(
-            br,
-            nrec,
-            record_context,
-            lib_type,
-            mapped_stats,
-            f,
-            RangeFactorizedEqMap::new(eqmap_orientation_status),
+            eq_map,
         ),
     }
 }
@@ -524,14 +524,17 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
+    ref_lengths: &[u32],
     fld_pdf: D,
     mut eqmap: EqMap<EqLabelT>,
-) -> (PackedEqMap, Vec<u32>) {
+) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
+    /*
     let eqmap_orientation_status = if eqmap.contains_ori {
         OrientationProperty::OrientationAware
     } else {
         OrientationProperty::OrientationAgnostic
     };
+    */
 
     let map = &mut eqmap.count_map;
     let mut frag_lengths = vec![0u32; 65_536];
@@ -562,9 +565,10 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
             dir_ints.clear();
             probs.clear();
 
-            for ((r, o), l) in mappings
+            for (((r, pos), o), l) in mappings
                 .refs
                 .iter()
+                .zip(mappings.positions.iter())
                 .zip(mappings.dirs.iter())
                 .zip(mappings.frag_lengths.iter())
             {
@@ -573,7 +577,20 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                     mapped_ori_count[y as usize] += 1;
                     label_ints.push(*r);
                     dir_ints.push(y);
-                    probs.push(fld_pdf.pdf(*l as usize))
+                    let frag_len_prob = match o {
+                        MappedFragmentOrientation::Forward => {
+                            let max_frag_len = (ref_lengths[*r as usize] - *pos) as usize;
+                            fld_pdf.cdf(max_frag_len)
+                        }
+                        MappedFragmentOrientation::Reverse => {
+                            let max_frag_len = *pos as usize + 100;
+                            fld_pdf.cdf(max_frag_len)
+                        }
+                        MappedFragmentOrientation::ForwardReverse
+                        | MappedFragmentOrientation::ReverseForward => fld_pdf.pdf(*l as usize),
+                        _ => 2.0 * f64::MIN_POSITIVE,
+                    };
+                    probs.push(frag_len_prob)
                 } else {
                     filtered_ori_count[y as usize] += 1;
                 }

@@ -1,16 +1,21 @@
 use ahash::AHashMap;
 
+/// aliases for referring to the different basic types of eq class maps
 pub type BasicEqMap = EqMap<BasicEqLabel>;
 pub type RangeFactorizedEqMap = EqMap<RangeFactorizedEqLabel>;
 
-const NUM_BINS: f64 = 32_f64;
+/// the default number of bins to use for range-factorized equivalence classes
+pub static NUM_BINS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
+/// whether or not the equivalence classes differentiate between fragments
+/// mapping in different orientations
 pub enum OrientationProperty {
     OrientationAware,
     #[allow(dead_code)]
     OrientationAgnostic,
 }
 
+/// discern betweeen the types of equivalence class maps
 pub enum EqMapType {
     BasicEqMap,
     RangeFactorizedEqMap,
@@ -128,7 +133,7 @@ impl EqLabel for RangeFactorizedEqLabel {
         // first, ensure probs are normalized
         let tot_prob: f64 = probs.iter().sum();
         let num_labels = probs.len();
-        let num_bins = NUM_BINS as usize; //4_usize + ((num_labels as f64).sqrt()).ceil() as usize;
+        let num_bins = *NUM_BINS.get().unwrap() as usize; //4_usize + ((num_labels as f64).sqrt()).ceil() as usize;
 
         let (just_labels, oris) = labels.split_at(num_labels);
         let mut targets_and_bins: Vec<u32> = just_labels.into();
@@ -202,7 +207,7 @@ impl<'a> TargetLabelsRef for RangeFactorizedEqLabelRef<'a> {
     fn target_probs(&self) -> impl Iterator<Item = f64> {
         let with_ori = self.contains_ori;
         let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
-        let num_bins = NUM_BINS;
+        let num_bins = *NUM_BINS.get().unwrap();
         let half_bin_width = 0.5 / num_bins;
         RangeFactorizedBinIterator {
             bin_iterator: self.targets_and_bins[l..2 * l].iter(),

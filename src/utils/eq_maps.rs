@@ -21,22 +21,30 @@ pub enum EqMapType {
     RangeFactorizedEqMap,
 }
 
+/// The `EqLabel` trait gives us the ability to create things that are equivalence class labels.
+/// These things can be created with or without associated probabilities.
+/// Also, any type implementing this trait will have an associated `LabelRefT` type that will allow
+/// the creation of borrowed references that can enumerate labels and probabilities.
+/// These types must also be hashable and comparable to be used as keys in HashMaps.
 pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq + Sync {
     type LabelRefT<'a>: TargetLabelsRef;
     fn new(labels: &[u32], probs: Option<&[f64]>) -> Self;
     fn new_ref(labels: &[u32], has_ori: bool) -> Self::LabelRefT<'_>;
 }
 
+/// This trait ensures that we can get a list of the labels of this equivalence class
 pub trait TargetLabels {
     fn target_labels(&self, with_ori: bool) -> &[u32];
 }
 
+/// This trait ensures we can get a list of the lables (and the probabilities of this
+/// equivalence class label refererence)
 pub trait TargetLabelsRef: Sync {
     fn target_labels(&self) -> &[u32];
     fn target_probs(&self) -> impl Iterator<Item = f64>;
 }
 
-/// basic equivalence classes
+// === basic equivalence classes
 
 #[derive(Hash, PartialEq, Eq)]
 pub struct BasicEqLabelRef<'a> {
@@ -52,6 +60,8 @@ pub struct BasicEqLabel {
 impl EqLabel for BasicEqLabel {
     type LabelRefT<'a> = BasicEqLabelRef<'a>;
 
+    /// we create a new reference by passing along the label refs we
+    /// are given
     fn new_ref(labels: &[u32], has_ori: bool) -> BasicEqLabelRef {
         BasicEqLabelRef {
             targets: labels,
@@ -59,6 +69,8 @@ impl EqLabel for BasicEqLabel {
         }
     }
 
+    /// we ignore probabiltiies in the basic equivalence class, and just
+    /// pass along the targets we are given as the labels
     fn new(targets: &[u32], _probs: Option<&[f64]>) -> Self {
         Self {
             targets: targets.into(),
@@ -83,9 +95,9 @@ impl TargetLabels for BasicEqLabel {
 }
 
 impl<'a> TargetLabelsRef for BasicEqLabelRef<'a> {
-    // return the slice of identifiers (u32s) that correspond
-    // to the target ids. If the EqLabel was built without orientations
-    // this is the whole vector, otherwise it's the first half.
+    /// return the slice of identifiers (u32s) that correspond
+    /// to the target ids. If the EqLabel was built without orientations
+    /// this is the whole vector, otherwise it's the first half.
     #[inline]
     fn target_labels(&self) -> &[u32] {
         let with_ori = self.contains_ori;
@@ -98,10 +110,12 @@ impl<'a> TargetLabelsRef for BasicEqLabelRef<'a> {
         &self.targets[0..nt]
     }
 
+    /// since there were no target probabilities provided when
+    /// creating this equivalence class, we will instead  
+    /// simply produce a stream of 1s
     #[inline]
     fn target_probs(&self) -> impl Iterator<Item = f64> {
         let with_ori = self.contains_ori;
-        // number of targets is total length / 2
         let nt = if with_ori {
             self.targets.len() >> 1
         } else {
@@ -111,7 +125,7 @@ impl<'a> TargetLabelsRef for BasicEqLabelRef<'a> {
     }
 }
 
-/// Range factorized equivalence classes
+// ===== Range factorized equivalence classes
 
 #[derive(Hash, PartialEq, Eq)]
 pub struct RangeFactorizedEqLabel {
@@ -128,15 +142,31 @@ impl EqLabel for RangeFactorizedEqLabel {
         }
     }
 
+    /// create the range factorized equivalence class the labels and
+    /// the associated probabilities.
     fn new(labels: &[u32], probs: Option<&[f64]>) -> Self {
+        // the probability vector must not be `None` when creating a
+        // range-factorized equivalence class
         let probs = probs.expect("probs *must* be present for range factorized equivalence class");
-        // first, ensure probs are normalized
-        let tot_prob: f64 = probs.iter().sum();
-        let num_labels = probs.len();
-        let num_bins = *NUM_BINS.get().unwrap() as usize; //4_usize + ((num_labels as f64).sqrt()).ceil() as usize;
 
+        // compute the total probability so we can normalize later
+        let tot_prob: f64 = probs.iter().sum();
+        // get the number of labels (because the labels slice could contain either
+        // just labels or labels and encoded orientations)
+        let num_labels = probs.len();
+        // get the number of bins we are using for the range factorized equivalence class
+        // representation
+        let num_bins = *NUM_BINS.get().unwrap() as usize;
+
+        // we will structure the contents of the range factorized equivalence class, that
+        // contains k labels as
+        //
+        // [label_1],[label_2],...,[label_k],[bin_id_1],[bin_id_2],...,[bin_id_k],[ori_1],[ori_2],...,[ori_k]
+        //
+        // where the `ori` components may be optional
         let (just_labels, oris) = labels.split_at(num_labels);
         let mut targets_and_bins: Vec<u32> = just_labels.into();
+        // map the probabilities to the appropriate bin IDs
         targets_and_bins.extend(probs.iter().map(|&prob| {
             let p: f64 = prob / tot_prob;
             // Handle edge case where p = 1.0 (should go to last bin)
@@ -147,11 +177,14 @@ impl EqLabel for RangeFactorizedEqLabel {
                 (p * num_bins as f64) as u32
             }
         }));
+        // add back the encoding of the orientations if we have them
         targets_and_bins.extend_from_slice(oris);
         Self { targets_and_bins }
     }
 }
 
+/// allows us to iterate over the bins of the range factorized equivalence
+/// classes and, for each bin, return the associated conditional probability
 struct RangeFactorizedBinIterator<'a> {
     bin_iterator: std::slice::Iter<'a, u32>,
     num_bins: f64,
@@ -161,6 +194,8 @@ struct RangeFactorizedBinIterator<'a> {
 impl<'a> Iterator for RangeFactorizedBinIterator<'a> {
     type Item = f64;
 
+    /// for the next bin, returns the probability associated with
+    /// the center of the bin
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(x) = self.bin_iterator.next() {
             Some((*x as f64) / self.num_bins + self.half_bin_width)
@@ -196,13 +231,18 @@ pub struct RangeFactorizedEqLabelRef<'a> {
     pub contains_ori: bool,
 }
 
+/// treat a slice of u32s as labels and or probabilities
 impl<'a> TargetLabelsRef for RangeFactorizedEqLabelRef<'a> {
+    /// gets the labels associated with this reference
     #[inline]
     fn target_labels(&self) -> &[u32] {
         let with_ori = self.contains_ori;
         let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
         &self.targets_and_bins[..l]
     }
+
+    /// returns an iterator over the probabilities assocaited with the
+    /// bins of this reference
     #[inline]
     fn target_probs(&self) -> impl Iterator<Item = f64> {
         let with_ori = self.contains_ori;
@@ -241,6 +281,9 @@ pub struct PackedEqMap<EqLabelT> {
     /// with orientation information encoded or not.
     #[allow(dead_code)]
     pub contains_ori: bool,
+    /// we need to be able to hold the type of the label of this
+    /// equivalence class, so that we can generated the associated
+    /// `LabelRefT`
     phantom: std::marker::PhantomData<EqLabelT>,
 }
 

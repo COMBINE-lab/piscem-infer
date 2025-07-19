@@ -16,36 +16,97 @@ pub enum EqMapType {
     RangeFactorizedEqMap,
 }
 
-pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq {
-    type LabelRefT<'a>;
+pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq + Sync {
+    type LabelRefT<'a>: TargetLabelsRef;
     fn new(labels: &[u32], probs: Option<&[f64]>) -> Self;
     fn new_ref(labels: &[u32], has_ori: bool) -> Self::LabelRefT<'_>;
 }
 
+pub trait TargetLabels {
+    fn target_labels(&self, with_ori: bool) -> &[u32];
+}
+
+pub trait TargetLabelsRef: Sync {
+    fn target_labels(&self) -> &[u32];
+    fn target_probs(&self) -> impl Iterator<Item = f64>;
+}
+
+/// basic equivalence classes
+
 #[derive(Hash, PartialEq, Eq)]
-pub struct RangeFactorizedEqLabelRef<'a> {
-    pub targets_and_bins: &'a [u32],
+pub struct BasicEqLabelRef<'a> {
+    pub targets: &'a [u32],
     pub contains_ori: bool,
 }
 
-impl<'a> TargetLabels for RangeFactorizedEqLabelRef<'a> {
-    #[inline]
-    fn target_labels(&self, with_ori: bool) -> &[u32] {
-        let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
-        &self.targets_and_bins[..l]
+#[derive(Hash, PartialEq, Eq)]
+pub struct BasicEqLabel {
+    pub targets: Vec<u32>,
+}
+
+impl EqLabel for BasicEqLabel {
+    type LabelRefT<'a> = BasicEqLabelRef<'a>;
+
+    fn new_ref(labels: &[u32], has_ori: bool) -> BasicEqLabelRef {
+        BasicEqLabelRef {
+            targets: labels,
+            contains_ori: has_ori,
+        }
     }
-    #[inline]
-    fn target_probs(&self, with_ori: bool) -> impl Iterator<Item = f64> {
-        let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
-        let num_bins = NUM_BINS;
-        let half_bin_width = 0.5 / num_bins;
-        RangeFactorizedBinIterator {
-            bin_iterator: self.targets_and_bins[l..2 * l].iter(),
-            num_bins,
-            half_bin_width,
+
+    fn new(targets: &[u32], _probs: Option<&[f64]>) -> Self {
+        Self {
+            targets: targets.into(),
         }
     }
 }
+
+impl TargetLabels for BasicEqLabel {
+    // return the slice of identifiers (u32s) that correspond
+    // to the target ids. If the EqLabel was built without orientations
+    // this is the whole vector, otherwise it's the first half.
+    #[inline]
+    fn target_labels(&self, with_ori: bool) -> &[u32] {
+        // number of targets is total length / 2
+        let nt = if with_ori {
+            self.targets.len() >> 1
+        } else {
+            self.targets.len()
+        };
+        &self.targets[0..nt]
+    }
+}
+
+impl<'a> TargetLabelsRef for BasicEqLabelRef<'a> {
+    // return the slice of identifiers (u32s) that correspond
+    // to the target ids. If the EqLabel was built without orientations
+    // this is the whole vector, otherwise it's the first half.
+    #[inline]
+    fn target_labels(&self) -> &[u32] {
+        let with_ori = self.contains_ori;
+        // number of targets is total length / 2
+        let nt = if with_ori {
+            self.targets.len() >> 1
+        } else {
+            self.targets.len()
+        };
+        &self.targets[0..nt]
+    }
+
+    #[inline]
+    fn target_probs(&self) -> impl Iterator<Item = f64> {
+        let with_ori = self.contains_ori;
+        // number of targets is total length / 2
+        let nt = if with_ori {
+            self.targets.len() >> 1
+        } else {
+            self.targets.len()
+        };
+        std::iter::repeat_n(1.0_f64, nt)
+    }
+}
+
+/// Range factorized equivalence classes
 
 #[derive(Hash, PartialEq, Eq)]
 pub struct RangeFactorizedEqLabel {
@@ -58,7 +119,7 @@ impl EqLabel for RangeFactorizedEqLabel {
     fn new_ref(labels: &[u32], has_ori: bool) -> RangeFactorizedEqLabelRef {
         RangeFactorizedEqLabelRef {
             targets_and_bins: labels,
-            contains_ori: has_ori
+            contains_ori: has_ori,
         }
     }
 
@@ -67,7 +128,7 @@ impl EqLabel for RangeFactorizedEqLabel {
         // first, ensure probs are normalized
         let tot_prob: f64 = probs.iter().sum();
         let num_labels = probs.len();
-        let num_bins = NUM_BINS as usize;//4_usize + ((num_labels as f64).sqrt()).ceil() as usize;
+        let num_bins = NUM_BINS as usize; //4_usize + ((num_labels as f64).sqrt()).ceil() as usize;
 
         let (just_labels, oris) = labels.split_at(num_labels);
         let mut targets_and_bins: Vec<u32> = just_labels.into();
@@ -122,14 +183,26 @@ impl TargetLabels for RangeFactorizedEqLabel {
         let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
         &self.targets_and_bins[..2 * l]
     }
+}
 
+#[derive(Hash, PartialEq, Eq)]
+pub struct RangeFactorizedEqLabelRef<'a> {
+    pub targets_and_bins: &'a [u32],
+    pub contains_ori: bool,
+}
+
+impl<'a> TargetLabelsRef for RangeFactorizedEqLabelRef<'a> {
     #[inline]
-    fn target_probs(&self, with_ori: bool) -> impl Iterator<Item = f64> {
-        // if this is an orientation-aware equivalence class factorization, then
-        // the targets_and_bins vector contains (labels, oris, probs), otherwise
-        // it contains just (labels, probs)
+    fn target_labels(&self) -> &[u32] {
+        let with_ori = self.contains_ori;
         let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
-        let num_bins = NUM_BINS;//4_f64 + ((l as f64).sqrt()).ceil();
+        &self.targets_and_bins[..l]
+    }
+    #[inline]
+    fn target_probs(&self) -> impl Iterator<Item = f64> {
+        let with_ori = self.contains_ori;
+        let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
+        let num_bins = NUM_BINS;
         let half_bin_width = 0.5 / num_bins;
         RangeFactorizedBinIterator {
             bin_iterator: self.targets_and_bins[l..2 * l].iter(),
@@ -139,92 +212,7 @@ impl TargetLabels for RangeFactorizedEqLabel {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
-pub struct BasicEqLabelRef<'a> {
-    pub targets: &'a [u32],
-    pub contains_ori: bool,
-}
-
-#[derive(Hash, PartialEq, Eq)]
-pub struct BasicEqLabel {
-    pub targets: Vec<u32>,
-}
-
-impl EqLabel for BasicEqLabel {
-    type LabelRefT<'a> = BasicEqLabelRef<'a>;
-
-    fn new_ref(labels: &[u32], has_ori: bool) -> BasicEqLabelRef {
-        BasicEqLabelRef {
-            targets: labels,
-            contains_ori: has_ori
-        }
-    }
-
-    fn new(targets: &[u32], probs: Option<&[f64]>) -> Self {
-        Self {
-            targets: targets.into(),
-        }
-    }
-}
-
-pub trait TargetLabels {
-    fn target_labels(&self, with_ori: bool) -> &[u32];
-    fn target_probs(&self, with_ori: bool) -> impl Iterator<Item = f64>;
-}
-
-impl TargetLabels for BasicEqLabel {
-    // return the slice of identifiers (u32s) that correspond
-    // to the target ids. If the EqLabel was built without orientations
-    // this is the whole vector, otherwise it's the first half.
-    #[inline]
-    fn target_labels(&self, with_ori: bool) -> &[u32] {
-        // number of targets is total length / 2
-        let nt = if with_ori {
-            self.targets.len() >> 1
-        } else {
-            self.targets.len()
-        };
-        &self.targets[0..nt]
-    }
-
-    #[inline]
-    fn target_probs(&self, with_ori: bool) -> impl Iterator<Item = f64> {
-        // number of targets is total length / 2
-        let nt = if with_ori {
-            self.targets.len() >> 1
-        } else {
-            self.targets.len()
-        };
-        std::iter::repeat_n(1.0_f64, nt)
-    }
-}
-
-impl<'a> TargetLabels for BasicEqLabelRef<'a> {
-    // return the slice of identifiers (u32s) that correspond
-    // to the target ids. If the EqLabel was built without orientations
-    // this is the whole vector, otherwise it's the first half.
-    #[inline]
-    fn target_labels(&self, with_ori: bool) -> &[u32] {
-        // number of targets is total length / 2
-        let nt = if with_ori {
-            self.targets.len() >> 1
-        } else {
-            self.targets.len()
-        };
-        &self.targets[0..nt]
-    }
-
-    #[inline]
-    fn target_probs(&self, with_ori: bool) -> impl Iterator<Item = f64> {
-        // number of targets is total length / 2
-        let nt = if with_ori {
-            self.targets.len() >> 1
-        } else {
-            self.targets.len()
-        };
-        std::iter::repeat_n(1.0_f64, nt)
-    }
-}
+// equivalence class maps
 
 /// An equivalence class map that maps target equivalence
 /// classes to their counts.
@@ -233,7 +221,7 @@ pub struct EqMap<EqLabelT: TargetLabels> {
     pub contains_ori: bool,
 }
 
-pub struct PackedEqMap {
+pub struct PackedEqMap<EqLabelT> {
     /// the packed list of all equivalence class labels
     pub eq_labels: Vec<u32>,
     /// vector that deliniates where each equivalence class label
@@ -246,13 +234,13 @@ pub struct PackedEqMap {
     pub counts: Vec<usize>,
     /// whether or not the underlying equivalence map was built
     /// with orientation information encoded or not.
+    #[allow(dead_code)]
     pub contains_ori: bool,
-    // phantom: std::marker::PhantomData<EqLabelT>
+    phantom: std::marker::PhantomData<EqLabelT>,
 }
 
-impl PackedEqMap {
-
-    pub fn from_eq_map<EqLabelT: EqLabel>(eqm: &EqMap<EqLabelT>) -> Self {
+impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
+    pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
         let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
         let mut counts = Vec::<usize>::with_capacity(eqm.len());
         let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
@@ -270,12 +258,11 @@ impl PackedEqMap {
             eq_label_starts,
             counts,
             contains_ori: eqm.contains_ori,
-            //phantom: std::marker::PhantomData
+            phantom: std::marker::PhantomData,
         }
     }
 
-    pub fn refs_for_eqc(&self, idx: usize) -> RangeFactorizedEqLabelRef {
-        //<EqLabelT as EqLabel>::LabelRefT<'_> {
+    pub fn refs_for_eqc(&self, idx: usize) -> <EqLabelT as EqLabel>::LabelRefT<'_> {
         let s: usize = self.eq_label_starts[idx] as usize;
         let e: usize = self.eq_label_starts[idx + 1] as usize;
         // if we encode orientation, then it's the first half of the
@@ -285,7 +272,7 @@ impl PackedEqMap {
         // we have stripped the orientations from the
         // label vector when building the
         // PackedEqMap.
-        RangeFactorizedEqLabel::new_ref(&self.eq_labels[s..(s+l)], false)
+        EqLabelT::new_ref(&self.eq_labels[s..(s + l)], false)
     }
 
     pub fn len(&self) -> usize {
@@ -302,7 +289,7 @@ impl PackedEqMap {
     }
     */
 
-    pub fn iter_labels(&self) -> PackedEqLabelIter {
+    pub fn iter_labels(&self) -> PackedEqLabelIter<EqLabelT> {
         PackedEqLabelIter {
             counter: 0,
             underlying_packed_map: self,
@@ -316,13 +303,13 @@ impl PackedEqMap {
 
 /// An iterator over the labels of the
 /// `PackedEqMap`.
-pub struct PackedEqLabelIter<'a> {
+pub struct PackedEqLabelIter<'a, EqLabelT> {
     counter: u32,
-    underlying_packed_map: &'a PackedEqMap,
+    underlying_packed_map: &'a PackedEqMap<EqLabelT>,
 }
 
-impl<'a> Iterator for PackedEqLabelIter<'a> {
-    type Item = RangeFactorizedEqLabelRef<'a>;
+impl<'a, EqLabelT: EqLabel> Iterator for PackedEqLabelIter<'a, EqLabelT> {
+    type Item = <EqLabelT as EqLabel>::LabelRefT<'a>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -341,7 +328,7 @@ impl<'a> Iterator for PackedEqLabelIter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for PackedEqLabelIter<'a> {}
+impl<'a, EqLabelT: EqLabel> ExactSizeIterator for PackedEqLabelIter<'a, EqLabelT> {}
 
 /*
 /// An iterator over the equivalence classes of the

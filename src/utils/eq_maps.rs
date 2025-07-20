@@ -35,6 +35,7 @@ pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq + Sync {
 /// This trait ensures that we can get a list of the labels of this equivalence class
 pub trait TargetLabels {
     fn target_labels(&self, with_ori: bool) -> &[u32];
+    fn extract_key_for_packed_map(&self, has_ori: bool) -> &[u32];
 }
 
 /// This trait ensures we can get a list of the lables (and the probabilities of this
@@ -86,6 +87,19 @@ impl TargetLabels for BasicEqLabel {
     fn target_labels(&self, with_ori: bool) -> &[u32] {
         // number of targets is total length / 2
         let nt = if with_ori {
+            self.targets.len() >> 1
+        } else {
+            self.targets.len()
+        };
+        &self.targets[0..nt]
+    }
+
+    // return the slice of identifiers (u32s) that corresponds
+    // to just the labels
+    #[inline]
+    fn extract_key_for_packed_map(&self, has_ori: bool) -> &[u32] {
+        // number of targets is total length / 2
+        let nt = if has_ori {
             self.targets.len() >> 1
         } else {
             self.targets.len()
@@ -212,15 +226,21 @@ impl<'a> Iterator for RangeFactorizedBinIterator<'a> {
 impl<'a> ExactSizeIterator for RangeFactorizedBinIterator<'a> {}
 
 impl TargetLabels for RangeFactorizedEqLabel {
-    /// NOTE: The 2 * l below here is a huge hack. We want to include the bins in the
-    /// contents of the packed map, and this is how we do it, but we certainly should
-    /// find a more elegant and less hacky way.
     #[inline]
     fn target_labels(&self, with_ori: bool) -> &[u32] {
         // if this is an orientation-aware equivalence class factorization, then
         // the targets_and_bins vector contains (labels, oris, probs), otherwise
         // it contains just (labels, probs)
         let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
+        &self.targets_and_bins[..l]
+    }
+
+    /// NOTE: The 2 * l below here is a huge hack. We want to include the bins in the
+    /// contents of the packed map, and this is how we do it, but we certainly should
+    /// find a more elegant and less hacky way.
+
+    fn extract_key_for_packed_map(&self, has_ori: bool) -> &[u32] {
+        let l = self.targets_and_bins.len() / if has_ori { 3 } else { 2 };
         &self.targets_and_bins[..2 * l]
     }
 }
@@ -261,9 +281,21 @@ impl<'a> TargetLabelsRef for RangeFactorizedEqLabelRef<'a> {
 
 /// An equivalence class map that maps target equivalence
 /// classes to their counts.
-pub struct EqMap<EqLabelT: TargetLabels> {
+pub struct EqMap<EqLabelT> {
     pub count_map: AHashMap<EqLabelT, usize>,
     pub contains_ori: bool,
+}
+
+impl<EqLabelT: EqLabel> EqMap<EqLabelT> {
+    /// add the equivalence class label to this `EQMap`'s
+    /// count map with a count of 1 if it hasen't yet been seen,
+    /// or increment the count if it already exists.
+    pub fn add(&mut self, lab: EqLabelT) -> &'_ mut usize {
+        self.count_map
+            .entry(lab)
+            .and_modify(|counter| *counter += 1)
+            .or_insert(1)
+    }
 }
 
 pub struct PackedEqMap<EqLabelT> {
@@ -294,8 +326,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
         let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
 
         eq_label_starts.push(0);
-        for (eq_lab, count) in eqm.iter() {
-            //eprintln!("eq_lab = {eq_lab:#?}");
+        for (eq_lab, count) in eqm.full_key_iter() {
             eq_labels.extend_from_slice(eq_lab);
             eq_label_starts.push(eq_labels.len() as u32);
             counts.push(*count);
@@ -437,13 +468,50 @@ where
 
     /// Return an iterator over the equivalence class
     /// map iterator.
+    #[allow(dead_code)]
     pub fn iter(&self) -> EqEntryIter<EqLabelT> {
         EqEntryIter {
             underlying_iter: self.count_map.iter(),
             contains_ori: self.contains_ori,
         }
     }
+
+    /// Return an iterator over the equivalence class
+    /// map iterator. Unlike the `iter` method, this iterator
+    /// yields the "full" key, and primarily designed for filling
+    /// in the `PackedEqMap`. For the `BasicEqLabel` the "full"
+    /// key is just the target ids, while for the `RangeFactorizedEqLabel`
+    /// it is the target ids and the conditional probability bin ids.
+    pub fn full_key_iter(&self) -> EqEntryKeyIter<EqLabelT> {
+        EqEntryKeyIter {
+            underlying_iter: self.count_map.iter(),
+            contains_ori: self.contains_ori,
+        }
+    }
 }
+
+pub struct EqEntryKeyIter<'a, EqLabelT: EqLabel> {
+    underlying_iter: std::collections::hash_map::Iter<'a, EqLabelT, usize>,
+    contains_ori: bool,
+}
+
+impl<'a, EqLabelT: EqLabel> Iterator for EqEntryKeyIter<'a, EqLabelT> {
+    type Item = (&'a [u32], &'a usize);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.underlying_iter.next() {
+            Some((k, v)) => Some((k.extract_key_for_packed_map(self.contains_ori), v)),
+            None => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.underlying_iter.size_hint()
+    }
+}
+
+impl<'a, EqLabelT: EqLabel> ExactSizeIterator for EqEntryKeyIter<'a, EqLabelT> {}
 
 pub struct EqEntryIter<'a, EqLabelT: EqLabel> {
     underlying_iter: std::collections::hash_map::Iter<'a, EqLabelT, usize>,

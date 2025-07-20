@@ -21,12 +21,19 @@ fn main() -> anyhow::Result<()> {
 
     match cli_args.command {
         Commands::Quant(quant_opts) => {
+            // if there is only 1 probability bin, then all fragments
+            // fall in the same probability bin and we are using the basic
+            // equivalence class definition. Otherwise, we are using the
+            // range factorized equivalence class definition.
             let eqc_type = if quant_opts.factorized_eqc_bins > 1 {
                 EqMapType::RangeFactorizedEqMap
             } else {
                 EqMapType::BasicEqMap
             };
-            crate::utils::eq_maps::NUM_BINS.get_or_init(|| quant_opts.factorized_eqc_bins as f64);
+            // set the
+            crate::utils::eq_maps::NUM_BINS
+                .set(quant_opts.factorized_eqc_bins as f64)
+                .expect("NUM_BINS should not yet have been initalized");
             process_bulk(quant_opts, eqc_type)?
         }
     }

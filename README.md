@@ -12,5 +12,5 @@ The `piscem-infer` program is written in `rust`, which makes it easy for end-use
 to compile it (it's easy to create statically-linked, pre-compiled executables, and to put the package on `bioconda`). At the same time, this gives us access to the safety 
 guarantees of `rust`, making the code easier to develop and maintain with confidence while retaining the efficiency of a high-performance, statically-typed, compiled language.
 
-While `piscem-infer` is in *active development*, it is already very usable! We encourage folks who are curious to try it out, to open Github issues for any questions or feature
+While `piscem-infer` is in *active development*, it is already very usable! We encourage folks who are curious to try it out, to open GitHub issues for any questions or feature
 requests, and to provide feedback on how you'd like to see this next "evolution" of (bulk sequencing) abundance estimation tools evolve!

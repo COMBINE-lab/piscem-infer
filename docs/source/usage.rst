@@ -21,6 +21,49 @@ or install it from source
    $ cargo build --release
 
 
+Command line parameters for ``piscem-infer``
+--------------------------------------------
+
+.. code-block:: console
+
+   quantify from the rad file
+
+   Usage: piscem-infer quant [OPTIONS] --input <INPUT> --lib-type <LIB_TYPE> --output <OUTPUT>
+
+   Options:
+   -i, --input <INPUT>                              input stem (i.e. without the .rad suffix)
+   -l, --lib-type <LIB_TYPE>                        the expected library type
+   -o, --output <OUTPUT>                            output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
+   -m, --max-iter <MAX_ITER>                        max iterations to run the EM [default: 1500]
+         --convergence-thresh <CONVERGENCE_THRESH>    convergence threshold for EM [default: 0.001]
+         --presence-thresh <PRESENCE_THRESH>          presence threshold for EM [default: 0.00000001]
+         --param-est-frags <PARAM_EST_FRAGS>          number of (unique) mappings to use to perform initial coarse-grained estimation of the fragment length distribution. These fragments will have to be read from
+                                                      the file and interrogated twice [default: 500000]
+         --factorized-eqc-bins <FACTORIZED_EQC_BINS>  number of probability bins to use in RangeFactorized equivalence classes. If this value is set to 1, then basic equivalence classes are used [default: 64]
+         --fld-mean <FLD_MEAN>                        mean of fragment length distribution mean (required, and used, only in the case of unpaired fragments)
+         --fld-sd <FLD_SD>                            mean of fragment length distribution standard deviation (required, and used, only in the case of unpaired fragments)
+         --num-bootstraps <NUM_BOOTSTRAPS>            number of bootstrap replicates to perform [default: 0]
+         --num-threads <NUM_THREADS>                  number of threads to use (used during the EM and for bootstrapping) [default: 16]
+   -h, --help                                       Print help
+   -V, --version                                    Print version
+
+Most of the parameters are self-explanatory.  The ``--input`` option should point to the stem of the input ``RAD`` file, the ``output`` should point to the output stem.  This can contain directories (which
+will be created if they do not yet exist, and several files with this prefix stem, but different suffixes, will be created). 
+
+The ``--lib-type`` option describes the library type (how the reads are expected to have arisen from the underlying molecules), and is specified 
+using `salmon's library type specification <https://salmon.readthedocs.io/en/latest/salmon.html#what-s-this-libtype>`_. The ``--param-est-frags`` determines how many fragments are used from the input
+RAD file to estimate the empirical fragment length distribution.  Not too many fragemnets are necessary to estimate the FLD reliably, but these fragments will be interrogated twice, so this parameter can have 
+a (generally small) effect on the runtime.  The ``--factorized-eqc-bins`` option determines how many conditional probability bins are used in the range factorized equivalence classes used for inference.
+To learn more about range factorized equivalence classes and the choice of this parameter, please see the paper 
+`Improved data-driven likelihood factorizations for transcript abundance estimation <https://doi.org/10.1093/bioinformatics/btx262>` which describes the purpose of this improved notion of equivalence 
+classes and the effect of choosing more or fewer bins.  If the number of bins is set to 1, then there is no purpose in using range factorized equivalence classes, and instead basic equivalence classes
+are used.  If the sample being processed is not paried-end, then an empirical FLD cannot be reliably estimated from the data, and the ``--fld-mean`` and ``--fld-sd`` should be provided by the user, which 
+will be used as the mean and standard deviation of a truncated normal distribution of fragment lengths.  Setting ``--num-bootstraps`` to some value ``k > 0`` will cause ``k`` inferential replicates
+to be generated.  Finally ``--num-threads`` specifies the number of threads that will be used during inference (to run the main estimation EM algorithm as well as to perform bootstrapping).
+Currently, the parsing of the RAD file is single-threaded, and so these threads are only used during inference an bootstrapping.
+
+
+
 An example run
 --------------
 

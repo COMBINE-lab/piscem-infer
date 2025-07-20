@@ -14,3 +14,8 @@ guarantees of `rust`, making the code easier to develop and maintain with confid
 
 While `piscem-infer` is in *active development*, it is already very usable! We encourage folks who are curious to try it out, to open GitHub issues for any questions or feature
 requests, and to provide feedback on how you'd like to see this next "evolution" of (bulk sequencing) abundance estimation tools evolve!
+
+
+### Check out the documentation
+
+Detailed documentation for `piscem-infer` is available in our dedicated [ReadTheDocs page](https://piscem-infer.readthedocs.io/en/latest/index.html)

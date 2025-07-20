@@ -12,7 +12,9 @@ To install piscem-infer, use `cargo <https://github.com/rust-lang/cargo>`_:
 
    $ cargo install piscem-infer
 
+
 or install it from source
+
 
 .. code-block:: console
 
@@ -21,8 +23,12 @@ or install it from source
    $ cargo build --release
 
 
+
 Command line parameters for ``piscem-infer``
 --------------------------------------------
+
+Currently, ``piscem-infer`` has only a ``help`` and ``quant`` sub-command. The ``help`` sub-command is 
+self-descriptive, and the usage for the ``quant`` sub-command is provided below.
 
 .. code-block:: console
 
@@ -46,6 +52,7 @@ Command line parameters for ``piscem-infer``
          --num-threads <NUM_THREADS>                  number of threads to use (used during the EM and for bootstrapping) [default: 16]
    -h, --help                                       Print help
    -V, --version                                    Print version
+
 
 Most of the parameters are self-explanatory.  The ``--input`` option should point to the stem of the input ``RAD`` file, the ``output`` should point to the output stem.  This can contain directories (which
 will be created if they do not yet exist, and several files with this prefix stem, but different suffixes, will be created). 

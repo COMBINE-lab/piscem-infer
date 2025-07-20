@@ -387,7 +387,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         &tag_context,
         lib_type,
         &mut frag_stats,
-        &ref_lengths,
+        ref_lengths,
         eqc_map,
         fld,
     );
@@ -536,7 +536,7 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     };
     */
 
-    let map = &mut eqmap.count_map;
+    //let map = &mut eqmap.count_map;
     let mut frag_lengths = vec![0u32; 65_536];
     const TARGET_UNIQUE_FRAGS: u32 = 5_000;
     let mut unique_frags = 0u32;
@@ -598,10 +598,7 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
 
             label_ints.append(&mut dir_ints);
             let eql = EqLabelT::new(&label_ints, Some(&probs));
-
-            map.entry(eql)
-                .and_modify(|counter| *counter += 1)
-                .or_insert(1);
+            eqmap.add(eql);
 
             if nm == 1 && !ft.is_orphan() {
                 if let Some(fl) = mappings.frag_lengths.first() {

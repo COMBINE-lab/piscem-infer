@@ -360,6 +360,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     let mut frag_stats = MappedFragStats::new();
     let est_frag_lengths: Option<Vec<u32>> = if paired_end {
+        // record the position in the file (right at the start)
+        // of the first chunk
         let file_offset = br.stream_position()?;
         let temp_frag_lens = compute_fld_from_sample(
             &mut br,
@@ -484,6 +486,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process<T: Read, EqLabelT: EqLabel>(
     br: &mut BufReader<T>,
     nrec: usize,
@@ -518,6 +521,7 @@ fn process<T: Read, EqLabelT: EqLabel>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     br: &mut BufReader<T>,
     nrec: usize,
@@ -583,6 +587,12 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                             fld_pdf.cdf(max_frag_len)
                         }
                         MappedFragmentOrientation::Reverse => {
+                            // TODO: modify the bulk RAD creation upstream so that
+                            // if a read is mapped as an orphan, then the length
+                            // field encodes the read length (instead of the maximum
+                            // fragment length).  This will allow us to compute the
+                            // actual right-most end of the mapped fragment, rather than
+                            // just assuming that the read is around length 100.
                             let max_frag_len = *pos as usize + 100;
                             fld_pdf.cdf(max_frag_len)
                         }

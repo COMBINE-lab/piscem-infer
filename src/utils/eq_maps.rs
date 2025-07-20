@@ -235,10 +235,11 @@ impl TargetLabels for RangeFactorizedEqLabel {
         &self.targets_and_bins[..l]
     }
 
-    /// NOTE: The 2 * l below here is a huge hack. We want to include the bins in the
-    /// contents of the packed map, and this is how we do it, but we certainly should
-    /// find a more elegant and less hacky way.
-
+    /// This function extracts the entire key that should be used to represent
+    /// this equivalence class label in a packed map. For a range factorized
+    /// equivalence class label such as this, it will be the list of targets
+    /// as well as the list of probability bin ids (but not the encoding of
+    /// the fragment orientations).
     fn extract_key_for_packed_map(&self, has_ori: bool) -> &[u32] {
         let l = self.targets_and_bins.len() / if has_ori { 3 } else { 2 };
         &self.targets_and_bins[..2 * l]

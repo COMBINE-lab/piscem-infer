@@ -94,6 +94,6 @@ impl FldPDF for EmpiricalFLD {
         (1.0 - self.cum_probs.get(i).unwrap_or(&1.0)) + self.epsilon
     }
     fn cdf(&self, i: usize) -> f64 {
-        self.cum_probs.get(i).unwrap_or(&1.0) + f64::MIN_POSITIVE
+        self.cum_probs.get(i).unwrap_or(&1.0) + self.epsilon
     }
 }

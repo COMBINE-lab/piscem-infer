@@ -1,4 +1,5 @@
 use atomic_float::AtomicF64;
+use orx_parallel::*;
 use rand::prelude::*;
 use rand::rng;
 use rand_distr::weighted::WeightedAliasIndex;
@@ -83,17 +84,20 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 
 #[inline]
 fn m_step_par<EqLabelT: EqLabel>(
-    eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
+    eq_iterates: &[(EqLabelT::LabelRefT<'_>, usize)],
     prev_count: &mut [AtomicF64],
     inv_eff_lens: &[f64],
     curr_counts: &mut [AtomicF64],
-) {
+) where
+    for<'a> [(EqLabelT::LabelRefT<'a>, usize)]: Sync,
+{
     // TODO: is there a better way to set the capacity on
     // this Vec?
-    eq_iterates.par_iter().for_each_with(
-        (&curr_counts, Vec::with_capacity(64)),
-        |(curr_counts, weights), (k, v)| {
-            let count = **v as f64;
+    eq_iterates
+        .par()
+        .using_clone((&curr_counts, Vec::with_capacity(64)))
+        .for_each(|(curr_counts, weights), (k, v)| {
+            let count = *v as f64;
 
             let mut denom = 0.0_f64;
             for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
@@ -111,8 +115,7 @@ fn m_step_par<EqLabelT: EqLabel>(
                 }
             }
             weights.clear();
-        },
-    );
+        });
 }
 
 #[inline]
@@ -236,7 +239,10 @@ pub fn do_bootstrap<EqLabelT: EqLabel>(
         .collect()
 }
 
-pub fn em_par<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>, nthreads: usize) -> Vec<f64> {
+pub fn em_par<EqLabelT>(em_info: &EMInfo<EqLabelT>, nthreads: usize) -> Vec<f64>
+where
+    EqLabelT: EqLabel,
+{
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
@@ -262,64 +268,67 @@ pub fn em_par<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>, nthreads: usize) ->
         .map(|x| AtomicF64::new(*x))
         .collect();
 
-    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
-        eq_map.iter_labels().zip(&eq_map.counts).collect();
+    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, usize)> = eq_map
+        .iter_labels()
+        .zip(eq_map.counts.iter().map(|x| *x))
+        .collect();
 
     let mut rel_diff = 0.0_f64;
     let mut niter = 0_u32;
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(nthreads)
-        .build()
-        .unwrap();
+    /*let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(nthreads)
+            .build()
+            .unwrap();
 
-    pool.install(|| {
-        while niter < max_iter {
-            m_step_par::<EqLabelT>(
-                &eq_iterates,
-                &mut prev_counts,
-                &inv_eff_lens,
-                &mut curr_counts,
-            );
-
-            //std::mem::swap(&)
-            for i in 0..curr_counts.len() {
-                let pci = prev_counts[i].load(Ordering::Relaxed);
-                if pci > presence_thresh {
-                    let cci = curr_counts[i].load(Ordering::Relaxed);
-                    let rd = (cci - pci) / pci;
-                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
-                }
-            }
-
-            std::mem::swap(&mut prev_counts, &mut curr_counts);
-            // zero out the vector
-            curr_counts
-                .par_iter()
-                .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
-
-            if rel_diff < converge_thresh {
-                break;
-            }
-            niter += 1;
-            if niter % 100 == 0 {
-                info!("iteration {}; rel diff {:.3}", niter, rel_diff);
-            }
-            rel_diff = 0.0_f64;
-        }
-
-        prev_counts.iter_mut().for_each(|x| {
-            if x.load(Ordering::Relaxed) < presence_thresh {
-                x.store(0.0, Ordering::Relaxed);
-            }
-        });
+        pool.install(|| {
+    */
+    while niter < max_iter {
         m_step_par::<EqLabelT>(
             &eq_iterates,
             &mut prev_counts,
             &inv_eff_lens,
             &mut curr_counts,
         );
+
+        //std::mem::swap(&)
+        for i in 0..curr_counts.len() {
+            let pci = prev_counts[i].load(Ordering::Relaxed);
+            if pci > presence_thresh {
+                let cci = curr_counts[i].load(Ordering::Relaxed);
+                let rd = (cci - pci) / pci;
+                rel_diff = if rel_diff > rd { rel_diff } else { rd };
+            }
+        }
+
+        std::mem::swap(&mut prev_counts, &mut curr_counts);
+        // zero out the vector
+        curr_counts
+            .par_iter()
+            .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
+
+        if rel_diff < converge_thresh {
+            break;
+        }
+        niter += 1;
+        if niter % 100 == 0 {
+            info!("iteration {}; rel diff {:.3}", niter, rel_diff);
+        }
+        rel_diff = 0.0_f64;
+    }
+
+    prev_counts.iter_mut().for_each(|x| {
+        if x.load(Ordering::Relaxed) < presence_thresh {
+            x.store(0.0, Ordering::Relaxed);
+        }
     });
+    m_step_par::<EqLabelT>(
+        &eq_iterates,
+        &mut prev_counts,
+        &inv_eff_lens,
+        &mut curr_counts,
+    );
+    //});
 
     curr_counts
         .iter()

@@ -330,7 +330,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
         for (eq_lab, count) in eqm.full_key_iter() {
             eq_labels.extend_from_slice(eq_lab);
             eq_label_starts.push(eq_labels.len() as u32);
-            counts.push(*count);
+            counts.push(count);
         }
 
         Self {
@@ -497,12 +497,12 @@ pub struct EqEntryKeyIter<'a, EqLabelT: EqLabel> {
 }
 
 impl<'a, EqLabelT: EqLabel> Iterator for EqEntryKeyIter<'a, EqLabelT> {
-    type Item = (&'a [u32], &'a usize);
+    type Item = (&'a [u32], usize);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying_iter.next() {
-            Some((k, v)) => Some((k.extract_key_for_packed_map(self.contains_ori), v)),
+            Some((k, v)) => Some((k.extract_key_for_packed_map(self.contains_ori), *v)),
             None => None,
         }
     }
@@ -520,12 +520,12 @@ pub struct EqEntryIter<'a, EqLabelT: EqLabel> {
 }
 
 impl<'a, EqLabelT: EqLabel> Iterator for EqEntryIter<'a, EqLabelT> {
-    type Item = (&'a [u32], &'a usize);
+    type Item = (&'a [u32], usize);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying_iter.next() {
-            Some((k, v)) => Some((k.target_labels(self.contains_ori), v)),
+            Some((k, v)) => Some((k.target_labels(self.contains_ori), *v)),
             None => None,
         }
     }

@@ -63,7 +63,7 @@ impl EqLabel for BasicEqLabel {
 
     /// we create a new reference by passing along the label refs we
     /// are given
-    fn new_ref(labels: &[u32], has_ori: bool) -> BasicEqLabelRef {
+    fn new_ref(labels: &[u32], has_ori: bool) -> BasicEqLabelRef<'_> {
         BasicEqLabelRef {
             targets: labels,
             contains_ori: has_ori,
@@ -149,7 +149,7 @@ pub struct RangeFactorizedEqLabel {
 impl EqLabel for RangeFactorizedEqLabel {
     type LabelRefT<'a> = RangeFactorizedEqLabelRef<'a>;
 
-    fn new_ref(labels: &[u32], has_ori: bool) -> RangeFactorizedEqLabelRef {
+    fn new_ref(labels: &[u32], has_ori: bool) -> RangeFactorizedEqLabelRef<'_> {
         RangeFactorizedEqLabelRef {
             targets_and_bins: labels,
             contains_ori: has_ori,
@@ -369,7 +369,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
     }
     */
 
-    pub fn iter_labels(&self) -> PackedEqLabelIter<EqLabelT> {
+    pub fn iter_labels(&self) -> PackedEqLabelIter<'_, EqLabelT> {
         PackedEqLabelIter {
             counter: 0,
             underlying_packed_map: self,
@@ -470,7 +470,7 @@ where
     /// Return an iterator over the equivalence class
     /// map iterator.
     #[allow(dead_code)]
-    pub fn iter(&self) -> EqEntryIter<EqLabelT> {
+    pub fn iter(&self) -> EqEntryIter<'_, EqLabelT> {
         EqEntryIter {
             underlying_iter: self.count_map.iter(),
             contains_ori: self.contains_ori,
@@ -483,7 +483,7 @@ where
     /// in the `PackedEqMap`. For the `BasicEqLabel` the "full"
     /// key is just the target ids, while for the `RangeFactorizedEqLabel`
     /// it is the target ids and the conditional probability bin ids.
-    pub fn full_key_iter(&self) -> EqEntryKeyIter<EqLabelT> {
+    pub fn full_key_iter(&self) -> EqEntryKeyIter<'_, EqLabelT> {
         EqEntryKeyIter {
             underlying_iter: self.count_map.iter(),
             contains_ori: self.contains_ori,

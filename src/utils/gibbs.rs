@@ -38,6 +38,12 @@ pub fn do_gibbs<EqLabelT: EqLabel>(
     let samples_per_chain = num_samples / num_chains;
     let remainder = num_samples % num_chains;
 
+    // Total mapped fragments for scaling output to expected count space
+    let total_mapped_fragments = eq_map.counts.iter().sum::<usize>() as f64;
+
+    // Minimum count threshold (adopted from Bray et al. 2016, matching salmon)
+    const MIN_ALPHA: f64 = 1e-8;
+
     // Run chains in parallel, each chain produces samples sequentially
     let all_samples: Vec<Vec<Vec<f64>>> = (0..num_chains)
         .into_par_iter()
@@ -68,7 +74,24 @@ pub fn do_gibbs<EqLabelT: EqLabel>(
                     );
                 }
 
-                chain_samples.push(counts.clone());
+                // Convert Gamma-drawn fractions (mu) to expected count scale
+                // following salmon: output[i] = mu[i] * effLen[i] * totalMapped / sum(mu[j] * effLen[j])
+                let mut sample = vec![0.0_f64; num_targets];
+                let mut denom = 0.0_f64;
+                for i in 0..num_targets {
+                    sample[i] = mu[i] * eff_lens[i];
+                    denom += sample[i];
+                }
+                if denom > 0.0 {
+                    let scale = total_mapped_fragments / denom;
+                    for x in sample.iter_mut() {
+                        *x *= scale;
+                        if *x < MIN_ALPHA {
+                            *x = 0.0;
+                        }
+                    }
+                }
+                chain_samples.push(sample);
 
                 if (sample_idx + 1) % 50 == 0 {
                     info!(

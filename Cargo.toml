@@ -57,6 +57,7 @@ path-tools = "0.1.0"
 atomic_float = "1.1.0"
 num-format = "0.4.4"
 clap-num = "1.2.0"
+indicatif = "0.17"
 
 [[bin]]
 name = "piscem-infer"

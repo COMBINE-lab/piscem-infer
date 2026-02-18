@@ -5,12 +5,14 @@ use arrow2::{
     datatypes::Field,
 };
 
+use indicatif::{HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::time::Duration;
 use std::{
     fs::{File, create_dir_all},
     io::Seek,
@@ -623,7 +625,15 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     let mut label_ints = vec![];
     let mut dir_ints = vec![];
     let mut probs = vec![];
-    //let mut dir_vec = vec![0u32, 64];
+
+    let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(1));
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} Processed {human_pos} reads [{elapsed_precise}]")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    pb.enable_steady_tick(Duration::from_secs(1));
+
     for _ in 0..nrec {
         let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
         for mappings in &c.reads {
@@ -694,8 +704,15 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                 mapped_stats.mapped_ori_count[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
                 mapped_stats.filtered_ori_count[i] += if filtered_ori_count[i] > 0 { 1 } else { 0 };
             }
+
+            pb.inc(1);
         }
     }
+
+    pb.finish_with_message(format!(
+        "Done — processed {} reads",
+        HumanCount(mapped_stats.num_mapped_reads as u64)
+    ));
 
     let count_table_pass = build_ori_table(&mapped_stats.mapped_ori_count);
     info!(

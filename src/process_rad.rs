@@ -22,8 +22,13 @@ use crate::utils::eq_maps::{
     BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
 };
 use crate::utils::io;
-use crate::utils::map_record_types::LibraryType;
-use crate::{fld::FldPDF, prog_opts::QuantOpts};
+use crate::utils::map_record_types::{
+    LibraryType, OrientationCounts, check_strand_warnings, detect_library_type,
+};
+use crate::{
+    fld::FldPDF,
+    prog_opts::{LibTypeArg, QuantOpts},
+};
 use crate::{
     fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
@@ -162,6 +167,53 @@ fn compute_fld_from_params(mu: f64, sigma: f64, weight: usize, upper: usize) -> 
         .collect()
 }
 
+fn detect_lib_type_from_sample<T: Read>(
+    br: &mut BufReader<T>,
+    nchunk: usize,
+    record_context: &PiscemBulkRecordContext,
+    paired_end: bool,
+    max_samples: usize,
+) -> anyhow::Result<LibraryType> {
+    let mut counts = OrientationCounts::default();
+    let mut sampled = 0usize;
+
+    'sample: for _ in 0..nchunk {
+        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
+        for mappings in &c.reads {
+            for o in &mappings.dirs {
+                counts.add(*o);
+            }
+            sampled += 1;
+            if sampled >= max_samples {
+                break 'sample;
+            }
+        }
+    }
+
+    info!(
+        "Auto-detection sampled {} reads: forward={}, reverse={}, FR={}, RF={}, FF={}, RR={}, unknown={}",
+        sampled,
+        counts.forward, counts.reverse,
+        counts.forward_reverse, counts.reverse_forward,
+        counts.forward_forward, counts.reverse_reverse,
+        counts.unknown
+    );
+
+    if sampled == 0 {
+        anyhow::bail!("No mapped reads found in sample for library type auto-detection");
+    }
+
+    let (detected, ratio) = detect_library_type(&counts, paired_end);
+    check_strand_warnings(detected, ratio, paired_end);
+
+    info!(
+        "Auto-detected library type: {} (forward-strand ratio: {:.4})",
+        detected, ratio
+    );
+
+    Ok(detected)
+}
+
 pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Result<()> {
     let eqmap_orientation_status = OrientationProperty::OrientationAware;
     match eq_map_t {
@@ -181,7 +233,6 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 ) -> anyhow::Result<()> {
     let qo = quant_opts.clone();
     let input = qo.input;
-    let lib_type = qo.lib_type;
     let output = qo.output;
     let max_iter = qo.max_iter;
     let convergence_thresh = qo.convergence_thresh;
@@ -358,6 +409,26 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     // extract whatever context we'll need to read the records
     let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
+    // resolve library type (auto-detect if requested)
+    let lib_type: LibraryType = match qo.lib_type {
+        LibTypeArg::Explicit(lt) => {
+            info!("Using user-specified library type: {}", lt);
+            lt
+        }
+        LibTypeArg::Auto => {
+            let file_offset = br.stream_position()?;
+            let detected = detect_lib_type_from_sample(
+                &mut br,
+                prelude.hdr.num_chunks as usize,
+                &tag_context,
+                paired_end,
+                qo.auto_detect_samples,
+            )?;
+            br.seek(std::io::SeekFrom::Start(file_offset))?;
+            detected
+        }
+    };
+
     let mut frag_stats = MappedFragStats::new();
     let est_frag_lengths: Option<Vec<u32>> = if paired_end {
         // record the position in the file (right at the start)
@@ -477,6 +548,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let ofile = File::create(meta_info_output)?;
     let meta_info = json!({
         "quant_opts": quant_opts,
+        "inferred_lib_type": lib_type.to_string(),
         "mapped_frag_stats": frag_stats,
         "num_bootstraps": num_bootstraps,
         "num_targets": eff_lengths.len(),

@@ -53,3 +53,7 @@ The binary is named `piscem-infer`. Rust edition 2024 is required.
 ## Documentation
 
 Sphinx-based docs in `docs/` published to [ReadTheDocs](https://piscem-infer.readthedocs.io/). Build with `make html` from `docs/`.
+
+## Feature Tracking
+
+See [CLAUDE-features.md](CLAUDE-features.md) for the status of features in development.

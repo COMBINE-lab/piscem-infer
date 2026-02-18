@@ -20,6 +20,7 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
+use crate::utils::gibbs::do_gibbs;
 use crate::utils::eq_maps::{
     BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
 };
@@ -35,7 +36,7 @@ use crate::{
     fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
         EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
-        do_gibbs, em, em_par,
+        em, em_par,
     },
 };
 

@@ -20,7 +20,7 @@ The binary is named `piscem-infer`. Rust edition 2024 is required.
 
 ## Architecture
 
-**Data flow:** RAD file + map_info.json → parse header/metadata → estimate fragment length distribution → build equivalence class maps → run EM algorithm → output abundance estimates (TSV .quant file)
+**Data flow:** RAD file + map_info.json → parse header/metadata → (optional auto library type detection) → estimate fragment length distribution → build equivalence class maps → run EM algorithm → output abundance estimates (TSV .quant file) → (optional inferential replicates via bootstrap or Gibbs sampling)
 
 **Key modules in `src/`:**
 
@@ -29,9 +29,16 @@ The binary is named `piscem-infer`. Rust edition 2024 is required.
 - `process_rad.rs` — Core quantification workflow: RAD parsing, FLD estimation, EM coordination via `process_bulk()` / `process_bulk_dispatch()`
 - `fld.rs` — Fragment length distribution models (empirical and parametric), `FldPDF` trait
 - `utils/em.rs` — EM algorithm implementation with Rayon parallelization, bootstrap replicates, conditional means
+- `utils/gibbs.rs` — Gibbs sampler (`do_gibbs`/`gibbs_iteration`): Gamma step + multinomial reassignment over equivalence classes
 - `utils/eq_maps.rs` — Equivalence class representations: `EqLabel` trait with `BasicEqMap` and `RangeFactorizedEqMap` (probability binning) implementations
 - `utils/io.rs` — Output writing (TSV results, Parquet FLD/bootstrap files via arrow2)
 - `utils/map_record_types.rs` — Library type enums (SF, ISF, SR, ISR, U, IU) and compatibility checking; contains unit tests
+
+**Inferential uncertainty:** Two mutually exclusive methods (`--num-bootstraps` vs `--num-gibbs-samples`):
+- **Bootstrap**: Resamples equivalence class counts via `WeightedAliasIndex`, runs EM on each replicate. Parallelized across replicates.
+- **Gibbs sampling**: Gamma step (transcript fractions from Gamma(prior+count, 1/(β+effLen))) + multinomial reassignment over equivalence classes. Per-nucleotide Dirichlet prior (α=1e-3/effLen), β=0.1. Adaptive multi-chain (1/2/4/8 chains parallelized via rayon), configurable thinning factor.
+
+Both output to `.infreps.pq` with `bootstrap.N` columns; `meta_info.json` records `infrep_method`.
 
 **Key design patterns:**
 - Generic trait-based equivalence classes (`EqLabel` trait) allow swappable strategies

@@ -1,9 +1,11 @@
+use anyhow::bail;
 use clap::Args;
 use clap::{Parser, Subcommand};
 use clap_num::number_range;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use crate::utils::map_record_types::LibraryType;
 
@@ -15,14 +17,43 @@ fn greater_than_0(s: &str) -> std::result::Result<u32, String> {
     number_range(s, 1, u32::MAX)
 }
 
+#[derive(Debug, Clone)]
+pub enum LibTypeArg {
+    Explicit(LibraryType),
+    Auto,
+}
+
+impl FromStr for LibTypeArg {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "AUTO" => Ok(Self::Auto),
+            other => match other.parse::<LibraryType>() {
+                Ok(lt) => Ok(Self::Explicit(lt)),
+                Err(e) => bail!("{e}"),
+            },
+        }
+    }
+}
+
+impl Serialize for LibTypeArg {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Explicit(lt) => lt.serialize(serializer),
+            Self::Auto => serializer.serialize_str("Auto"),
+        }
+    }
+}
+
 #[derive(Args, Serialize, Clone, Debug)]
 pub struct QuantOpts {
     /// input stem (i.e. without the .rad suffix)
     #[arg(short, long)]
     pub input: PathBuf,
-    /// the expected library type
-    #[arg(short, long, value_parser = clap::value_parser!(LibraryType))]
-    pub lib_type: LibraryType,
+    /// the expected library type (or 'auto' for automatic detection)
+    #[arg(short, long, value_parser = clap::value_parser!(LibTypeArg))]
+    pub lib_type: LibTypeArg,
     /// output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
     #[arg(short, long)]
     pub output: PathBuf,
@@ -58,6 +89,10 @@ pub struct QuantOpts {
     /// number of threads to use (used during the EM and for bootstrapping)
     #[arg(long, default_value_t = 16)]
     pub num_threads: usize,
+    /// number of mapped reads to sample for automatic library type detection
+    /// (only used when --lib-type is set to 'auto')
+    #[arg(long, default_value_t = 10_000)]
+    pub auto_detect_samples: usize,
 }
 
 #[derive(Debug, Subcommand)]

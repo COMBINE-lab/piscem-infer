@@ -35,7 +35,7 @@ use crate::{
     fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
         EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
-        em, em_par,
+        do_gibbs, em, em_par,
     },
 };
 
@@ -242,6 +242,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let fld_mean = qo.fld_mean;
     let fld_sd = qo.fld_sd;
     let num_bootstraps = qo.num_bootstraps;
+    let num_gibbs_samples = qo.num_gibbs_samples;
+    let gibbs_thinning_factor = qo.gibbs_thinning_factor;
     let num_threads = qo.num_threads;
 
     // if there is a parent directory
@@ -546,6 +548,37 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         io::write_infrep_file(&output, bs_fields, chunk)?;
     }
 
+    if num_gibbs_samples > 0 {
+        info!("performing Gibbs sampling ({num_gibbs_samples} samples, thinning factor {gibbs_thinning_factor})");
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_global()?;
+        let gibbs_samples =
+            do_gibbs(&eminfo, &em_res, num_gibbs_samples, gibbs_thinning_factor);
+
+        let mut new_arrays = vec![];
+        let mut gs_fields = vec![];
+        for (i, g) in gibbs_samples.into_iter().enumerate() {
+            let gs_array = Float64Array::from_vec(g);
+            gs_fields.push(Field::new(
+                format!("bootstrap.{i}"),
+                gs_array.data_type().clone(),
+                false,
+            ));
+            new_arrays.push(gs_array.boxed());
+        }
+        let chunk = Chunk::new(new_arrays);
+        io::write_infrep_file(&output, gs_fields, chunk)?;
+    }
+
+    let infrep_method = if num_gibbs_samples > 0 {
+        "gibbs"
+    } else if num_bootstraps > 0 {
+        "bootstrap"
+    } else {
+        "none"
+    };
+
     let meta_info_output = output.with_additional_extension(".meta_info.json");
     let ofile = File::create(meta_info_output)?;
     let meta_info = json!({
@@ -553,6 +586,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         "inferred_lib_type": lib_type.to_string(),
         "mapped_frag_stats": frag_stats,
         "num_bootstraps": num_bootstraps,
+        "num_gibbs_samples": num_gibbs_samples,
+        "infrep_method": infrep_method,
         "num_targets": eff_lengths.len(),
         "signatures": ref_sig_json
     });

@@ -84,8 +84,17 @@ pub struct QuantOpts {
     #[arg(long, requires = "fld_mean")]
     pub fld_sd: Option<f64>,
     /// number of bootstrap replicates to perform.
-    #[arg(long, default_value_t = 0)]
+    /// Mutually exclusive with --num-gibbs-samples.
+    #[arg(long, default_value_t = 0, conflicts_with = "num_gibbs_samples")]
     pub num_bootstraps: usize,
+    /// number of Gibbs samples to draw for posterior uncertainty estimation.
+    /// Mutually exclusive with --num-bootstraps.
+    #[arg(long, default_value_t = 0, conflicts_with = "num_bootstraps")]
+    pub num_gibbs_samples: usize,
+    /// number of internal Gibbs iterations between collected samples (thinning).
+    /// Only used when --num-gibbs-samples > 0.
+    #[arg(long, default_value_t = 5)]
+    pub gibbs_thinning_factor: usize,
     /// number of threads to use (used during the EM and for bootstrapping)
     #[arg(long, default_value_t = 16)]
     pub num_threads: usize,

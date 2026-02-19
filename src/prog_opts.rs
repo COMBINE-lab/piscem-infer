@@ -48,59 +48,68 @@ impl Serialize for LibTypeArg {
 
 #[derive(Args, Serialize, Clone, Debug)]
 pub struct QuantOpts {
+    // --- Input / Output ---
     /// input stem (i.e. without the .rad suffix)
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Input / Output")]
     pub input: PathBuf,
     /// the expected library type (or 'auto' for automatic detection)
-    #[arg(short, long, value_parser = clap::value_parser!(LibTypeArg))]
+    #[arg(short, long, value_parser = clap::value_parser!(LibTypeArg), help_heading = "Input / Output")]
     pub lib_type: LibTypeArg,
     /// output file prefix (multiple output files may be created, the main will have a `.quant` suffix)
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Input / Output")]
     pub output: PathBuf,
+
+    // --- EM Algorithm ---
     /// max iterations to run the EM
-    #[arg(short, long, default_value_t = MAX_EM_ITER)]
+    #[arg(short, long, default_value_t = MAX_EM_ITER, help_heading = "EM Algorithm")]
     pub max_iter: u32,
     /// convergence threshold for EM
-    #[arg(long, default_value_t = RELDIFF_THRESH)]
+    #[arg(long, default_value_t = RELDIFF_THRESH, help_heading = "EM Algorithm")]
     pub convergence_thresh: f64,
     /// presence threshold for EM
-    #[arg(long, default_value_t = PRESENCE_THRESH)]
+    #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
+
+    // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use to perform initial coarse-grained
     /// estimation of the fragment length distribution. These fragments will have
     /// to be read from the file and interrogated twice.
-    #[arg(long, default_value_t = 500_000_isize)]
+    #[arg(long, default_value_t = 500_000_isize, help_heading = "Fragment Length Distribution")]
     pub param_est_frags: isize,
-    /// number of probability bins to use in RangeFactorized equivalence classes.
-    /// If this value is set to 1, then basic equivalence classes are used.
-    #[arg(long, default_value_t = 64_u32, value_parser=greater_than_0)]
-    pub factorized_eqc_bins: u32,
     /// mean of fragment length distribution mean
     /// (required, and used, only in the case of unpaired fragments).
-    #[arg(long, requires = "fld_sd")]
+    #[arg(long, requires = "fld_sd", help_heading = "Fragment Length Distribution")]
     pub fld_mean: Option<f64>,
     /// mean of fragment length distribution standard deviation
     /// (required, and used, only in the case of unpaired fragments).
-    #[arg(long, requires = "fld_mean")]
+    #[arg(long, requires = "fld_mean", help_heading = "Fragment Length Distribution")]
     pub fld_sd: Option<f64>,
+
+    // --- Inferential Replicates ---
     /// number of bootstrap replicates to perform.
     /// Mutually exclusive with --num-gibbs-samples.
-    #[arg(long, default_value_t = 0, conflicts_with = "num_gibbs_samples")]
+    #[arg(long, default_value_t = 0, conflicts_with = "num_gibbs_samples", help_heading = "Inferential Replicates")]
     pub num_bootstraps: usize,
     /// number of Gibbs samples to draw for posterior uncertainty estimation.
     /// Mutually exclusive with --num-bootstraps.
-    #[arg(long, default_value_t = 0, conflicts_with = "num_bootstraps")]
+    #[arg(long, default_value_t = 0, conflicts_with = "num_bootstraps", help_heading = "Inferential Replicates")]
     pub num_gibbs_samples: usize,
     /// number of internal Gibbs iterations between collected samples (thinning).
     /// Only used when --num-gibbs-samples > 0.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 5, help_heading = "Inferential Replicates")]
     pub gibbs_thinning_factor: usize,
+
+    // --- Advanced ---
+    /// number of probability bins to use in RangeFactorized equivalence classes.
+    /// If this value is set to 1, then basic equivalence classes are used.
+    #[arg(long, default_value_t = 64_u32, value_parser=greater_than_0, help_heading = "Advanced")]
+    pub factorized_eqc_bins: u32,
     /// number of threads to use (used during the EM and for bootstrapping)
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16, help_heading = "Advanced")]
     pub num_threads: usize,
     /// number of mapped reads to sample for automatic library type detection
     /// (only used when --lib-type is set to 'auto')
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]
     pub auto_detect_samples: usize,
 }
 

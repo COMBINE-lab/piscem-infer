@@ -123,14 +123,14 @@ fn compute_fld_from_sample<T: Read>(
             let nm = mappings.positions.len();
             if nm == 1 && !ft.is_orphan() {
                 let o = mappings.dirs.first().expect("at least one mapping");
-                if lib_type.is_compatible_with(*o) {
-                    if let Some(fl) = mappings.frag_lengths.first() {
-                        temp_frag_lengths[*fl as usize] += 1;
-                        param_est_frags -= 1;
-                        if param_est_frags <= 0 {
-                            sufficient_samples = true;
-                            break 'estimate_fld;
-                        }
+                if lib_type.is_compatible_with(*o)
+                    && let Some(fl) = mappings.frag_lengths.first()
+                {
+                    temp_frag_lengths[*fl as usize] += 1;
+                    param_est_frags -= 1;
+                    if param_est_frags <= 0 {
+                        sufficient_samples = true;
+                        break 'estimate_fld;
                     }
                 }
             }

@@ -302,7 +302,7 @@ pub fn em_par<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>, nthreads: usize) ->
                 break;
             }
             niter += 1;
-            if niter % 100 == 0 {
+            if niter.is_multiple_of(100) {
                 info!("iteration {}; rel diff {:.3}", niter, rel_diff);
             }
             rel_diff = 0.0_f64;
@@ -374,7 +374,7 @@ pub fn em<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>) -> Vec<f64> {
             break;
         }
         niter += 1;
-        if niter % 100 == 0 {
+        if niter.is_multiple_of(100) {
             info!("iteration {}; rel diff {:.3}", niter, rel_diff);
         }
         rel_diff = 0.0_f64;

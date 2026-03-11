@@ -5,7 +5,6 @@ use arrow2::{
     chunk::Chunk,
     datatypes::{Field, Schema},
 };
-use libradicl::header;
 use path_tools::WithAdditionalExtension;
 use std::fs::File;
 use std::io::Write;
@@ -15,7 +14,7 @@ use tracing::warn;
 
 pub(crate) fn write_results(
     output: &Path,
-    hdr: &header::RadHeader,
+    ref_names: &[String],
     e_counts: &[f64],
     lengths: &[u32],
     eff_lengths: &[f64],
@@ -52,7 +51,7 @@ pub(crate) fn write_results(
         })
         .collect();
 
-    for (i, name) in hdr.ref_names.iter().enumerate() {
+    for (i, name) in ref_names.iter().enumerate() {
         let l = format!(
             "{}\t{}\t{:.3}\t{:.3}\t{:.3}\n",
             name, lengths[i], eff_lengths[i], tpms[i], e_counts[i]

@@ -162,7 +162,6 @@ simulate_experiment(
   fragsd = fragsd,
   error_rate = error_rate,
   outdir = sim_outdir,
-  write_info = TRUE,
   seed = 42
 )
 

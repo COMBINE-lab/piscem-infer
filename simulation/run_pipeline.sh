@@ -79,7 +79,7 @@ mkdir -p "$MAPPED_DIR"
 echo "Step 2: Mapping reads with piscem..."
 
 # Read sample_info.csv (skip header), extract sample_name, r1_path, r2_path
-tail -n +2 "$SAMPLE_INFO" | while IFS=, read -r _ sample_name condition r1_path r2_path; do
+tail -n +2 "$SAMPLE_INFO" | while IFS=, read -r sample_name condition r1_path r2_path; do
     # Strip quotes that R's write.csv may add
     sample_name=$(echo "$sample_name" | tr -d '"')
     condition=$(echo "$condition" | tr -d '"')
@@ -115,7 +115,7 @@ mkdir -p "$SINGLE_DIR"
 
 echo "Step 3: Running single-sample quantification (baseline)..."
 
-tail -n +2 "$SAMPLE_INFO" | while IFS=, read -r _ sample_name condition r1_path r2_path; do
+tail -n +2 "$SAMPLE_INFO" | while IFS=, read -r sample_name condition r1_path r2_path; do
     sample_name=$(echo "$sample_name" | tr -d '"')
     SAMPLE_MAP_PREFIX="$MAPPED_DIR/$sample_name/$sample_name"
     SAMPLE_OUT="$SINGLE_DIR/$sample_name/$sample_name"
@@ -151,7 +151,7 @@ echo "Step 4: Running multi-sample hierarchical quantification..."
 MULTI_MANIFEST="$SIMDIR/manifest_multi.csv"
 {
     echo "sample_name,condition,rad_path,output_dir"
-    tail -n +2 "$SAMPLE_INFO" | while IFS=, read -r _ sample_name condition r1_path r2_path; do
+    tail -n +2 "$SAMPLE_INFO" | while IFS=, read -r sample_name condition r1_path r2_path; do
         sample_name=$(echo "$sample_name" | tr -d '"')
         condition=$(echo "$condition" | tr -d '"')
         echo "$sample_name,$condition,$MAPPED_DIR/$sample_name/$sample_name,$MULTI_DIR/$sample_name"

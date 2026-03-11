@@ -32,7 +32,7 @@ pub fn init_hyperparams(
     let num_conditions = condition_names.len();
     HierarchicalHyperparams {
         nu: vec![vec![0.0; num_targets]; num_conditions],
-        sigma_sq: vec![1.0; num_targets],
+        sigma_sq: vec![10.0; num_targets],
         condition_names,
     }
 }
@@ -109,7 +109,10 @@ pub fn update_biological_variance(
 
         // max(floor, ...) clamp — floor prevents division by zero in the prior term
         // when measurement noise dominates (common with few samples)
-        const SIGMA_SQ_FLOOR: f64 = 1e-4;
+        // Floor of 1.0 ensures the prior remains weak when biological variance
+        // cannot be reliably estimated (few samples, high measurement noise).
+        // This prevents over-shrinkage toward the condition mean.
+        const SIGMA_SQ_FLOOR: f64 = 1.0;
         hyperparams.sigma_sq[t] = (mean_sq_dev - mean_sigma_hat).max(SIGMA_SQ_FLOOR);
     }
 }
@@ -171,7 +174,7 @@ mod tests {
         assert_eq!(hp.nu[0].len(), 100);
         assert_eq!(hp.sigma_sq.len(), 100);
         assert!(hp.nu[0].iter().all(|&v| v == 0.0));
-        assert!(hp.sigma_sq.iter().all(|&v| v == 1.0));
+        assert!(hp.sigma_sq.iter().all(|&v| v == 10.0));
     }
 
     #[test]
@@ -241,7 +244,7 @@ mod tests {
         update_biological_variance(&posteriors, &mut hp);
 
         assert!(
-            hp.sigma_sq[0] <= 1e-4,
+            hp.sigma_sq[0] <= 1.0,
             "When noise dominates, sigma_sq should clamp to floor, got {}",
             hp.sigma_sq[0]
         );

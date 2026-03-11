@@ -20,6 +20,8 @@ if (!file.exists(gt_file)) {
   stop("Ground truth file not found: ", gt_file)
 }
 gt <- read.csv(gt_file, stringsAsFactors = FALSE)
+# Extract short ID (first field before space) to match piscem's truncated names
+gt$short_id <- sub(" .*", "", gt$transcript_id)
 cat("Loaded ground truth for", nrow(gt), "transcripts\n")
 
 # ---- Load sample info ----
@@ -49,8 +51,8 @@ compare_to_gt <- function(quant_df, gt, condition) {
     return(NULL)
   }
 
-  # Match by transcript name
-  m <- match(quant_df$target_name, gt$transcript_id)
+  # Match by short ID (piscem truncates names at first space)
+  m <- match(quant_df$target_name, gt$short_id)
   if (any(is.na(m))) {
     warning(sum(is.na(m)), " transcripts not found in ground truth")
   }
@@ -145,8 +147,8 @@ if (length(single_results) > 0 && length(multi_results) > 0) {
   # ---- DE-specific analysis ----
   cat("\n=== DE transcript analysis ===\n")
 
-  de_tx <- gt$transcript_id[gt$is_de]
-  non_de_tx <- gt$transcript_id[!gt$is_de]
+  de_tx <- gt$short_id[gt$is_de]
+  non_de_tx <- gt$short_id[!gt$is_de]
 
   # Compare MARD for DE vs non-DE transcripts
   for (method_name in c("single", "multi")) {
@@ -162,11 +164,11 @@ if (length(single_results) > 0 && length(multi_results) > 0) {
       quant_df <- read_quant(quant_path)
       if (is.null(quant_df)) next
 
-      m <- match(quant_df$target_name, gt$transcript_id)
+      m <- match(quant_df$target_name, gt$short_id)
       valid <- !is.na(m)
       est_tpm <- quant_df$tpm[valid]
       true_tpm <- gt[[tpm_col]][m[valid]]
-      tx_names <- gt$transcript_id[m[valid]]
+      tx_names <- gt$short_id[m[valid]]
 
       pseudo <- 0.01
       ard <- abs(est_tpm - true_tpm) / (true_tpm + pseudo)

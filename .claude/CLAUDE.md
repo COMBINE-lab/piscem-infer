@@ -36,7 +36,7 @@ The binary is named `piscem-infer`. Rust edition 2024 is required.
 
 **Inferential uncertainty:** Two mutually exclusive methods (`--num-bootstraps` vs `--num-gibbs-samples`):
 - **Bootstrap**: Resamples equivalence class counts via `WeightedAliasIndex`, runs EM on each replicate. Parallelized across replicates.
-- **Gibbs sampling**: Gamma step (transcript fractions from Gamma(prior+count, 1/(β+effLen))) + multinomial reassignment over equivalence classes. Per-nucleotide Dirichlet prior (α=1e-3/effLen), β=0.1. Adaptive multi-chain (1/2/4/8 chains parallelized via rayon), configurable thinning factor.
+- **Gibbs sampling**: Gamma step (transcript fractions from Gamma(prior+count, 1/(β+effLen))) + multinomial reassignment over equivalence classes. Per-nucleotide Dirichlet prior (α=1e-3/effLen), β=0.1. Adaptive multi-chain (1/2/4/8 chains parallelized via rayon), configurable thinning factor. Output uses salmon-style scaled Gamma fractions (`output[i] = μ[i] * effLen[i] * totalMapped / Σ(μ[j] * effLen[j])`) rather than raw count assignments, with values below 1e-8 truncated to zero (Bray et al. 2016).
 
 Both output to `.infreps.pq` with `bootstrap.N` columns; `meta_info.json` records `infrep_method`.
 

@@ -159,11 +159,13 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
         );
     }
 
-    let eq_map_type = if opts.factorized_eqc_bins > 1 {
-        EqMapType::RangeFactorizedEqMap
-    } else {
-        EqMapType::BasicEqMap
-    };
+    // Force BasicEqMap for multi-quant: the serialization/deserialization pipeline
+    // in Phase B operates in BasicEqLabel space. RangeFactorized labels can't be
+    // reinterpreted as Basic labels without losing correctness.
+    if opts.factorized_eqc_bins > 1 {
+        info!("Note: multi-quant uses basic equivalence classes (overriding factorized_eqc_bins={})", opts.factorized_eqc_bins);
+    }
+    let eq_map_type = EqMapType::BasicEqMap;
 
     if !opts.phase_b_only {
         info!("=== Phase A: Per-sample EQ class building ===");
@@ -296,8 +298,18 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
         let mut final_posteriors: Vec<HierSamplePosterior> = Vec::new();
         let mut converged_at: Option<u32> = None;
 
-        for outer_iter in 0..opts.num_outer_iters {
-            info!("--- Outer iteration {}/{} ---", outer_iter + 1, opts.num_outer_iters);
+        // Total iterations = 1 (initialization with flat prior) + num_outer_iters
+        let total_iters = 1 + opts.num_outer_iters;
+
+        for outer_iter in 0..total_iters {
+            // Iteration 0 uses a flat prior to get unbiased initial estimates;
+            // subsequent iterations use the learned hyperparameters.
+            let is_init_iter = outer_iter == 0;
+            if is_init_iter {
+                info!("--- Initialization iteration (flat prior) ---");
+            } else {
+                info!("--- Outer iteration {}/{} ---", outer_iter, opts.num_outer_iters);
+            }
 
             // Snapshot current hyperparams for convergence check
             let old_nu = hyperparams.nu.clone();
@@ -309,9 +321,17 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             for (i, sample) in samples.iter().enumerate() {
                 info!("  Sample '{}'", sample.sample_name);
 
-                let prior = PenalizedPrior {
-                    nu: hyperparams.nu[condition_index(&sample.condition, &conditions)].clone(),
-                    sigma_sq: hyperparams.sigma_sq.clone(),
+                let prior = if is_init_iter {
+                    // Flat prior: let EM+L-BFGS find the MLE without shrinkage
+                    PenalizedPrior {
+                        nu: vec![0.0; num_targets],
+                        sigma_sq: vec![1e30; num_targets],
+                    }
+                } else {
+                    PenalizedPrior {
+                        nu: hyperparams.nu[condition_index(&sample.condition, &conditions)].clone(),
+                        sigma_sq: hyperparams.sigma_sq.clone(),
+                    }
                 };
 
                 let em_info = EMInfo {
@@ -352,16 +372,17 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             );
 
             convergence_history.push(json!({
-                "iteration": outer_iter + 1,
+                "iteration": if is_init_iter { "init".to_string() } else { outer_iter.to_string() },
                 "max_nu_change": nu_change,
                 "max_sigma_sq_change": sigma_change,
             }));
 
             final_posteriors = posteriors;
 
-            if nu_change < 1e-5 && sigma_change < 1e-5 {
-                converged_at = Some(outer_iter + 1);
-                info!("Hierarchical loop converged at iteration {}", outer_iter + 1);
+            // Don't check convergence on the init iteration
+            if !is_init_iter && nu_change < 1e-5 && sigma_change < 1e-5 {
+                converged_at = Some(outer_iter);
+                info!("Hierarchical loop converged at iteration {}", outer_iter);
                 break;
             }
         }

@@ -108,13 +108,21 @@ pub fn penalized_em<EqLabelT: EqLabel>(
         em(&warmstart_info)
     };
 
-    // Convert EM counts to theta (probability simplex), then to phi (log-space)
+    // Convert EM counts to theta (probability simplex), then to phi (log-space).
+    // Use a moderate floor (1e-8) to keep phi in a reasonable range for L-BFGS,
+    // then center phi to mean zero (softmax is shift-invariant).
     let total_counts: f64 = em_counts.iter().sum();
+    let theta_floor = 1e-8;
     let theta: Vec<f64> = em_counts.iter().map(|&c| {
         let t = c / total_counts;
-        if t > 1e-300 { t } else { 1e-300 }
+        if t > theta_floor { t } else { theta_floor }
     }).collect();
-    let init_phi = gradient::log_transform(&theta, 1e-300);
+    let mut init_phi = gradient::log_transform(&theta, theta_floor);
+    // Center phi so mean = 0 (stabilizes L-BFGS and prior interaction)
+    let phi_mean = init_phi.iter().sum::<f64>() / init_phi.len() as f64;
+    for p in init_phi.iter_mut() {
+        *p -= phi_mean;
+    }
 
     // Phase 1b: L-BFGS on penalized objective
     info!("Phase 1b: Running L-BFGS optimization (max {} iters, history {})",
@@ -128,9 +136,9 @@ pub fn penalized_em<EqLabelT: EqLabel>(
 
     let linesearch = MoreThuenteLineSearch::new();
     let solver = LBFGS::new(linesearch, lbfgs_history)
-        .with_tolerance_grad(1e-6 * (num_targets as f64).sqrt())
+        .with_tolerance_grad(1e-4 * (num_targets as f64).sqrt())
         .map_err(|e| anyhow::anyhow!("L-BFGS config error: {}", e))?
-        .with_tolerance_cost(f64::EPSILON)
+        .with_tolerance_cost(1e-10)
         .map_err(|e| anyhow::anyhow!("L-BFGS config error: {}", e))?;
 
     let executor = Executor::new(problem, solver)

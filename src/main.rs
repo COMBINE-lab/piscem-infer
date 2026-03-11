@@ -3,6 +3,7 @@ use clap::Parser;
 use tracing::Level;
 
 mod fld;
+mod multi_sample;
 mod process_rad;
 mod prog_opts;
 mod utils;
@@ -35,6 +36,12 @@ fn main() -> anyhow::Result<()> {
                 .set(quant_opts.factorized_eqc_bins as f64)
                 .expect("NUM_BINS should not yet have been initalized");
             process_bulk(quant_opts, eqc_type)?
+        }
+        Commands::MultiQuant(multi_opts) => {
+            crate::utils::eq_maps::NUM_BINS
+                .set(multi_opts.factorized_eqc_bins as f64)
+                .expect("NUM_BINS should not yet have been initalized");
+            multi_sample::run(&multi_opts)?
         }
     }
     Ok(())

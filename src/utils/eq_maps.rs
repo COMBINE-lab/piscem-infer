@@ -321,6 +321,22 @@ pub struct PackedEqMap<EqLabelT> {
 }
 
 impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
+    /// Reconstruct a `PackedEqMap` from raw vectors (e.g. after deserialization).
+    pub fn from_raw(
+        eq_labels: Vec<u32>,
+        eq_label_starts: Vec<u32>,
+        counts: Vec<usize>,
+        contains_ori: bool,
+    ) -> Self {
+        Self {
+            eq_labels,
+            eq_label_starts,
+            counts,
+            contains_ori,
+            phantom: std::marker::PhantomData,
+        }
+    }
+
     pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
         let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
         let mut counts = Vec::<usize>::with_capacity(eqm.len());

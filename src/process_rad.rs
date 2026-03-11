@@ -40,6 +40,28 @@ use crate::{
     },
 };
 
+/// Options for RAD file processing (shared between single-sample and multi-sample modes).
+pub struct RadProcessingOpts {
+    pub input: std::path::PathBuf,
+    pub lib_type: LibTypeArg,
+    pub param_est_frags: isize,
+    pub fld_mean: Option<f64>,
+    pub fld_sd: Option<f64>,
+    pub auto_detect_samples: usize,
+}
+
+/// Bundle of results from building an EQ map from a RAD file.
+pub struct EqMapBundle<EqLabelT: EqLabel> {
+    pub packed_eq_map: PackedEqMap<EqLabelT>,
+    pub eff_lengths: Vec<f64>,
+    pub ref_lengths: Vec<u32>,
+    pub ref_names: Vec<String>,
+    pub frag_lengths: Vec<u32>,
+    pub frag_stats: MappedFragStats,
+    pub ref_sig_json: Option<Value>,
+    pub lib_type: LibraryType,
+}
+
 use libradicl::rad_types::{self, MappedFragmentOrientation};
 use libradicl::{
     chunk,
@@ -48,11 +70,11 @@ use libradicl::{
 };
 
 #[derive(Serialize)]
-struct MappedFragStats {
-    tot_mappings: usize,
-    num_mapped_reads: usize,
-    mapped_ori_count: [u32; 7],
-    filtered_ori_count: [u32; 7],
+pub struct MappedFragStats {
+    pub tot_mappings: usize,
+    pub num_mapped_reads: usize,
+    pub mapped_ori_count: [u32; 7],
+    pub filtered_ori_count: [u32; 7],
 }
 
 impl MappedFragStats {
@@ -230,32 +252,16 @@ pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Resul
     }
 }
 
-pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
-    quant_opts: QuantOpts,
+/// Build an equivalence class map from a RAD file, including FLD estimation
+/// and effective length computation. This is the common "Phase A" work shared
+/// between single-sample `quant` and multi-sample `multi-quant`.
+pub fn build_eq_map_from_rad<EqLabelT: EqLabel>(
+    opts: &RadProcessingOpts,
     eqc_map: EqMap<EqLabelT>,
-) -> anyhow::Result<()> {
-    let qo = quant_opts.clone();
-    let input = qo.input;
-    let output = qo.output;
-    let max_iter = qo.max_iter;
-    let convergence_thresh = qo.convergence_thresh;
-    let presence_thresh = qo.presence_thresh;
-    let fld_mean = qo.fld_mean;
-    let fld_sd = qo.fld_sd;
-    let num_bootstraps = qo.num_bootstraps;
-    let num_gibbs_samples = qo.num_gibbs_samples;
-    let gibbs_thinning_factor = qo.gibbs_thinning_factor;
-    let num_threads = qo.num_threads;
-
-    // if there is a parent directory
-    if let Some(p) = output.parent() {
-        // unless this was a relative path with one component,
-        // which we should treat as the file prefix, then grab
-        // the non-empty parent and create it.
-        if p != Path::new("") {
-            create_dir_all(p)?;
-        }
-    }
+) -> anyhow::Result<EqMapBundle<EqLabelT>> {
+    let input = &opts.input;
+    let fld_mean = opts.fld_mean;
+    let fld_sd = opts.fld_sd;
 
     info!("path {:?}", input);
     let ref_sig_json;
@@ -285,7 +291,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         }
     }
 
-    let mut input_rad = input;
+    let mut input_rad = input.clone();
     input_rad.set_extension("rad");
     let i_file = File::open(&input_rad).context("could not open input rad file")?;
     let mut br = BufReader::new(i_file);
@@ -294,7 +300,6 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let mut fl_mean = 0_f64;
     let mut fl_sd = 0_f64;
 
-    // read the header and tag sections from the rad file
     let prelude = RadPrelude::from_bytes(&mut br)?;
 
     info!("read header!");
@@ -326,18 +331,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     // file-level
     info!("read {:?} file-level tags", prelude.file_tags.tags.len());
-    // parse actual tags
     for ft in &prelude.file_tags.tags {
         info!("\tfile-level tag {}", ft.name);
     }
 
     // read-level
     info!("read {:?} read-level tags", prelude.read_tags.tags.len());
-
-    // required read-level tag
     const FRAG_TYPE_NAME: &str = "frag_map_type";
     let mut had_frag_map_type = false;
-    // parse actual tags
     for rt in &prelude.read_tags.tags {
         info!("\tread-level tag {}", rt.name);
         if rt.name == FRAG_TYPE_NAME {
@@ -356,7 +357,6 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         prelude.aln_tags.tags.len()
     );
 
-    // required alignment level tags
     const REF_ORI_NAME: &str = "compressed_ori_ref";
     const POS_NAME: &str = "pos";
     const FRAGLEN_NAME: &str = "frag_len";
@@ -364,61 +364,36 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let mut found_ref_ori_t = false;
     let mut found_pos_t = false;
     let mut found_fraglen_t = false;
-    // parse actual tags
     for at in &prelude.aln_tags.tags {
         info!("\talignment-level tag {}", at.name);
         match at.name.as_str() {
-            REF_ORI_NAME => {
-                found_ref_ori_t = true;
-            }
-            POS_NAME => {
-                found_pos_t = true;
-            }
-            FRAGLEN_NAME => {
-                found_fraglen_t = true;
-            }
-            _ => {
-                info!("unknown alignment-level tag {}", at.name);
-            }
+            REF_ORI_NAME => found_ref_ori_t = true,
+            POS_NAME => found_pos_t = true,
+            FRAGLEN_NAME => found_fraglen_t = true,
+            _ => info!("unknown alignment-level tag {}", at.name),
         }
     }
-    // ensure the tags we expect are found
-    assert!(
-        found_ref_ori_t,
-        "required alignment-level tag \"{REF_ORI_NAME}\" is missing"
-    );
-    assert!(
-        found_pos_t,
-        "required alignment-level tag \"{POS_NAME}\" is missing"
-    );
-    assert!(
-        found_fraglen_t,
-        "required alignment-level tag \"{FRAGLEN_NAME}\" is missing"
-    );
+    assert!(found_ref_ori_t, "required alignment-level tag \"{REF_ORI_NAME}\" is missing");
+    assert!(found_pos_t, "required alignment-level tag \"{POS_NAME}\" is missing");
+    assert!(found_fraglen_t, "required alignment-level tag \"{FRAGLEN_NAME}\" is missing");
 
-    // parse the actual file-level tags
     const REF_LENGTHS_NAME: &str = "ref_lengths";
     let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
-    // get the reference lengths from the tag map
     let ref_lengths = match file_tag_map.get(REF_LENGTHS_NAME) {
-        Some(rad_types::TagValue::ArrayU32(v)) => Some(v),
-        _ => None,
+        Some(rad_types::TagValue::ArrayU32(v)) => v,
+        _ => bail!("was not able to read reference lengths from file!"),
     };
-
-    let ref_lengths = ref_lengths.expect("was not able to read reference lengths from file!");
     info!(
         "read {} reference lengths",
         ref_lengths.len().to_formatted_string(&Locale::en)
     );
 
-    // extract whatever context we'll need to read the records
     let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
-    // resolve library type (auto-detect if requested)
-    let lib_type: LibraryType = match qo.lib_type {
+    let lib_type: LibraryType = match &opts.lib_type {
         LibTypeArg::Explicit(lt) => {
             info!("Using user-specified library type: {}", lt);
-            lt
+            *lt
         }
         LibTypeArg::Auto => {
             let file_offset = br.stream_position()?;
@@ -427,7 +402,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
                 prelude.hdr.num_chunks as usize,
                 &tag_context,
                 paired_end,
-                qo.auto_detect_samples,
+                opts.auto_detect_samples,
             )?;
             br.seek(std::io::SeekFrom::Start(file_offset))?;
             detected
@@ -436,17 +411,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     let mut frag_stats = MappedFragStats::new();
     let est_frag_lengths: Option<Vec<u32>> = if paired_end {
-        // record the position in the file (right at the start)
-        // of the first chunk
         let file_offset = br.stream_position()?;
         let temp_frag_lens = compute_fld_from_sample(
             &mut br,
             prelude.hdr.num_chunks as usize,
             &tag_context,
             lib_type,
-            qo.param_est_frags,
+            opts.param_est_frags,
         )?;
-        // reset the stream to the start of the chunks
         br.seek(std::io::SeekFrom::Start(file_offset))?;
         Some(temp_frag_lens)
     } else {
@@ -477,9 +449,70 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     };
     let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
 
+    info!(
+        "num mapped reads = {}",
+        frag_stats.num_mapped_reads.to_formatted_string(&Locale::en)
+    );
+    info!(
+        "total mappings = {}",
+        frag_stats.tot_mappings.to_formatted_string(&Locale::en)
+    );
+    info!(
+        "number of equivalence classes = {}",
+        packed_eq_map.len().to_formatted_string(&Locale::en)
+    );
+    info!(
+        "total equivalence map weight = {}",
+        packed_eq_map.total_weight().to_formatted_string(&Locale::en)
+    );
+
+    Ok(EqMapBundle {
+        packed_eq_map,
+        eff_lengths,
+        ref_lengths: ref_lengths.to_vec(),
+        ref_names: prelude.hdr.ref_names.clone(),
+        frag_lengths,
+        frag_stats,
+        ref_sig_json,
+        lib_type,
+    })
+}
+
+pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
+    quant_opts: QuantOpts,
+    eqc_map: EqMap<EqLabelT>,
+) -> anyhow::Result<()> {
+    let output = quant_opts.output.clone();
+    let max_iter = quant_opts.max_iter;
+    let convergence_thresh = quant_opts.convergence_thresh;
+    let presence_thresh = quant_opts.presence_thresh;
+    let num_bootstraps = quant_opts.num_bootstraps;
+    let num_gibbs_samples = quant_opts.num_gibbs_samples;
+    let gibbs_thinning_factor = quant_opts.gibbs_thinning_factor;
+    let num_threads = quant_opts.num_threads;
+
+    // if there is a parent directory
+    if let Some(p) = output.parent()
+        && p != Path::new("")
+    {
+        create_dir_all(p)?;
+    }
+
+    // Build EQ map from RAD (Phase A work)
+    let rad_opts = RadProcessingOpts {
+        input: quant_opts.input.clone(),
+        lib_type: quant_opts.lib_type.clone(),
+        param_est_frags: quant_opts.param_est_frags,
+        fld_mean: quant_opts.fld_mean,
+        fld_sd: quant_opts.fld_sd,
+        auto_detect_samples: quant_opts.auto_detect_samples,
+    };
+    let bundle = build_eq_map_from_rad(&rad_opts, eqc_map)?;
+    let frag_lengths = bundle.frag_lengths;
+
     let eminfo = EMInfo {
-        eq_map: &packed_eq_map,
-        eff_lens: &eff_lengths,
+        eq_map: &bundle.packed_eq_map,
+        eff_lens: &bundle.eff_lengths,
         max_iter,
         convergence_thresh,
         presence_thresh,
@@ -494,29 +527,12 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let quant_output = output.with_additional_extension(".quant");
     io::write_results(
         &quant_output,
-        &prelude.hdr,
+        &bundle.ref_names,
         &em_res,
-        ref_lengths,
-        &eff_lengths,
-    )?;
-
-    info!(
-        "num mapped reads = {}",
-        frag_stats.num_mapped_reads.to_formatted_string(&Locale::en)
-    );
-    info!(
-        "total mappings = {}",
-        frag_stats.tot_mappings.to_formatted_string(&Locale::en)
-    );
-    info!(
-        "number of equivalence classes = {}",
-        packed_eq_map.len().to_formatted_string(&Locale::en)
-    );
-    let total_weight: usize = packed_eq_map.total_weight();
-    info!(
-        "total equivalence map weight = {}",
-        total_weight.to_formatted_string(&Locale::en)
-    );
+        &bundle.ref_lengths,
+        &bundle.eff_lengths,
+    )
+    .context("failed to write quant output")?;
 
     {
         let fld_array = UInt32Array::from_vec(frag_lengths);
@@ -584,13 +600,13 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let ofile = File::create(meta_info_output)?;
     let meta_info = json!({
         "quant_opts": quant_opts,
-        "inferred_lib_type": lib_type.to_string(),
-        "mapped_frag_stats": frag_stats,
+        "inferred_lib_type": bundle.lib_type.to_string(),
+        "mapped_frag_stats": bundle.frag_stats,
         "num_bootstraps": num_bootstraps,
         "num_gibbs_samples": num_gibbs_samples,
         "infrep_method": infrep_method,
-        "num_targets": eff_lengths.len(),
-        "signatures": ref_sig_json
+        "num_targets": bundle.eff_lengths.len(),
+        "signatures": bundle.ref_sig_json
     });
     serde_json::to_writer_pretty(ofile, &meta_info)?;
     Ok(())

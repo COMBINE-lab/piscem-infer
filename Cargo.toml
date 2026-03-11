@@ -58,6 +58,10 @@ atomic_float = "1.1.0"
 num-format = "0.4.4"
 clap-num = "1.2.0"
 indicatif = "0.17"
+argmin = "0.11.0"
+argmin-math = { version = "0.5.1", features = ["vec"] }
+csv = "1.4.0"
+saphyr = "0.0.6"
 
 [[bin]]
 name = "piscem-infer"
@@ -97,3 +101,6 @@ install-updater = true
 
 [workspace.metadata.dist.github-custom-runners]
 aarch64-apple-darwin = "macos-14"
+
+[dev-dependencies]
+tempfile = "3.27.0"

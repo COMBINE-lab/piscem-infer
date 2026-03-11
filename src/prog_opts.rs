@@ -113,11 +113,86 @@ pub struct QuantOpts {
     pub auto_detect_samples: usize,
 }
 
+#[derive(Args, Serialize, Clone, Debug)]
+pub struct MultiQuantOpts {
+    // --- Input / Output ---
+    /// path to a manifest file listing samples (CSV, JSON, or YAML).
+    /// Format detected by extension (.csv, .json, .yaml/.yml).
+    /// CSV columns: sample_name, condition, rad_path, output_dir
+    #[arg(short, long, help_heading = "Input / Output")]
+    pub manifest: PathBuf,
+    /// the expected library type (or 'auto' for automatic detection)
+    #[arg(short, long, value_parser = clap::value_parser!(LibTypeArg), help_heading = "Input / Output")]
+    pub lib_type: LibTypeArg,
+    /// global output directory for joint results and intermediate files
+    #[arg(short, long, help_heading = "Input / Output")]
+    pub output: PathBuf,
+
+    // --- EM Algorithm ---
+    /// max iterations for initial EM warm-start per sample
+    #[arg(long, default_value_t = 20, help_heading = "EM Algorithm")]
+    pub em_warmstart_iters: u32,
+    /// convergence threshold for EM warm-start
+    #[arg(long, default_value_t = RELDIFF_THRESH, help_heading = "EM Algorithm")]
+    pub convergence_thresh: f64,
+    /// presence threshold for EM
+    #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
+    pub presence_thresh: f64,
+
+    // --- L-BFGS ---
+    /// max L-BFGS iterations per sample
+    #[arg(long, default_value_t = 200, help_heading = "L-BFGS")]
+    pub lbfgs_max_iters: u64,
+    /// L-BFGS history size (m parameter)
+    #[arg(long, default_value_t = 7, help_heading = "L-BFGS")]
+    pub lbfgs_history: usize,
+
+    // --- Hierarchical ---
+    /// number of outer hierarchical EM iterations
+    #[arg(long, default_value_t = 7, help_heading = "Hierarchical")]
+    pub num_outer_iters: u32,
+
+    // --- Fragment Length Distribution ---
+    /// number of (unique) mappings to use for fragment length distribution estimation
+    #[arg(long, default_value_t = 500_000_isize, help_heading = "Fragment Length Distribution")]
+    pub param_est_frags: isize,
+    /// mean of fragment length distribution
+    /// (required, and used, only for unpaired fragments)
+    #[arg(long, requires = "fld_sd", help_heading = "Fragment Length Distribution")]
+    pub fld_mean: Option<f64>,
+    /// standard deviation of fragment length distribution
+    /// (required, and used, only for unpaired fragments)
+    #[arg(long, requires = "fld_mean", help_heading = "Fragment Length Distribution")]
+    pub fld_sd: Option<f64>,
+
+    // --- Advanced ---
+    /// number of probability bins for RangeFactorized equivalence classes (1 = basic)
+    #[arg(long, default_value_t = 64_u32, value_parser = greater_than_0, help_heading = "Advanced")]
+    pub factorized_eqc_bins: u32,
+    /// number of threads to use
+    #[arg(long, default_value_t = 16, help_heading = "Advanced")]
+    pub num_threads: usize,
+    /// number of mapped reads to sample for automatic library type detection
+    #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]
+    pub auto_detect_samples: usize,
+
+    // --- Workflow ---
+    /// only run Phase A (per-sample EQ class building + serialization)
+    #[arg(long, conflicts_with = "phase_b_only", help_heading = "Workflow")]
+    pub phase_a_only: bool,
+    /// only run Phase B (joint hierarchical inference from serialized EQ classes)
+    #[arg(long, conflicts_with = "phase_a_only", help_heading = "Workflow")]
+    pub phase_b_only: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// quantify from the rad file
+    /// quantify from the rad file (single sample)
     #[command(arg_required_else_help = true)]
     Quant(QuantOpts),
+    /// hierarchical multi-sample quantification
+    #[command(arg_required_else_help = true)]
+    MultiQuant(MultiQuantOpts),
 }
 
 /// quantify target abundance from bulk-sequencing data

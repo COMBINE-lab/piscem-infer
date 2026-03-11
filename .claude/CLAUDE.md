@@ -24,13 +24,18 @@ The binary is named `piscem-infer`. Rust edition 2024 is required.
 
 **Key modules in `src/`:**
 
-- `main.rs` — Entry point, dispatches to the `quant` subcommand
-- `prog_opts.rs` — CLI argument definitions using clap derive (`Cli`, `Commands::Quant`, `QuantOpts`)
-- `process_rad.rs` — Core quantification workflow: RAD parsing, FLD estimation, EM coordination via `process_bulk()` / `process_bulk_dispatch()`
+- `main.rs` — Entry point, dispatches to `quant` and `multi-quant` subcommands
+- `prog_opts.rs` — CLI argument definitions using clap derive (`Cli`, `Commands::Quant`, `Commands::MultiQuant`, `QuantOpts`, `MultiQuantOpts`)
+- `process_rad.rs` — Core quantification workflow: `build_eq_map_from_rad()` (shared EQ map building), `process_bulk()` / `process_bulk_dispatch()` (single-sample EM + output)
+- `multi_sample.rs` — Multi-sample hierarchical quantification: manifest parsing (CSV/JSON/YAML), Phase A (per-sample EQ map building + serialization), Phase B (joint hierarchical inference)
 - `fld.rs` — Fragment length distribution models (empirical and parametric), `FldPDF` trait
 - `utils/em.rs` — EM algorithm implementation with Rayon parallelization, bootstrap replicates, conditional means
 - `utils/gibbs.rs` — Gibbs sampler (`do_gibbs`/`gibbs_iteration`): Gamma step + multinomial reassignment over equivalence classes
 - `utils/eq_maps.rs` — Equivalence class representations: `EqLabel` trait with `BasicEqMap` and `RangeFactorizedEqMap` (probability binning) implementations
+- `utils/gradient.rs` — Softmax, gradient of penalized log-likelihood, diagonal Fisher information, Laplace posterior variance
+- `utils/lbfgs.rs` — L-BFGS wrapper (argmin crate) for penalized MAP estimation; `penalized_em()` runs EM warm-start → L-BFGS → Fisher/Laplace
+- `utils/eq_serialize.rs` — EQ class serialization to/from Parquet + JSON metadata; `serialize_eq_map()`, `deserialize_eq_map()`
+- `utils/hierarchical.rs` — Hierarchical empirical Bayes M-step: precision-weighted condition means, method-of-moments biological variance
 - `utils/io.rs` — Output writing (TSV results, Parquet FLD/bootstrap files via arrow2)
 - `utils/map_record_types.rs` — Library type enums (SF, ISF, SR, ISR, U, IU) and compatibility checking; contains unit tests
 

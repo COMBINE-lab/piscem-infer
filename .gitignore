@@ -1,4 +1,5 @@
 /untracked_data
 /target
 /sim_data
+/sim_data_gencode
 .claude/settings.local.json

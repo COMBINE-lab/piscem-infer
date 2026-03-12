@@ -327,6 +327,198 @@ pub fn em_par<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>, nthreads: usize) ->
         .collect::<Vec<f64>>()
 }
 
+/// Run EM with pseudo-count regularization from a hierarchical prior.
+///
+/// After each M-step, adds `alpha[t]` pseudo-counts to `curr_counts[t]`.
+/// This causes the prior to influence read assignments in the next E-step,
+/// unlike post-hoc L-BFGS which can only reweight the point estimate.
+///
+/// Returns the final estimated counts (not normalized).
+pub fn em_penalized<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    alpha: &[f64],
+) -> Vec<f64> {
+    let converge_thresh = em_info.convergence_thresh;
+    let presence_thresh = em_info.presence_thresh;
+    let eq_map = em_info.eq_map;
+    let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = eff_lens
+        .iter()
+        .map(|x| {
+            let y = 1.0_f64 / *x;
+            if y.is_finite() { y } else { 0_f64 }
+        })
+        .collect::<Vec<f64>>();
+    let max_iter = em_info.max_iter;
+    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+
+    // init
+    let avg = total_weight / (eff_lens.len() as f64);
+    let mut prev_counts = vec![avg; eff_lens.len()];
+    let mut curr_counts = vec![0.0f64; eff_lens.len()];
+
+    let mut rel_diff = 0.0_f64;
+    let mut niter = 0_u32;
+
+    while niter < max_iter {
+        m_step(
+            eq_map,
+            &eq_map.counts,
+            &prev_counts,
+            &inv_eff_lens,
+            &mut curr_counts,
+        );
+
+        // Add pseudo-counts from hierarchical prior
+        for (c, &a) in curr_counts.iter_mut().zip(alpha.iter()) {
+            *c += a;
+        }
+
+        for i in 0..curr_counts.len() {
+            if prev_counts[i] > presence_thresh {
+                let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
+                rel_diff = if rel_diff > rd { rel_diff } else { rd };
+            }
+        }
+
+        std::mem::swap(&mut prev_counts, &mut curr_counts);
+        curr_counts.fill(0.0_f64);
+
+        if rel_diff < converge_thresh {
+            break;
+        }
+        niter += 1;
+        if niter.is_multiple_of(100) {
+            info!("iteration {}; rel diff {:.3}", niter, rel_diff);
+        }
+        rel_diff = 0.0_f64;
+    }
+
+    prev_counts.iter_mut().for_each(|x| {
+        if *x < presence_thresh {
+            *x = 0.0
+        }
+    });
+    m_step(
+        eq_map,
+        &eq_map.counts,
+        &prev_counts,
+        &inv_eff_lens,
+        &mut curr_counts,
+    );
+
+    // Add pseudo-counts to the final step too
+    for (c, &a) in curr_counts.iter_mut().zip(alpha.iter()) {
+        *c += a;
+    }
+
+    curr_counts
+}
+
+/// Parallel version of penalized EM with pseudo-count regularization.
+pub fn em_penalized_par<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    alpha: &[f64],
+    nthreads: usize,
+) -> Vec<f64> {
+    let converge_thresh = em_info.convergence_thresh;
+    let presence_thresh = em_info.presence_thresh;
+    let eq_map = em_info.eq_map;
+    let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = eff_lens
+        .iter()
+        .map(|x| {
+            let y = 1.0_f64 / *x;
+            if y.is_finite() { y } else { 0_f64 }
+        })
+        .collect::<Vec<f64>>();
+    let max_iter = em_info.max_iter;
+    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+
+    // init
+    let avg = total_weight / (eff_lens.len() as f64);
+    let mut prev_counts: Vec<AtomicF64> = vec![avg; eff_lens.len()]
+        .iter()
+        .map(|x| AtomicF64::new(*x))
+        .collect();
+    let mut curr_counts: Vec<AtomicF64> = vec![0.0f64; eff_lens.len()]
+        .iter()
+        .map(|x| AtomicF64::new(*x))
+        .collect();
+
+    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
+        eq_map.iter_labels().zip(&eq_map.counts).collect();
+
+    let mut rel_diff = 0.0_f64;
+    let mut niter = 0_u32;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(nthreads)
+        .build()
+        .unwrap();
+
+    pool.install(|| {
+        while niter < max_iter {
+            m_step_par::<EqLabelT>(
+                &eq_iterates,
+                &mut prev_counts,
+                &inv_eff_lens,
+                &mut curr_counts,
+            );
+
+            // Add pseudo-counts from hierarchical prior
+            for (c, &a) in curr_counts.iter().zip(alpha.iter()) {
+                c.fetch_add(a, Ordering::AcqRel);
+            }
+
+            for i in 0..curr_counts.len() {
+                let pci = prev_counts[i].load(Ordering::Relaxed);
+                if pci > presence_thresh {
+                    let cci = curr_counts[i].load(Ordering::Relaxed);
+                    let rd = (cci - pci) / pci;
+                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
+                }
+            }
+
+            std::mem::swap(&mut prev_counts, &mut curr_counts);
+            curr_counts
+                .par_iter()
+                .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
+
+            if rel_diff < converge_thresh {
+                break;
+            }
+            niter += 1;
+            if niter.is_multiple_of(100) {
+                info!("iteration {}; rel diff {:.3}", niter, rel_diff);
+            }
+            rel_diff = 0.0_f64;
+        }
+
+        prev_counts.iter_mut().for_each(|x| {
+            if x.load(Ordering::Relaxed) < presence_thresh {
+                x.store(0.0, Ordering::Relaxed);
+            }
+        });
+        m_step_par::<EqLabelT>(
+            &eq_iterates,
+            &mut prev_counts,
+            &inv_eff_lens,
+            &mut curr_counts,
+        );
+
+        // Add pseudo-counts to the final step too
+        for (c, &a) in curr_counts.iter().zip(alpha.iter()) {
+            c.fetch_add(a, Ordering::AcqRel);
+        }
+    });
+
+    curr_counts
+        .iter()
+        .map(|x| x.load(Ordering::Relaxed))
+        .collect::<Vec<f64>>()
+}
+
 pub fn em<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;

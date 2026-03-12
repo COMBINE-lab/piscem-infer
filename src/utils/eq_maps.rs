@@ -392,6 +392,13 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
         }
     }
 
+    /// Returns the number of distinct targets in equivalence class `idx`.
+    /// Works for both `BasicEqLabel` (label = targets) and
+    /// `RangeFactorizedEqLabel` (label = targets + bins).
+    pub fn num_targets_in_eqc(&self, idx: usize) -> usize {
+        self.refs_for_eqc(idx).target_labels().len()
+    }
+
     pub fn total_weight(&self) -> usize {
         self.counts.iter().sum()
     }

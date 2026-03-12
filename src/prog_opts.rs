@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::utils::map_record_types::LibraryType;
+use crate::utils::txp_selection::SelectionStages;
 
 const PRESENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 1e-3;
@@ -15,6 +16,10 @@ const MAX_EM_ITER: u32 = 1500;
 
 fn greater_than_0(s: &str) -> std::result::Result<u32, String> {
     number_range(s, 1, u32::MAX)
+}
+
+fn parse_selection_stages(s: &str) -> std::result::Result<SelectionStages, String> {
+    SelectionStages::from_str_list(s)
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +116,14 @@ pub struct QuantOpts {
     /// (only used when --lib-type is set to 'auto')
     #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]
     pub auto_detect_samples: usize,
+    /// enable transcript variable selection (removes structurally redundant
+    /// transcripts before EM using EC graph analysis)
+    #[arg(long, help_heading = "Advanced")]
+    pub txp_selection: bool,
+    /// which selection stages to run (comma-separated: collapse,peeling,dominance).
+    /// Only used when --txp-selection is enabled. Default: all stages.
+    #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
+    pub selection_stages: Option<SelectionStages>,
 }
 
 #[derive(Args, Serialize, Clone, Debug)]
@@ -129,9 +142,9 @@ pub struct MultiQuantOpts {
     pub output: PathBuf,
 
     // --- EM Algorithm ---
-    /// max iterations for initial EM warm-start per sample
-    #[arg(long, default_value_t = 20, help_heading = "EM Algorithm")]
-    pub em_warmstart_iters: u32,
+    /// max EM iterations per sample (determines presence mask and L-BFGS init)
+    #[arg(long, default_value_t = MAX_EM_ITER, help_heading = "EM Algorithm")]
+    pub max_em_iter: u32,
     /// convergence threshold for EM warm-start
     #[arg(long, default_value_t = RELDIFF_THRESH, help_heading = "EM Algorithm")]
     pub convergence_thresh: f64,
@@ -139,18 +152,24 @@ pub struct MultiQuantOpts {
     #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
 
-    // --- L-BFGS ---
-    /// max L-BFGS iterations per sample
-    #[arg(long, default_value_t = 200, help_heading = "L-BFGS")]
-    pub lbfgs_max_iters: u64,
-    /// L-BFGS history size (m parameter)
-    #[arg(long, default_value_t = 7, help_heading = "L-BFGS")]
-    pub lbfgs_history: usize,
-
     // --- Hierarchical ---
     /// number of outer hierarchical EM iterations
     #[arg(long, default_value_t = 7, help_heading = "Hierarchical")]
     pub num_outer_iters: u32,
+    /// prior weight (κ): fraction of total sample reads added as pseudo-counts
+    /// from the hierarchical prior. E.g. 0.1 = 10% of reads as pseudo-counts.
+    /// Higher values give the prior more influence.
+    #[arg(long, default_value_t = 0.25, help_heading = "Hierarchical")]
+    pub prior_weight: f64,
+    /// minimum fraction of replicates (within any condition) in which a transcript
+    /// must be present to enter the consensus support set. Transcripts below this
+    /// threshold are zeroed out. E.g. 1.0 = all replicates, 0.67 = 2/3 majority.
+    #[arg(long, default_value_t = 0.67, help_heading = "Hierarchical")]
+    pub consensus_thresh: f64,
+    /// use spike-and-slab prior instead of hard consensus filtering.
+    /// Computes soft inclusion probabilities per transcript, updated each iteration.
+    #[arg(long, help_heading = "Hierarchical")]
+    pub spike_slab: bool,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation
@@ -175,6 +194,14 @@ pub struct MultiQuantOpts {
     /// number of mapped reads to sample for automatic library type detection
     #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]
     pub auto_detect_samples: usize,
+    /// enable transcript variable selection (removes structurally redundant
+    /// transcripts before EM using EC graph analysis)
+    #[arg(long, help_heading = "Advanced")]
+    pub txp_selection: bool,
+    /// which selection stages to run (comma-separated: collapse,peeling,dominance).
+    /// Only used when --txp-selection is enabled. Default: all stages.
+    #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
+    pub selection_stages: Option<SelectionStages>,
 
     // --- Workflow ---
     /// only run Phase A (per-sample EQ class building + serialization)

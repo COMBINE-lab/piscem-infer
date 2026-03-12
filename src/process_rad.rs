@@ -510,6 +510,23 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let bundle = build_eq_map_from_rad(&rad_opts, eqc_map)?;
     let frag_lengths = bundle.frag_lengths;
 
+    // Optional transcript variable selection
+    let selection_mask = if quant_opts.txp_selection {
+        info!("Running transcript variable selection...");
+        let stages = quant_opts
+            .selection_stages
+            .clone()
+            .unwrap_or_default();
+        let result = crate::utils::txp_selection::run_selection_with_stages(
+            &bundle.packed_eq_map,
+            bundle.ref_names.len(),
+            &stages,
+        );
+        Some(result.keep_mask)
+    } else {
+        None
+    };
+
     let eminfo = EMInfo {
         eq_map: &bundle.packed_eq_map,
         eff_lens: &bundle.eff_lengths,
@@ -522,6 +539,17 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         em_par(&eminfo, num_threads)
     } else {
         em(&eminfo)
+    };
+
+    // Apply selection mask: zero out structurally redundant transcripts
+    let em_res = if let Some(ref mask) = selection_mask {
+        em_res
+            .iter()
+            .enumerate()
+            .map(|(t, &c)| if mask[t] { c } else { 0.0 })
+            .collect()
+    } else {
+        em_res
     };
 
     let quant_output = output.with_additional_extension(".quant");

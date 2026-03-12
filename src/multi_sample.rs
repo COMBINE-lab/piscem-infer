@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::process_rad::{RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::MultiQuantOpts;
-use crate::utils::em::EMInfo;
+use crate::utils::em::{self, EMInfo};
 use crate::utils::eq_maps::{
     BasicEqLabel, BasicEqMap, EqMapType, OrientationProperty, PackedEqMap,
     RangeFactorizedEqMap,
@@ -18,10 +18,8 @@ use crate::utils::eq_maps::{
 use crate::utils::eq_serialize::{
     EqMapTypeTag, SampleMeta, deserialize_eq_map, serialize_eq_map,
 };
-use crate::utils::gradient;
-use crate::utils::hierarchical::{self, SamplePosterior as HierSamplePosterior};
+use crate::utils::hierarchical;
 use crate::utils::io;
-use crate::utils::lbfgs::{PenalizedPrior, penalized_em};
 
 /// A single entry from the sample manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +140,16 @@ fn condition_index(condition: &str, condition_names: &[String]) -> usize {
 
 /// Main entry point for the multi-sample quantification workflow.
 pub fn run(opts: &MultiQuantOpts) -> Result<()> {
+    // Initialize rayon thread pool for parallel EM
+    if opts.num_threads > 1 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(opts.num_threads)
+            .build_global()
+            .unwrap_or_else(|_| {
+                info!("Rayon global thread pool already initialized, using existing pool");
+            });
+    }
+
     let samples = parse_manifest(&opts.manifest)?;
     let conditions = condition_names(&samples);
     info!(
@@ -285,115 +293,335 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
             .collect();
 
-        // Initialize hierarchical hyperparameters with vague prior
-        let mut hyperparams = hierarchical::init_hyperparams(num_targets, conditions.clone());
+        // Optional transcript variable selection on merged EC graph.
+        let selection_mask: Option<Vec<bool>> = if opts.txp_selection {
+            info!("Running multi-sample transcript variable selection...");
+            use crate::utils::txp_selection;
+            let stages = opts
+                .selection_stages
+                .clone()
+                .unwrap_or_default();
+            let indices: Vec<_> = packed_maps
+                .iter()
+                .map(|m| txp_selection::TranscriptEqIndex::from_packed_eq_map(m, num_targets))
+                .collect();
+            let eqc_counts: Vec<usize> = packed_maps.iter().map(|m| m.len()).collect();
+            let total_eqcs: usize = eqc_counts.iter().sum();
+            let merged_index =
+                txp_selection::merge_transcript_indices(&indices, &eqc_counts, num_targets);
+            let result = txp_selection::run_selection_from_index_with_stages(
+                &merged_index,
+                num_targets,
+                total_eqcs,
+                &stages,
+            );
+            Some(result.keep_mask)
+        } else {
+            None
+        };
 
+        // Initialize Dirichlet-Multinomial hyperparameters.
+        // α₀ = prior_weight × average total reads across samples.
+        let avg_total_reads: f64 = packed_maps.iter()
+            .map(|m| m.total_weight() as f64)
+            .sum::<f64>()
+            / packed_maps.len() as f64;
+        let alpha_0 = opts.prior_weight * avg_total_reads;
+        let mut hyperparams =
+            hierarchical::init_hyperparams(num_targets, conditions.clone(), alpha_0);
+
+        let mode_label = if opts.spike_slab { "spike-and-slab" } else { "Dirichlet-Multinomial" };
         info!(
-            "Starting hierarchical outer loop ({} iterations)",
-            opts.num_outer_iters
+            "Starting hierarchical outer loop ({} iterations, α₀={:.1}, mode={})",
+            opts.num_outer_iters, alpha_0, mode_label
         );
 
         // Track convergence metrics per iteration
         let mut convergence_history: Vec<serde_json::Value> = Vec::new();
-        let mut final_posteriors: Vec<HierSamplePosterior> = Vec::new();
         let mut converged_at: Option<u32> = None;
 
-        // Total iterations = 1 (initialization with flat prior) + num_outer_iters
+        // Per-sample cached counts from previous iteration
+        let mut prev_counts: Vec<Vec<f64>> = Vec::new();
+
+        // Per-sample presence masks (used in Dirichlet mode only).
+        let mut presence_masks: Vec<Vec<bool>> = Vec::new();
+
+        // Spike-and-slab inclusion probabilities (used in spike-slab mode only).
+        let mut gamma: Vec<f64> = vec![1.0; num_targets];
+
+        // Pre-compute condition indices for all samples
+        let sample_cond_indices: Vec<usize> = samples
+            .iter()
+            .map(|s| condition_index(&s.condition, &conditions))
+            .collect();
+
+        // Total iterations = 1 (initialization with standard EM) + num_outer_iters
         let total_iters = 1 + opts.num_outer_iters;
 
         for outer_iter in 0..total_iters {
-            // Iteration 0 uses a flat prior to get unbiased initial estimates;
-            // subsequent iterations use the learned hyperparameters.
             let is_init_iter = outer_iter == 0;
             if is_init_iter {
-                info!("--- Initialization iteration (flat prior) ---");
+                info!("--- Initialization iteration (standard EM, no prior) ---");
             } else {
-                info!("--- Outer iteration {}/{} ---", outer_iter, opts.num_outer_iters);
+                info!(
+                    "--- Outer iteration {}/{} (penalized EM) ---",
+                    outer_iter, opts.num_outer_iters
+                );
             }
 
             // Snapshot current hyperparams for convergence check
-            let old_nu = hyperparams.nu.clone();
-            let old_sigma_sq = hyperparams.sigma_sq.clone();
+            let old_pi = hyperparams.pi.clone();
 
-            // Inner loop: per-sample penalized MAP estimation
-            let mut posteriors: Vec<HierSamplePosterior> = Vec::with_capacity(samples.len());
+            // Inner loop: per-sample EM (standard or penalized)
+            let mut results: Vec<hierarchical::SampleResult> = Vec::with_capacity(samples.len());
+            let mut new_counts: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
 
             for (i, sample) in samples.iter().enumerate() {
                 info!("  Sample '{}'", sample.sample_name);
 
-                let prior = if is_init_iter {
-                    // Flat prior: let EM+L-BFGS find the MLE without shrinkage
-                    PenalizedPrior {
-                        nu: vec![0.0; num_targets],
-                        sigma_sq: vec![1e30; num_targets],
-                    }
-                } else {
-                    PenalizedPrior {
-                        nu: hyperparams.nu[condition_index(&sample.condition, &conditions)].clone(),
-                        sigma_sq: hyperparams.sigma_sq.clone(),
-                    }
-                };
-
                 let em_info = EMInfo {
                     eq_map: &packed_maps[i],
                     eff_lens: &all_meta[i].eff_lengths,
-                    max_iter: opts.em_warmstart_iters,
+                    max_iter: opts.max_em_iter,
                     convergence_thresh: opts.convergence_thresh,
                     presence_thresh: opts.presence_thresh,
                 };
 
-                let lbfgs_result = penalized_em(
-                    &em_info,
-                    &prior,
-                    opts.em_warmstart_iters,
-                    opts.lbfgs_max_iters,
-                    opts.lbfgs_history,
-                    opts.num_threads,
-                )?;
+                let counts = if is_init_iter {
+                    // Standard EM to establish presence mask and data-driven estimates
+                    let c = if opts.num_threads > 1 {
+                        em::em_par(&em_info, opts.num_threads)
+                    } else {
+                        em::em(&em_info)
+                    };
+                    let mask: Vec<bool> = c.iter().map(|&v| v > opts.presence_thresh).collect();
+                    let n_present = mask.iter().filter(|&&b| b).count();
+                    info!("    {} / {} transcripts present", n_present, num_targets);
+                    presence_masks.push(mask);
+                    c
+                } else {
+                    // Penalized EM with pseudo-counts from hierarchical prior
+                    let cond_idx = sample_cond_indices[i];
+                    let alpha = if opts.spike_slab {
+                        hierarchical::compute_pseudo_counts_spike_slab(
+                            &hyperparams,
+                            cond_idx,
+                            &gamma,
+                        )
+                    } else {
+                        hierarchical::compute_pseudo_counts(
+                            &hyperparams,
+                            cond_idx,
+                            &presence_masks[i],
+                        )
+                    };
 
-                posteriors.push(HierSamplePosterior {
-                    phi_hat: lbfgs_result.phi_hat,
-                    sigma_hat_sq: lbfgs_result.sigma_hat_sq,
+                    if opts.num_threads > 1 {
+                        em::em_penalized_par(&em_info, &alpha, opts.num_threads)
+                    } else {
+                        em::em_penalized(&em_info, &alpha)
+                    }
+                };
+
+                let present: Vec<bool> = counts
+                    .iter()
+                    .map(|&c| c > opts.presence_thresh)
+                    .collect();
+
+                results.push(hierarchical::SampleResult {
+                    counts: counts.clone(),
+                    present,
                     sample_name: sample.sample_name.clone(),
-                    condition_idx: condition_index(&sample.condition, &conditions),
+                    condition_idx: sample_cond_indices[i],
                 });
+
+                new_counts.push(counts);
             }
 
-            // M-step: update hyperparameters
-            hierarchical::update_condition_means(&posteriors, &mut hyperparams);
-            hierarchical::update_biological_variance(&posteriors, &mut hyperparams);
+            // M-step: update condition-level mean proportions
+            hierarchical::update_condition_means(&results, &mut hyperparams);
 
             // Check convergence
-            let (nu_change, sigma_change) =
-                hierarchical::convergence_metrics(&old_nu, &old_sigma_sq, &hyperparams);
-            info!(
-                "  Convergence: max_nu_change={:.6e}, max_sigma_sq_change={:.6e}",
-                nu_change, sigma_change
-            );
+            let pi_change = hierarchical::convergence_metric(&old_pi, &hyperparams);
+            info!("  Convergence: max_pi_change={:.6e}", pi_change);
 
             convergence_history.push(json!({
                 "iteration": if is_init_iter { "init".to_string() } else { outer_iter.to_string() },
-                "max_nu_change": nu_change,
-                "max_sigma_sq_change": sigma_change,
+                "max_pi_change": pi_change,
             }));
 
-            final_posteriors = posteriors;
+            prev_counts = new_counts;
+
+            if opts.spike_slab && is_init_iter {
+                // Empirical Bayes spike-and-slab: compute γ ONCE from init iteration
+                // counts. Using penalized counts in later iterations creates a positive
+                // feedback loop where pseudo-counts inflate presence → γ grows → repeat.
+                let pi_0 = hierarchical::estimate_inclusion_rate(
+                    &prev_counts,
+                    num_targets,
+                    opts.presence_thresh,
+                );
+                let n_expressed = (pi_0 * num_targets as f64).round() as usize;
+                info!(
+                    "  Estimated inclusion rate π₀ = {:.4} ({} / {} expressed in ≥1 sample)",
+                    pi_0, n_expressed, num_targets
+                );
+
+                gamma = hierarchical::compute_inclusion_probabilities(
+                    &prev_counts,
+                    &sample_cond_indices,
+                    conditions.len(),
+                    num_targets,
+                    opts.presence_thresh,
+                    pi_0,
+                );
+
+                // Unique EQ class rule: transcripts with strong unique evidence
+                // get γ = 1.0 regardless of replicate consistency.
+                const UNIQUE_EQ_MIN_COUNT: usize = 10;
+                let mut unique_eq_counts = vec![0usize; num_targets];
+                for packed_map in packed_maps.iter() {
+                    for eqc_idx in 0..packed_map.len() {
+                        if packed_map.counts[eqc_idx] > 0
+                            && packed_map.num_targets_in_eqc(eqc_idx) == 1
+                        {
+                            let s = packed_map.eq_label_starts[eqc_idx] as usize;
+                            let target_id = packed_map.eq_labels[s] as usize;
+                            unique_eq_counts[target_id] += packed_map.counts[eqc_idx];
+                        }
+                    }
+                }
+                let mut n_unique_added = 0usize;
+                for (t, &count) in unique_eq_counts.iter().enumerate() {
+                    if count >= UNIQUE_EQ_MIN_COUNT && gamma[t] < 0.5 {
+                        gamma[t] = 1.0;
+                        n_unique_added += 1;
+                    }
+                }
+                if n_unique_added > 0 {
+                    info!(
+                        "  Added {} transcripts via unique EQ class rule (γ set to 1.0)",
+                        n_unique_added
+                    );
+                }
+
+                let n_included = gamma.iter().filter(|&&g| g >= 0.5).count();
+                let n_excluded = gamma.iter().filter(|&&g| g < 0.5).count();
+                info!(
+                    "  Spike-and-slab support: {} included (γ≥0.5), {} excluded",
+                    n_included, n_excluded
+                );
+            } else if !opts.spike_slab && is_init_iter {
+                // Dirichlet mode: hard consensus filtering after init iteration
+                info!("--- Consensus support filtering ---");
+
+                let num_conditions = conditions.len();
+                let mut cond_counts: Vec<Vec<u32>> =
+                    vec![vec![0u32; num_targets]; num_conditions];
+                let mut cond_n_reps: Vec<u32> = vec![0u32; num_conditions];
+
+                for (i, _sample) in samples.iter().enumerate() {
+                    let cond_idx = sample_cond_indices[i];
+                    cond_n_reps[cond_idx] += 1;
+                    for t in 0..num_targets {
+                        if presence_masks[i][t] {
+                            cond_counts[cond_idx][t] += 1;
+                        }
+                    }
+                }
+
+                let mut consensus_support = vec![false; num_targets];
+                for c in 0..num_conditions {
+                    let threshold = (opts.consensus_thresh * cond_n_reps[c] as f64).ceil() as u32;
+                    let threshold = threshold.max(1);
+                    for t in 0..num_targets {
+                        if cond_counts[c][t] >= threshold {
+                            consensus_support[t] = true;
+                        }
+                    }
+                }
+
+                // Unique EQ class rule
+                const UNIQUE_EQ_MIN_COUNT: usize = 10;
+                let n_before_unique = consensus_support.iter().filter(|&&b| b).count();
+                let mut unique_eq_counts = vec![0usize; num_targets];
+                for packed_map in packed_maps.iter() {
+                    for eqc_idx in 0..packed_map.len() {
+                        if packed_map.counts[eqc_idx] > 0
+                            && packed_map.num_targets_in_eqc(eqc_idx) == 1
+                        {
+                            let s = packed_map.eq_label_starts[eqc_idx] as usize;
+                            let target_id = packed_map.eq_labels[s] as usize;
+                            unique_eq_counts[target_id] += packed_map.counts[eqc_idx];
+                        }
+                    }
+                }
+                for (t, &count) in unique_eq_counts.iter().enumerate() {
+                    if count >= UNIQUE_EQ_MIN_COUNT {
+                        consensus_support[t] = true;
+                    }
+                }
+                let n_unique_added = consensus_support.iter().filter(|&&b| b).count()
+                    - n_before_unique;
+                if n_unique_added > 0 {
+                    info!(
+                        "  Added {} transcripts via unique EQ class rule",
+                        n_unique_added
+                    );
+                }
+
+                let n_consensus = consensus_support.iter().filter(|&&b| b).count();
+                let n_before: usize = presence_masks
+                    .iter()
+                    .map(|m| m.iter().filter(|&&b| b).count())
+                    .sum::<usize>()
+                    / samples.len();
+                let n_removed = n_before.saturating_sub(n_consensus);
+                info!(
+                    "  Consensus support: {} transcripts (was ~{}/sample, removed ~{})",
+                    n_consensus, n_before, n_removed
+                );
+
+                for mask in presence_masks.iter_mut() {
+                    *mask = consensus_support.clone();
+                }
+            }
 
             // Don't check convergence on the init iteration
-            if !is_init_iter && nu_change < 1e-5 && sigma_change < 1e-5 {
+            if !is_init_iter && pi_change < 1e-7 {
                 converged_at = Some(outer_iter);
                 info!("Hierarchical loop converged at iteration {}", outer_iter);
                 break;
             }
         }
 
-        // Write per-sample output using cached final posteriors
+        // Write per-sample output using cached final counts.
         info!("Writing per-sample quantification results...");
         for (i, sample) in samples.iter().enumerate() {
-            let posterior = &final_posteriors[i];
-            let theta = gradient::softmax(&posterior.phi_hat);
-            let total_weight = packed_maps[i].total_weight() as f64;
-            let e_counts: Vec<f64> = theta.iter().map(|&t| t * total_weight).collect();
+            // Apply support filtering: hard mask (Dirichlet) or soft γ (spike-and-slab),
+            // composed with structural variable selection if enabled.
+            let e_counts: Vec<f64> = if opts.spike_slab {
+                // MAP decision: include transcript if γ ≥ 0.5 (posterior
+                // probability of expression exceeds 0.5). This is the
+                // Bayes-optimal binary decision under 0-1 loss.
+                prev_counts[i]
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &c)| {
+                        let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
+                        if gamma[t] >= 0.5 && structural_ok { c } else { 0.0 }
+                    })
+                    .collect()
+            } else {
+                prev_counts[i]
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &c)| {
+                        let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
+                        if presence_masks[i][t] && structural_ok { c } else { 0.0 }
+                    })
+                    .collect()
+            };
 
             create_dir_all(&sample.output_dir)
                 .with_context(|| format!("Failed to create output dir: {}", sample.output_dir.display()))?;
@@ -411,17 +639,6 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             )
             .with_context(|| format!("Failed to write quant for '{}'", sample.sample_name))?;
 
-            // Write posterior JSON
-            let posterior_path = sample
-                .output_dir
-                .join(format!("{}.posterior.json", sample.sample_name));
-            let posterior_json = json!({
-                "phi_hat": posterior.phi_hat,
-                "sigma_hat_sq": posterior.sigma_hat_sq,
-            });
-            let pf = File::create(&posterior_path)?;
-            serde_json::to_writer_pretty(pf, &posterior_json)?;
-
             info!("  Wrote {}", quant_path.display());
         }
 
@@ -432,8 +649,8 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
         let hp_path = opts.output.join("hierarchical_params.json");
         let hp_json = json!({
             "condition_names": hyperparams.condition_names,
-            "nu": hyperparams.nu,
-            "sigma_sq": hyperparams.sigma_sq,
+            "pi": hyperparams.pi,
+            "alpha_0": hyperparams.alpha_0,
         });
         let hf = File::create(&hp_path)?;
         serde_json::to_writer_pretty(hf, &hp_json)?;
@@ -460,9 +677,8 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             "condition_names": conditions,
             "num_targets": num_targets,
             "num_outer_iters": opts.num_outer_iters,
-            "em_warmstart_iters": opts.em_warmstart_iters,
-            "lbfgs_max_iters": opts.lbfgs_max_iters,
-            "lbfgs_history": opts.lbfgs_history,
+            "max_em_iter": opts.max_em_iter,
+            "prior_weight": opts.prior_weight,
             "convergence_thresh": opts.convergence_thresh,
             "converged": converged_at.is_some(),
             "converged_at_iteration": converged_at,
@@ -727,11 +943,9 @@ mod tests {
             manifest: manifest_path,
             lib_type: LibTypeArg::Explicit(LibraryType::InwardStrandedForward),
             output: output_dir.clone(),
-            em_warmstart_iters: 10,
+            max_em_iter: 1500,
             convergence_thresh: 0.001,
             presence_thresh: 1e-8,
-            lbfgs_max_iters: 100,
-            lbfgs_history: 5,
             num_outer_iters: 5,
             param_est_frags: 500_000,
             fld_mean: None,
@@ -741,6 +955,11 @@ mod tests {
             auto_detect_samples: 10_000,
             phase_a_only: false,
             phase_b_only: true,
+            prior_weight: 0.25,
+            consensus_thresh: 0.67,
+            spike_slab: false,
+            txp_selection: false,
+            selection_stages: None,
         };
 
         run(&opts).expect("Phase B should succeed");
@@ -765,35 +984,42 @@ mod tests {
         ))
         .unwrap();
 
-        let nu = hp["nu"].as_array().unwrap();
+        let pi = hp["pi"].as_array().unwrap();
         // Conditions are sorted alphabetically: control=0, treatment=1
-        let nu_control: Vec<f64> = nu[0]
+        let pi_control: Vec<f64> = pi[0]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_f64().unwrap())
             .collect();
-        let nu_treatment: Vec<f64> = nu[1]
+        let pi_treatment: Vec<f64> = pi[1]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_f64().unwrap())
             .collect();
 
+        // pi should sum to 1 per condition
+        assert!(
+            (pi_control.iter().sum::<f64>() - 1.0).abs() < 1e-6,
+            "pi_control should sum to 1, got {}",
+            pi_control.iter().sum::<f64>()
+        );
+
         // Transcript 0: higher in control than treatment (DE down)
         assert!(
-            nu_control[0] > nu_treatment[0],
-            "tx0 should have higher nu in control ({:.4}) than treatment ({:.4})",
-            nu_control[0],
-            nu_treatment[0]
+            pi_control[0] > pi_treatment[0],
+            "tx0 should have higher pi in control ({:.4}) than treatment ({:.4})",
+            pi_control[0],
+            pi_treatment[0]
         );
 
         // Transcript 2: higher in treatment than control (DE up)
         assert!(
-            nu_treatment[2] > nu_control[2],
-            "tx2 should have higher nu in treatment ({:.4}) than control ({:.4})",
-            nu_treatment[2],
-            nu_control[2]
+            pi_treatment[2] > pi_control[2],
+            "tx2 should have higher pi in treatment ({:.4}) than control ({:.4})",
+            pi_treatment[2],
+            pi_control[2]
         );
 
         // === Verify per-sample quant files exist and have plausible estimates ===
@@ -871,39 +1097,6 @@ mod tests {
             }
         }
 
-        // === Verify posterior files exist ===
-        for cond_name in &conditions {
-            for rep in 0..3 {
-                let sample_name = format!("{}_{}", cond_name, rep);
-                let sample_dir = tmp.path().join(&sample_name);
-                let posterior_path =
-                    sample_dir.join(format!("{}.posterior.json", sample_name));
-                assert!(
-                    posterior_path.exists(),
-                    "Posterior file should exist: {}",
-                    posterior_path.display()
-                );
-
-                let post: serde_json::Value = serde_json::from_reader(
-                    std::io::BufReader::new(File::open(&posterior_path).unwrap()),
-                )
-                .unwrap();
-                let phi_hat = post["phi_hat"].as_array().unwrap();
-                let sigma_hat_sq = post["sigma_hat_sq"].as_array().unwrap();
-                assert_eq!(phi_hat.len(), num_targets);
-                assert_eq!(sigma_hat_sq.len(), num_targets);
-
-                // All posterior variances should be positive
-                for (t, v) in sigma_hat_sq.iter().enumerate() {
-                    assert!(
-                        v.as_f64().unwrap() > 0.0,
-                        "Posterior variance for tx{} should be positive",
-                        t
-                    );
-                }
-            }
-        }
-
         // === Verify convergence.json ===
         let conv: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
             File::open(output_dir.join("convergence.json")).unwrap(),
@@ -916,21 +1109,7 @@ mod tests {
         );
         // Verify each iteration has valid metric fields
         for entry in history {
-            assert!(entry["max_nu_change"].as_f64().unwrap() >= 0.0);
-            assert!(entry["max_sigma_sq_change"].as_f64().unwrap() >= 0.0);
-        }
-        // Check that convergence metrics decrease over iterations
-        if history.len() >= 2 {
-            let first_nu = history[0]["max_nu_change"].as_f64().unwrap();
-            let last_nu = history.last().unwrap()["max_nu_change"]
-                .as_f64()
-                .unwrap();
-            assert!(
-                last_nu <= first_nu,
-                "Nu change should generally decrease: first={:.6e}, last={:.6e}",
-                first_nu,
-                last_nu
-            );
+            assert!(entry["max_pi_change"].as_f64().unwrap() >= 0.0);
         }
     }
 }

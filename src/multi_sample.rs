@@ -12,8 +12,8 @@ use crate::process_rad::{RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::MultiQuantOpts;
 use crate::utils::em::{self, EMInfo};
 use crate::utils::eq_maps::{
-    BasicEqLabel, BasicEqMap, EqMapType, OrientationProperty, PackedEqMap,
-    RangeFactorizedEqMap,
+    BasicEqLabel, BasicEqMap, EqLabel, EqMapType, OrientationProperty, PackedEqMap,
+    RangeFactorizedEqLabel, RangeFactorizedEqMap,
 };
 use crate::utils::eq_serialize::{
     EqMapTypeTag, SampleMeta, deserialize_eq_map, serialize_eq_map,
@@ -167,13 +167,11 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
         );
     }
 
-    // Force BasicEqMap for multi-quant: the serialization/deserialization pipeline
-    // in Phase B operates in BasicEqLabel space. RangeFactorized labels can't be
-    // reinterpreted as Basic labels without losing correctness.
-    if opts.factorized_eqc_bins > 1 {
-        info!("Note: multi-quant uses basic equivalence classes (overriding factorized_eqc_bins={})", opts.factorized_eqc_bins);
-    }
-    let eq_map_type = EqMapType::BasicEqMap;
+    let eq_map_type = if opts.factorized_eqc_bins > 1 {
+        EqMapType::RangeFactorizedEqMap
+    } else {
+        EqMapType::BasicEqMap
+    };
 
     if !opts.phase_b_only {
         info!("=== Phase A: Per-sample EQ class building ===");
@@ -285,415 +283,463 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             num_targets
         );
 
-        // Reconstruct PackedEqMaps (BasicEqLabel only for now)
-        // Phase B operates in BasicEqLabel space regardless of the original EQ map type,
-        // since we've already resolved conditional probabilities during Phase A.
-        let packed_maps: Vec<PackedEqMap<BasicEqLabel>> = all_deser
-            .into_iter()
-            .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
-            .collect();
-
-        // Optional transcript variable selection on merged EC graph.
-        let selection_mask: Option<Vec<bool>> = if opts.txp_selection {
-            info!("Running multi-sample transcript variable selection...");
-            use crate::utils::txp_selection;
-            let stages = opts
-                .selection_stages
-                .clone()
-                .unwrap_or_default();
-            let indices: Vec<_> = packed_maps
-                .iter()
-                .map(|m| txp_selection::TranscriptEqIndex::from_packed_eq_map(m, num_targets))
-                .collect();
-            let eqc_counts: Vec<usize> = packed_maps.iter().map(|m| m.len()).collect();
-            let total_eqcs: usize = eqc_counts.iter().sum();
-            let merged_index =
-                txp_selection::merge_transcript_indices(&indices, &eqc_counts, num_targets);
-            let result = txp_selection::run_selection_from_index_with_stages(
-                &merged_index,
-                num_targets,
-                total_eqcs,
-                &stages,
-            );
-            Some(result.keep_mask)
-        } else {
-            None
-        };
-
-        // Initialize Dirichlet-Multinomial hyperparameters.
-        // α₀ = prior_weight × average total reads across samples.
-        let avg_total_reads: f64 = packed_maps.iter()
-            .map(|m| m.total_weight() as f64)
-            .sum::<f64>()
-            / packed_maps.len() as f64;
-        let alpha_0 = opts.prior_weight * avg_total_reads;
-        let mut hyperparams =
-            hierarchical::init_hyperparams(num_targets, conditions.clone(), alpha_0);
-
-        let mode_label = if opts.spike_slab { "spike-and-slab" } else { "Dirichlet-Multinomial" };
-        info!(
-            "Starting hierarchical outer loop ({} iterations, α₀={:.1}, mode={})",
-            opts.num_outer_iters, alpha_0, mode_label
-        );
-
-        // Track convergence metrics per iteration
-        let mut convergence_history: Vec<serde_json::Value> = Vec::new();
-        let mut converged_at: Option<u32> = None;
-
-        // Per-sample cached counts from previous iteration
-        let mut prev_counts: Vec<Vec<f64>> = Vec::new();
-
-        // Per-sample presence masks (used in Dirichlet mode only).
-        let mut presence_masks: Vec<Vec<bool>> = Vec::new();
-
-        // Spike-and-slab inclusion probabilities (used in spike-slab mode only).
-        let mut gamma: Vec<f64> = vec![1.0; num_targets];
-
-        // Pre-compute condition indices for all samples
-        let sample_cond_indices: Vec<usize> = samples
-            .iter()
-            .map(|s| condition_index(&s.condition, &conditions))
-            .collect();
-
-        // Total iterations = 1 (initialization with standard EM) + num_outer_iters
-        let total_iters = 1 + opts.num_outer_iters;
-
-        for outer_iter in 0..total_iters {
-            let is_init_iter = outer_iter == 0;
-            if is_init_iter {
-                info!("--- Initialization iteration (standard EM, no prior) ---");
-            } else {
-                info!(
-                    "--- Outer iteration {}/{} (penalized EM) ---",
-                    outer_iter, opts.num_outer_iters
+        // Validate EQ map type consistency across samples
+        let eq_map_type_tag = all_meta[0].eq_map_type;
+        for (i, meta) in all_meta.iter().enumerate().skip(1) {
+            if meta.eq_map_type != eq_map_type_tag {
+                bail!(
+                    "EQ map type mismatch: sample '{}' has {:?} but sample '{}' has {:?}. \
+                     All samples must use the same EQ map type.",
+                    samples[0].sample_name, eq_map_type_tag,
+                    samples[i].sample_name, meta.eq_map_type,
                 );
             }
+        }
 
-            // Snapshot current hyperparams for convergence check
-            let old_pi = hyperparams.pi.clone();
-
-            // Inner loop: per-sample EM (standard or penalized)
-            let mut results: Vec<hierarchical::SampleResult> = Vec::with_capacity(samples.len());
-            let mut new_counts: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
-
-            for (i, sample) in samples.iter().enumerate() {
-                info!("  Sample '{}'", sample.sample_name);
-
-                let em_info = EMInfo {
-                    eq_map: &packed_maps[i],
-                    eff_lens: &all_meta[i].eff_lengths,
-                    max_iter: opts.max_em_iter,
-                    convergence_thresh: opts.convergence_thresh,
-                    presence_thresh: opts.presence_thresh,
-                };
-
-                let counts = if is_init_iter {
-                    // Standard EM to establish presence mask and data-driven estimates
-                    let c = if opts.num_threads > 1 {
-                        em::em_par(&em_info, opts.num_threads)
-                    } else {
-                        em::em(&em_info)
-                    };
-                    let mask: Vec<bool> = c.iter().map(|&v| v > opts.presence_thresh).collect();
-                    let n_present = mask.iter().filter(|&&b| b).count();
-                    info!("    {} / {} transcripts present", n_present, num_targets);
-                    presence_masks.push(mask);
-                    c
-                } else {
-                    // Penalized EM with pseudo-counts from hierarchical prior
-                    let cond_idx = sample_cond_indices[i];
-                    let alpha = if opts.spike_slab {
-                        hierarchical::compute_pseudo_counts_spike_slab(
-                            &hyperparams,
-                            cond_idx,
-                            &gamma,
-                        )
-                    } else {
-                        hierarchical::compute_pseudo_counts(
-                            &hyperparams,
-                            cond_idx,
-                            &presence_masks[i],
-                        )
-                    };
-
-                    if opts.num_threads > 1 {
-                        em::em_penalized_par(&em_info, &alpha, opts.num_threads)
-                    } else {
-                        em::em_penalized(&em_info, &alpha)
-                    }
-                };
-
-                let present: Vec<bool> = counts
-                    .iter()
-                    .map(|&c| c > opts.presence_thresh)
+        // Reconstruct PackedEqMaps with the correct label type and run Phase B
+        match eq_map_type_tag {
+            EqMapTypeTag::Basic => {
+                info!("Using basic equivalence classes");
+                let packed_maps: Vec<PackedEqMap<BasicEqLabel>> = all_deser
+                    .into_iter()
+                    .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
                     .collect();
-
-                results.push(hierarchical::SampleResult {
-                    counts: counts.clone(),
-                    present,
-                    sample_name: sample.sample_name.clone(),
-                    condition_idx: sample_cond_indices[i],
-                });
-
-                new_counts.push(counts);
+                run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
             }
-
-            // M-step: update condition-level mean proportions
-            hierarchical::update_condition_means(&results, &mut hyperparams);
-
-            // Check convergence
-            let pi_change = hierarchical::convergence_metric(&old_pi, &hyperparams);
-            info!("  Convergence: max_pi_change={:.6e}", pi_change);
-
-            convergence_history.push(json!({
-                "iteration": if is_init_iter { "init".to_string() } else { outer_iter.to_string() },
-                "max_pi_change": pi_change,
-            }));
-
-            prev_counts = new_counts;
-
-            if opts.spike_slab && is_init_iter {
-                // Empirical Bayes spike-and-slab: compute γ ONCE from init iteration
-                // counts. Using penalized counts in later iterations creates a positive
-                // feedback loop where pseudo-counts inflate presence → γ grows → repeat.
-                let pi_0 = hierarchical::estimate_inclusion_rate(
-                    &prev_counts,
-                    num_targets,
-                    opts.presence_thresh,
-                );
-                let n_expressed = (pi_0 * num_targets as f64).round() as usize;
-                info!(
-                    "  Estimated inclusion rate π₀ = {:.4} ({} / {} expressed in ≥1 sample)",
-                    pi_0, n_expressed, num_targets
-                );
-
-                gamma = hierarchical::compute_inclusion_probabilities(
-                    &prev_counts,
-                    &sample_cond_indices,
-                    conditions.len(),
-                    num_targets,
-                    opts.presence_thresh,
-                    pi_0,
-                );
-
-                // Unique EQ class rule: transcripts with strong unique evidence
-                // get γ = 1.0 regardless of replicate consistency.
-                const UNIQUE_EQ_MIN_COUNT: usize = 10;
-                let mut unique_eq_counts = vec![0usize; num_targets];
-                for packed_map in packed_maps.iter() {
-                    for eqc_idx in 0..packed_map.len() {
-                        if packed_map.counts[eqc_idx] > 0
-                            && packed_map.num_targets_in_eqc(eqc_idx) == 1
-                        {
-                            let s = packed_map.eq_label_starts[eqc_idx] as usize;
-                            let target_id = packed_map.eq_labels[s] as usize;
-                            unique_eq_counts[target_id] += packed_map.counts[eqc_idx];
-                        }
-                    }
-                }
-                let mut n_unique_added = 0usize;
-                for (t, &count) in unique_eq_counts.iter().enumerate() {
-                    if count >= UNIQUE_EQ_MIN_COUNT && gamma[t] < 0.5 {
-                        gamma[t] = 1.0;
-                        n_unique_added += 1;
-                    }
-                }
-                if n_unique_added > 0 {
-                    info!(
-                        "  Added {} transcripts via unique EQ class rule (γ set to 1.0)",
-                        n_unique_added
+            EqMapTypeTag::RangeFactorized => {
+                // Validate NUM_BINS matches metadata
+                let meta_bins = all_meta[0].num_bins;
+                let current_bins = *crate::utils::eq_maps::NUM_BINS.get().unwrap() as u32;
+                if meta_bins != current_bins {
+                    bail!(
+                        "Bin count mismatch: serialized data used {} bins but current setting is {}. \
+                         Use --factorized-eqc-bins {} to match.",
+                        meta_bins, current_bins, meta_bins,
                     );
                 }
-
-                let n_included = gamma.iter().filter(|&&g| g >= 0.5).count();
-                let n_excluded = gamma.iter().filter(|&&g| g < 0.5).count();
-                info!(
-                    "  Spike-and-slab support: {} included (γ≥0.5), {} excluded",
-                    n_included, n_excluded
-                );
-            } else if !opts.spike_slab && is_init_iter {
-                // Dirichlet mode: hard consensus filtering after init iteration
-                info!("--- Consensus support filtering ---");
-
-                let num_conditions = conditions.len();
-                let mut cond_counts: Vec<Vec<u32>> =
-                    vec![vec![0u32; num_targets]; num_conditions];
-                let mut cond_n_reps: Vec<u32> = vec![0u32; num_conditions];
-
-                for (i, _sample) in samples.iter().enumerate() {
-                    let cond_idx = sample_cond_indices[i];
-                    cond_n_reps[cond_idx] += 1;
-                    for t in 0..num_targets {
-                        if presence_masks[i][t] {
-                            cond_counts[cond_idx][t] += 1;
-                        }
-                    }
-                }
-
-                let mut consensus_support = vec![false; num_targets];
-                for c in 0..num_conditions {
-                    let threshold = (opts.consensus_thresh * cond_n_reps[c] as f64).ceil() as u32;
-                    let threshold = threshold.max(1);
-                    for t in 0..num_targets {
-                        if cond_counts[c][t] >= threshold {
-                            consensus_support[t] = true;
-                        }
-                    }
-                }
-
-                // Unique EQ class rule
-                const UNIQUE_EQ_MIN_COUNT: usize = 10;
-                let n_before_unique = consensus_support.iter().filter(|&&b| b).count();
-                let mut unique_eq_counts = vec![0usize; num_targets];
-                for packed_map in packed_maps.iter() {
-                    for eqc_idx in 0..packed_map.len() {
-                        if packed_map.counts[eqc_idx] > 0
-                            && packed_map.num_targets_in_eqc(eqc_idx) == 1
-                        {
-                            let s = packed_map.eq_label_starts[eqc_idx] as usize;
-                            let target_id = packed_map.eq_labels[s] as usize;
-                            unique_eq_counts[target_id] += packed_map.counts[eqc_idx];
-                        }
-                    }
-                }
-                for (t, &count) in unique_eq_counts.iter().enumerate() {
-                    if count >= UNIQUE_EQ_MIN_COUNT {
-                        consensus_support[t] = true;
-                    }
-                }
-                let n_unique_added = consensus_support.iter().filter(|&&b| b).count()
-                    - n_before_unique;
-                if n_unique_added > 0 {
-                    info!(
-                        "  Added {} transcripts via unique EQ class rule",
-                        n_unique_added
-                    );
-                }
-
-                let n_consensus = consensus_support.iter().filter(|&&b| b).count();
-                let n_before: usize = presence_masks
-                    .iter()
-                    .map(|m| m.iter().filter(|&&b| b).count())
-                    .sum::<usize>()
-                    / samples.len();
-                let n_removed = n_before.saturating_sub(n_consensus);
-                info!(
-                    "  Consensus support: {} transcripts (was ~{}/sample, removed ~{})",
-                    n_consensus, n_before, n_removed
-                );
-
-                for mask in presence_masks.iter_mut() {
-                    *mask = consensus_support.clone();
-                }
-            }
-
-            // Don't check convergence on the init iteration
-            if !is_init_iter && pi_change < 1e-7 {
-                converged_at = Some(outer_iter);
-                info!("Hierarchical loop converged at iteration {}", outer_iter);
-                break;
+                info!("Using range-factorized equivalence classes ({} bins)", meta_bins);
+                let packed_maps: Vec<PackedEqMap<RangeFactorizedEqLabel>> = all_deser
+                    .into_iter()
+                    .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
+                    .collect();
+                run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
             }
         }
-
-        // Write per-sample output using cached final counts.
-        info!("Writing per-sample quantification results...");
-        for (i, sample) in samples.iter().enumerate() {
-            // Apply support filtering: hard mask (Dirichlet) or soft γ (spike-and-slab),
-            // composed with structural variable selection if enabled.
-            let e_counts: Vec<f64> = if opts.spike_slab {
-                // MAP decision: include transcript if γ ≥ 0.5 (posterior
-                // probability of expression exceeds 0.5). This is the
-                // Bayes-optimal binary decision under 0-1 loss.
-                prev_counts[i]
-                    .iter()
-                    .enumerate()
-                    .map(|(t, &c)| {
-                        let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
-                        if gamma[t] >= 0.5 && structural_ok { c } else { 0.0 }
-                    })
-                    .collect()
-            } else {
-                prev_counts[i]
-                    .iter()
-                    .enumerate()
-                    .map(|(t, &c)| {
-                        let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
-                        if presence_masks[i][t] && structural_ok { c } else { 0.0 }
-                    })
-                    .collect()
-            };
-
-            create_dir_all(&sample.output_dir)
-                .with_context(|| format!("Failed to create output dir: {}", sample.output_dir.display()))?;
-
-            let quant_path = sample
-                .output_dir
-                .join(&sample.sample_name)
-                .with_additional_extension(".quant");
-            io::write_results(
-                &quant_path,
-                &all_meta[i].ref_names,
-                &e_counts,
-                &all_meta[i].ref_lengths,
-                &all_meta[i].eff_lengths,
-            )
-            .with_context(|| format!("Failed to write quant for '{}'", sample.sample_name))?;
-
-            info!("  Wrote {}", quant_path.display());
-        }
-
-        // Write joint output files to the global output directory
-        create_dir_all(&opts.output)?;
-
-        // Hierarchical parameters
-        let hp_path = opts.output.join("hierarchical_params.json");
-        let hp_json = json!({
-            "condition_names": hyperparams.condition_names,
-            "pi": hyperparams.pi,
-            "alpha_0": hyperparams.alpha_0,
-        });
-        let hf = File::create(&hp_path)?;
-        serde_json::to_writer_pretty(hf, &hp_json)?;
-        info!("Wrote hierarchical parameters to {}", hp_path.display());
-
-        // Convergence history
-        let conv_path = opts.output.join("convergence.json");
-        let conv_json = json!({
-            "converged": converged_at.is_some(),
-            "converged_at_iteration": converged_at,
-            "total_iterations": convergence_history.len(),
-            "history": convergence_history,
-        });
-        let cf = File::create(&conv_path)?;
-        serde_json::to_writer_pretty(cf, &conv_json)?;
-        info!("Wrote convergence history to {}", conv_path.display());
-
-        // Meta info
-        let meta_path = opts.output.join("meta_info.json");
-        let meta_json = json!({
-            "mode": "hierarchical_multi_sample",
-            "num_samples": samples.len(),
-            "num_conditions": conditions.len(),
-            "condition_names": conditions,
-            "num_targets": num_targets,
-            "num_outer_iters": opts.num_outer_iters,
-            "max_em_iter": opts.max_em_iter,
-            "prior_weight": opts.prior_weight,
-            "convergence_thresh": opts.convergence_thresh,
-            "converged": converged_at.is_some(),
-            "converged_at_iteration": converged_at,
-            "samples": samples.iter().map(|s| json!({
-                "sample_name": s.sample_name,
-                "condition": s.condition,
-                "output_dir": s.output_dir.to_string_lossy(),
-            })).collect::<Vec<_>>(),
-        });
-        let mf = File::create(&meta_path)?;
-        serde_json::to_writer_pretty(mf, &meta_json)?;
-        info!("Wrote meta info to {}", meta_path.display());
 
         info!("Phase B complete.");
     }
+
+    Ok(())
+}
+
+/// Generic Phase B inner loop: runs hierarchical inference on packed EQ maps
+/// of any label type (BasicEqLabel or RangeFactorizedEqLabel).
+fn run_phase_b_inner<EqLabelT: EqLabel>(
+    packed_maps: &[PackedEqMap<EqLabelT>],
+    all_meta: &[SampleMeta],
+    samples: &[SampleEntry],
+    opts: &MultiQuantOpts,
+    conditions: &[String],
+    num_targets: usize,
+) -> Result<()> {
+    // Optional transcript variable selection on merged EC graph.
+    let selection_mask: Option<Vec<bool>> = if opts.txp_selection {
+        info!("Running multi-sample transcript variable selection...");
+        use crate::utils::txp_selection;
+        let stages = opts
+            .selection_stages
+            .clone()
+            .unwrap_or_default();
+        let indices: Vec<_> = packed_maps
+            .iter()
+            .map(|m| txp_selection::TranscriptEqIndex::from_packed_eq_map(m, num_targets))
+            .collect();
+        let eqc_counts: Vec<usize> = packed_maps.iter().map(|m| m.len()).collect();
+        let total_eqcs: usize = eqc_counts.iter().sum();
+        let merged_index =
+            txp_selection::merge_transcript_indices(&indices, &eqc_counts, num_targets);
+        let result = txp_selection::run_selection_from_index_with_stages(
+            &merged_index,
+            num_targets,
+            total_eqcs,
+            &stages,
+        );
+        Some(result.keep_mask)
+    } else {
+        None
+    };
+
+    // Initialize Dirichlet-Multinomial hyperparameters.
+    // α₀ = prior_weight × average total reads across samples.
+    let avg_total_reads: f64 = packed_maps.iter()
+        .map(|m| m.total_weight() as f64)
+        .sum::<f64>()
+        / packed_maps.len() as f64;
+    let alpha_0 = opts.prior_weight * avg_total_reads;
+    let mut hyperparams =
+        hierarchical::init_hyperparams(num_targets, conditions.to_vec(), alpha_0);
+
+    let mode_label = if opts.spike_slab { "spike-and-slab" } else { "Dirichlet-Multinomial" };
+    info!(
+        "Starting hierarchical outer loop ({} iterations, α₀={:.1}, mode={})",
+        opts.num_outer_iters, alpha_0, mode_label
+    );
+
+    // Track convergence metrics per iteration
+    let mut convergence_history: Vec<serde_json::Value> = Vec::new();
+    let mut converged_at: Option<u32> = None;
+
+    // Per-sample cached counts from previous iteration
+    let mut prev_counts: Vec<Vec<f64>> = Vec::new();
+
+    // Per-sample presence masks (used in Dirichlet mode only).
+    let mut presence_masks: Vec<Vec<bool>> = Vec::new();
+
+    // Spike-and-slab inclusion probabilities (used in spike-slab mode only).
+    let mut gamma: Vec<f64> = vec![1.0; num_targets];
+
+    // Pre-compute condition indices for all samples
+    let sample_cond_indices: Vec<usize> = samples
+        .iter()
+        .map(|s| condition_index(&s.condition, conditions))
+        .collect();
+
+    // Total iterations = 1 (initialization with standard EM) + num_outer_iters
+    let total_iters = 1 + opts.num_outer_iters;
+
+    for outer_iter in 0..total_iters {
+        let is_init_iter = outer_iter == 0;
+        if is_init_iter {
+            info!("--- Initialization iteration (standard EM, no prior) ---");
+        } else {
+            info!(
+                "--- Outer iteration {}/{} (penalized EM) ---",
+                outer_iter, opts.num_outer_iters
+            );
+        }
+
+        // Snapshot current hyperparams for convergence check
+        let old_pi = hyperparams.pi.clone();
+
+        // Inner loop: per-sample EM (standard or penalized)
+        let mut results: Vec<hierarchical::SampleResult> = Vec::with_capacity(samples.len());
+        let mut new_counts: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
+
+        for (i, sample) in samples.iter().enumerate() {
+            info!("  Sample '{}'", sample.sample_name);
+
+            let em_info = EMInfo {
+                eq_map: &packed_maps[i],
+                eff_lens: &all_meta[i].eff_lengths,
+                max_iter: opts.max_em_iter,
+                convergence_thresh: opts.convergence_thresh,
+                presence_thresh: opts.presence_thresh,
+            };
+
+            let counts = if is_init_iter {
+                // Standard EM to establish presence mask and data-driven estimates
+                let c = if opts.num_threads > 1 {
+                    em::em_par(&em_info, opts.num_threads)
+                } else {
+                    em::em(&em_info)
+                };
+                let mask: Vec<bool> = c.iter().map(|&v| v > opts.presence_thresh).collect();
+                let n_present = mask.iter().filter(|&&b| b).count();
+                info!("    {} / {} transcripts present", n_present, num_targets);
+                presence_masks.push(mask);
+                c
+            } else {
+                // Penalized EM with pseudo-counts from hierarchical prior
+                let cond_idx = sample_cond_indices[i];
+                let alpha = if opts.spike_slab {
+                    hierarchical::compute_pseudo_counts_spike_slab(
+                        &hyperparams,
+                        cond_idx,
+                        &gamma,
+                    )
+                } else {
+                    hierarchical::compute_pseudo_counts(
+                        &hyperparams,
+                        cond_idx,
+                        &presence_masks[i],
+                    )
+                };
+
+                if opts.num_threads > 1 {
+                    em::em_penalized_par(&em_info, &alpha, opts.num_threads)
+                } else {
+                    em::em_penalized(&em_info, &alpha)
+                }
+            };
+
+            let present: Vec<bool> = counts
+                .iter()
+                .map(|&c| c > opts.presence_thresh)
+                .collect();
+
+            results.push(hierarchical::SampleResult {
+                counts: counts.clone(),
+                present,
+                sample_name: sample.sample_name.clone(),
+                condition_idx: sample_cond_indices[i],
+            });
+
+            new_counts.push(counts);
+        }
+
+        // M-step: update condition-level mean proportions
+        hierarchical::update_condition_means(&results, &mut hyperparams);
+
+        // Check convergence
+        let pi_change = hierarchical::convergence_metric(&old_pi, &hyperparams);
+        info!("  Convergence: max_pi_change={:.6e}", pi_change);
+
+        convergence_history.push(json!({
+            "iteration": if is_init_iter { "init".to_string() } else { outer_iter.to_string() },
+            "max_pi_change": pi_change,
+        }));
+
+        prev_counts = new_counts;
+
+        if opts.spike_slab && is_init_iter {
+            // Empirical Bayes spike-and-slab: compute γ ONCE from init iteration
+            // counts. Using penalized counts in later iterations creates a positive
+            // feedback loop where pseudo-counts inflate presence → γ grows → repeat.
+            let pi_0 = hierarchical::estimate_inclusion_rate(
+                &prev_counts,
+                num_targets,
+                opts.presence_thresh,
+            );
+            let n_expressed = (pi_0 * num_targets as f64).round() as usize;
+            info!(
+                "  Estimated inclusion rate π₀ = {:.4} ({} / {} expressed in ≥1 sample)",
+                pi_0, n_expressed, num_targets
+            );
+
+            gamma = hierarchical::compute_inclusion_probabilities(
+                &prev_counts,
+                &sample_cond_indices,
+                conditions.len(),
+                num_targets,
+                opts.presence_thresh,
+                pi_0,
+            );
+
+            // Unique EQ class rule: transcripts with strong unique evidence
+            // get γ = 1.0 regardless of replicate consistency.
+            const UNIQUE_EQ_MIN_COUNT: usize = 10;
+            let mut unique_eq_counts = vec![0usize; num_targets];
+            for packed_map in packed_maps.iter() {
+                for eqc_idx in 0..packed_map.len() {
+                    if packed_map.counts[eqc_idx] > 0
+                        && packed_map.num_targets_in_eqc(eqc_idx) == 1
+                    {
+                        let s = packed_map.eq_label_starts[eqc_idx] as usize;
+                        let target_id = packed_map.eq_labels[s] as usize;
+                        unique_eq_counts[target_id] += packed_map.counts[eqc_idx];
+                    }
+                }
+            }
+            let mut n_unique_added = 0usize;
+            for (t, &count) in unique_eq_counts.iter().enumerate() {
+                if count >= UNIQUE_EQ_MIN_COUNT && gamma[t] < 0.5 {
+                    gamma[t] = 1.0;
+                    n_unique_added += 1;
+                }
+            }
+            if n_unique_added > 0 {
+                info!(
+                    "  Added {} transcripts via unique EQ class rule (γ set to 1.0)",
+                    n_unique_added
+                );
+            }
+
+            let n_included = gamma.iter().filter(|&&g| g >= 0.5).count();
+            let n_excluded = gamma.iter().filter(|&&g| g < 0.5).count();
+            info!(
+                "  Spike-and-slab support: {} included (γ≥0.5), {} excluded",
+                n_included, n_excluded
+            );
+        } else if !opts.spike_slab && is_init_iter {
+            // Dirichlet mode: hard consensus filtering after init iteration
+            info!("--- Consensus support filtering ---");
+
+            let num_conditions = conditions.len();
+            let mut cond_counts: Vec<Vec<u32>> =
+                vec![vec![0u32; num_targets]; num_conditions];
+            let mut cond_n_reps: Vec<u32> = vec![0u32; num_conditions];
+
+            for (i, _sample) in samples.iter().enumerate() {
+                let cond_idx = sample_cond_indices[i];
+                cond_n_reps[cond_idx] += 1;
+                for t in 0..num_targets {
+                    if presence_masks[i][t] {
+                        cond_counts[cond_idx][t] += 1;
+                    }
+                }
+            }
+
+            let mut consensus_support = vec![false; num_targets];
+            for c in 0..num_conditions {
+                let threshold = (opts.consensus_thresh * cond_n_reps[c] as f64).ceil() as u32;
+                let threshold = threshold.max(1);
+                for t in 0..num_targets {
+                    if cond_counts[c][t] >= threshold {
+                        consensus_support[t] = true;
+                    }
+                }
+            }
+
+            // Unique EQ class rule
+            const UNIQUE_EQ_MIN_COUNT: usize = 10;
+            let n_before_unique = consensus_support.iter().filter(|&&b| b).count();
+            let mut unique_eq_counts = vec![0usize; num_targets];
+            for packed_map in packed_maps.iter() {
+                for eqc_idx in 0..packed_map.len() {
+                    if packed_map.counts[eqc_idx] > 0
+                        && packed_map.num_targets_in_eqc(eqc_idx) == 1
+                    {
+                        let s = packed_map.eq_label_starts[eqc_idx] as usize;
+                        let target_id = packed_map.eq_labels[s] as usize;
+                        unique_eq_counts[target_id] += packed_map.counts[eqc_idx];
+                    }
+                }
+            }
+            for (t, &count) in unique_eq_counts.iter().enumerate() {
+                if count >= UNIQUE_EQ_MIN_COUNT {
+                    consensus_support[t] = true;
+                }
+            }
+            let n_unique_added = consensus_support.iter().filter(|&&b| b).count()
+                - n_before_unique;
+            if n_unique_added > 0 {
+                info!(
+                    "  Added {} transcripts via unique EQ class rule",
+                    n_unique_added
+                );
+            }
+
+            let n_consensus = consensus_support.iter().filter(|&&b| b).count();
+            let n_before: usize = presence_masks
+                .iter()
+                .map(|m| m.iter().filter(|&&b| b).count())
+                .sum::<usize>()
+                / samples.len();
+            let n_removed = n_before.saturating_sub(n_consensus);
+            info!(
+                "  Consensus support: {} transcripts (was ~{}/sample, removed ~{})",
+                n_consensus, n_before, n_removed
+            );
+
+            for mask in presence_masks.iter_mut() {
+                *mask = consensus_support.clone();
+            }
+        }
+
+        // Don't check convergence on the init iteration
+        if !is_init_iter && pi_change < 1e-7 {
+            converged_at = Some(outer_iter);
+            info!("Hierarchical loop converged at iteration {}", outer_iter);
+            break;
+        }
+    }
+
+    // Write per-sample output using cached final counts.
+    info!("Writing per-sample quantification results...");
+    for (i, sample) in samples.iter().enumerate() {
+        // Apply support filtering: hard mask (Dirichlet) or soft γ (spike-and-slab),
+        // composed with structural variable selection if enabled.
+        let e_counts: Vec<f64> = if opts.spike_slab {
+            // MAP decision: include transcript if γ ≥ 0.5 (posterior
+            // probability of expression exceeds 0.5). This is the
+            // Bayes-optimal binary decision under 0-1 loss.
+            prev_counts[i]
+                .iter()
+                .enumerate()
+                .map(|(t, &c)| {
+                    let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
+                    if gamma[t] >= 0.5 && structural_ok { c } else { 0.0 }
+                })
+                .collect()
+        } else {
+            prev_counts[i]
+                .iter()
+                .enumerate()
+                .map(|(t, &c)| {
+                    let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
+                    if presence_masks[i][t] && structural_ok { c } else { 0.0 }
+                })
+                .collect()
+        };
+
+        create_dir_all(&sample.output_dir)
+            .with_context(|| format!("Failed to create output dir: {}", sample.output_dir.display()))?;
+
+        let quant_path = sample
+            .output_dir
+            .join(&sample.sample_name)
+            .with_additional_extension(".quant");
+        io::write_results(
+            &quant_path,
+            &all_meta[i].ref_names,
+            &e_counts,
+            &all_meta[i].ref_lengths,
+            &all_meta[i].eff_lengths,
+        )
+        .with_context(|| format!("Failed to write quant for '{}'", sample.sample_name))?;
+
+        info!("  Wrote {}", quant_path.display());
+    }
+
+    // Write joint output files to the global output directory
+    create_dir_all(&opts.output)?;
+
+    // Hierarchical parameters
+    let hp_path = opts.output.join("hierarchical_params.json");
+    let hp_json = json!({
+        "condition_names": hyperparams.condition_names,
+        "pi": hyperparams.pi,
+        "alpha_0": hyperparams.alpha_0,
+    });
+    let hf = File::create(&hp_path)?;
+    serde_json::to_writer_pretty(hf, &hp_json)?;
+    info!("Wrote hierarchical parameters to {}", hp_path.display());
+
+    // Convergence history
+    let conv_path = opts.output.join("convergence.json");
+    let conv_json = json!({
+        "converged": converged_at.is_some(),
+        "converged_at_iteration": converged_at,
+        "total_iterations": convergence_history.len(),
+        "history": convergence_history,
+    });
+    let cf = File::create(&conv_path)?;
+    serde_json::to_writer_pretty(cf, &conv_json)?;
+    info!("Wrote convergence history to {}", conv_path.display());
+
+    // Meta info
+    let meta_path = opts.output.join("meta_info.json");
+    let meta_json = json!({
+        "mode": "hierarchical_multi_sample",
+        "num_samples": samples.len(),
+        "num_conditions": conditions.len(),
+        "condition_names": conditions,
+        "num_targets": num_targets,
+        "num_outer_iters": opts.num_outer_iters,
+        "max_em_iter": opts.max_em_iter,
+        "prior_weight": opts.prior_weight,
+        "convergence_thresh": opts.convergence_thresh,
+        "converged": converged_at.is_some(),
+        "converged_at_iteration": converged_at,
+        "samples": samples.iter().map(|s| json!({
+            "sample_name": s.sample_name,
+            "condition": s.condition,
+            "output_dir": s.output_dir.to_string_lossy(),
+        })).collect::<Vec<_>>(),
+    });
+    let mf = File::create(&meta_path)?;
+    serde_json::to_writer_pretty(mf, &meta_json)?;
+    info!("Wrote meta info to {}", meta_path.display());
 
     Ok(())
 }

@@ -166,8 +166,7 @@ $PISCEM_INFER multi-quant \
     -l auto \
     --num-threads "$THREADS" \
     --num-outer-iters 7 \
-    --em-warmstart-iters 20 \
-    --lbfgs-max-iters 200 \
+    --prior-weight 0.25 \
     2>&1 | tail -10
 
 echo "  Multi-sample quantification complete."

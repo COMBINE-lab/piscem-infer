@@ -409,7 +409,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     });
     let min_k = ((min_fraction * n_samples as f64).ceil() as u32).max(1);
 
-    let consensus_mask: Vec<bool> = if opts.condition_aware_consensus {
+    // Compute per-condition evidence counts (needed for condition_aware and condition_rescue).
+    let has_conditions = samples.iter().any(|s| s.condition != samples[0].condition);
+    let condition_data = if has_conditions && (opts.condition_aware_consensus || opts.condition_rescue) {
         let mut condition_names: Vec<String> = samples.iter().map(|s| s.condition.clone()).collect();
         condition_names.sort();
         condition_names.dedup();
@@ -470,6 +472,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             .map(|&nrep| ((min_fraction * nrep as f64).ceil() as u32).max(1))
             .collect();
 
+        Some((condition_names, cond_counts, cond_k))
+    } else {
+        None
+    };
+
+    let consensus_mask: Vec<bool> = if opts.condition_aware_consensus {
+        let (condition_names, cond_counts, cond_k) =
+            condition_data.as_ref().expect("condition data required for condition-aware consensus");
         let mut mask = vec![false; n_targets];
         for t in 0..n_targets {
             mask[t] = (0..condition_names.len()).any(|ci| cond_counts[ci][t] >= cond_k[ci]);
@@ -477,6 +487,30 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         info!(
             "Condition-aware consensus enabled across {} conditions",
             condition_names.len()
+        );
+        mask
+    } else if opts.condition_rescue {
+        // Strict global consensus + condition-specific rescue.
+        let (condition_names, cond_counts, cond_k) =
+            condition_data.as_ref().expect("condition data required for condition-rescue");
+
+        let mut mask = vec![false; n_targets];
+        let mut n_global = 0usize;
+        let mut n_rescued = 0usize;
+        for t in 0..n_targets {
+            if express_count[t] >= min_k {
+                // Passes strict global consensus.
+                mask[t] = true;
+                n_global += 1;
+            } else if (0..condition_names.len()).any(|ci| cond_counts[ci][t] >= cond_k[ci]) {
+                // Fails globally but passes within at least one condition.
+                mask[t] = true;
+                n_rescued += 1;
+            }
+        }
+        info!(
+            "Condition rescue: {} pass global, {} rescued from within-condition consensus ({} conditions)",
+            n_global, n_rescued, condition_names.len()
         );
         mask
     } else {
@@ -491,7 +525,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     info!(
         "Consensus filter ({}{}): K={} (min_fraction={:.2}), {} transcripts pass, {} filtered out",
         filter_label,
-        if opts.condition_aware_consensus { ", condition-aware" } else { "" },
+        if opts.condition_aware_consensus { ", condition-aware" } else if opts.condition_rescue { ", condition-rescue" } else { "" },
         min_k,
         min_fraction,
         n_consensus,

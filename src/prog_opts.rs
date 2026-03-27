@@ -334,6 +334,11 @@ pub struct ConsensusQuantOpts {
     /// replicates within at least one condition.
     #[arg(long, help_heading = "Consensus Filter")]
     pub condition_aware_consensus: bool,
+    /// use strict global consensus, then rescue transcripts that fail globally
+    /// but pass within at least one condition. Combines high precision of
+    /// global filtering with preservation of condition-specific expression.
+    #[arg(long, conflicts_with = "condition_aware_consensus", help_heading = "Consensus Filter")]
+    pub condition_rescue: bool,
     /// TPM threshold above which a transcript is considered expressed
     /// in a given sample. Only used with --filter-mode tpm. (default: 0.0)
     #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]

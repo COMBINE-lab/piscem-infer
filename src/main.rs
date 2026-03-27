@@ -2,6 +2,7 @@ use clap::Parser;
 
 use tracing::Level;
 
+mod consensus;
 mod fld;
 mod multi_sample;
 mod process_rad;
@@ -42,6 +43,12 @@ fn main() -> anyhow::Result<()> {
                 .set(multi_opts.factorized_eqc_bins as f64)
                 .expect("NUM_BINS should not yet have been initalized");
             multi_sample::run(&multi_opts)?
+        }
+        Commands::ConsensusQuant(consensus_opts) => {
+            crate::utils::eq_maps::NUM_BINS
+                .set(consensus_opts.factorized_eqc_bins as f64)
+                .expect("NUM_BINS should not yet have been initalized");
+            consensus::run(&consensus_opts)?
         }
     }
     Ok(())

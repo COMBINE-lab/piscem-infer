@@ -1,0 +1,1163 @@
+//! Two-pass consensus-filtered multi-sample quantification.
+//!
+//! Phase 1: Build EQ maps and run per-sample EM to get initial abundance estimates.
+//! Consensus filter: Keep transcripts expressed in ≥K of N samples.
+//! Phase 2: Re-run per-sample EM with non-consensus transcripts masked out
+//!          (effective length set to 0), redistributing reads to the consensus set.
+
+use anyhow::{Context, Result};
+use path_tools::WithAdditionalExtension;
+use rayon::prelude::*;
+use serde_json::json;
+use std::fs::{File, create_dir_all};
+use tracing::info;
+
+use crate::multi_sample::{SampleEntry, parse_manifest};
+use crate::process_rad::{EqMapBundle, RadProcessingOpts, build_eq_map_from_rad};
+use crate::prog_opts::{ConsensusQuantOpts, FilterMode};
+use crate::utils::em::{
+    EMInfo, em, em_adaptive_shrinkage_init, em_adaptive_shrinkage_par_init,
+    em_adaptive_shrinkage_par_with_pool_init, em_init, em_par, em_par_init, em_par_with_pool,
+    em_par_with_pool_init, em_with_sink_init, em_with_sink_par_init,
+    em_with_sink_par_with_pool_init, squarem_em, squarem_em_init, squarem_em_par,
+    squarem_em_par_init, squarem_em_par_with_pool, squarem_em_par_with_pool_init,
+    squarem_em_with_sink_init, squarem_em_with_sink_par_init,
+    squarem_em_with_sink_par_with_pool_init,
+};
+use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap, TargetLabelsRef};
+use crate::utils::io;
+
+/// Per-transcript EC-based evidence metrics computed after EM convergence.
+struct EvidenceMetrics {
+    /// Unique Evidence Score: count-weighted average of posterior share per EC.
+    /// High UES means the transcript dominates the ECs that contribute to it.
+    ues: Vec<f64>,
+    /// Effective support count: number of distinct ECs contributing ≥ min_count
+    /// assigned fragments to this transcript.
+    support: Vec<u32>,
+}
+
+/// Compute per-transcript UES and effective support count from converged EM counts.
+///
+/// For each EC `e` containing transcript `t` with count `C_e`:
+///   posterior_share[t,e] = (prob[t,e] * mu[t] / eff_len[t]) / denom_e
+///   assigned[t,e] = C_e * posterior_share[t,e]
+///
+/// UES[t] = Σ_e (assigned[t,e] * share[t,e]) / Σ_e assigned[t,e]
+/// support[t] = |{e : assigned[t,e] >= min_support_count}|
+fn compute_evidence_metrics<EqLabelT: EqLabel>(
+    packed_eq_map: &PackedEqMap<EqLabelT>,
+    em_counts: &[f64],
+    eff_lens: &[f64],
+    min_support_count: f64,
+) -> EvidenceMetrics {
+    let n_targets = em_counts.len();
+    let inv_eff_lens: Vec<f64> = eff_lens
+        .iter()
+        .map(|&l| {
+            let inv = 1.0 / l;
+            if inv.is_finite() { inv } else { 0.0 }
+        })
+        .collect();
+
+    // Accumulators: UES numerator (sum of assigned * share) and denominator (sum of assigned)
+    let mut ues_num = vec![0.0f64; n_targets];
+    let mut ues_den = vec![0.0f64; n_targets];
+    let mut support = vec![0u32; n_targets];
+
+    let mut weights: Vec<f64> = Vec::with_capacity(64);
+
+    for (label, &count) in packed_eq_map.iter_labels().zip(packed_eq_map.counts.iter()) {
+        let ec_count = count as f64;
+        if ec_count == 0.0 {
+            continue;
+        }
+
+        // Compute weights (same as EM M-step)
+        let mut denom = 0.0f64;
+        for (tid, cond_prob) in label.target_labels().iter().zip(label.target_probs()) {
+            let w = cond_prob * em_counts[*tid as usize] * inv_eff_lens[*tid as usize];
+            weights.push(w);
+            denom += w;
+        }
+
+        if denom > 1e-8 {
+            for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
+                let t = *tid as usize;
+                let share = w / denom; // posterior share for this transcript in this EC
+                let assigned = ec_count * share;
+                ues_num[t] += assigned * share;
+                ues_den[t] += assigned;
+                if assigned >= min_support_count {
+                    support[t] += 1;
+                }
+            }
+        }
+        weights.clear();
+    }
+
+    // Finalize UES
+    let ues: Vec<f64> = ues_num
+        .iter()
+        .zip(ues_den.iter())
+        .map(|(&num, &den)| if den > 0.0 { num / den } else { 0.0 })
+        .collect();
+
+    EvidenceMetrics { ues, support }
+}
+
+/// Compute TPM from estimated counts and effective lengths.
+fn compute_tpm(e_counts: &[f64], eff_lengths: &[f64]) -> Vec<f64> {
+    const ONE_MILLION: f64 = 1_000_000.0;
+    let denom: f64 = e_counts
+        .iter()
+        .zip(eff_lengths.iter())
+        .map(|(c, l)| if *l > 0.0 { c / l } else { 0.0 })
+        .sum::<f64>();
+    let inv_denom = if denom > 0.0 {
+        ONE_MILLION / denom
+    } else {
+        0.0
+    };
+    e_counts
+        .iter()
+        .zip(eff_lengths.iter())
+        .map(|(c, l)| if *l > 0.0 { inv_denom * (c / l) } else { 0.0 })
+        .collect()
+}
+
+fn compute_phase1_penalties<EqLabelT: EqLabel>(
+    opts: &ConsensusQuantOpts,
+    bundles: &[EqMapBundle<EqLabelT>],
+    phase1_counts: &[Vec<f64>],
+    consensus_mask: &[bool],
+) -> Vec<f64> {
+    let n_targets = bundles[0].ref_names.len();
+    let n_samples = bundles.len() as f64;
+    let mut mean_tpm = vec![0.0f64; n_targets];
+    let mut mean_ues = vec![0.0f64; n_targets];
+    let mut mean_support = vec![0.0f64; n_targets];
+
+    for (i, counts) in phase1_counts.iter().enumerate() {
+        let tpms = compute_tpm(counts, &bundles[i].eff_lengths);
+        let metrics = compute_evidence_metrics(
+            &bundles[i].packed_eq_map,
+            counts,
+            &bundles[i].eff_lengths,
+            opts.min_support_count,
+        );
+        for t in 0..n_targets {
+            mean_tpm[t] += tpms[t];
+            mean_ues[t] += metrics.ues[t];
+            mean_support[t] += metrics.support[t] as f64;
+        }
+    }
+
+    for t in 0..n_targets {
+        mean_tpm[t] /= n_samples;
+        mean_ues[t] /= n_samples;
+        mean_support[t] /= n_samples;
+    }
+
+    let mut penalties = vec![0.0f64; n_targets];
+    for t in 0..n_targets {
+        if consensus_mask[t] {
+            continue;
+        }
+        let evidence = opts.penalty_tpm_weight * mean_tpm[t].ln_1p()
+            + opts.penalty_ues_weight * (opts.penalty_ues_scale * mean_ues[t]).ln_1p()
+            + opts.penalty_support_weight * mean_support[t].ln_1p();
+        penalties[t] = opts.penalty_strength / (1.0 + evidence);
+    }
+    penalties
+}
+
+fn build_phase2_keep_mask(
+    consensus_mask: &[bool],
+    penalties: &[f64],
+    hard_mask_fraction: f64,
+) -> Vec<bool> {
+    if hard_mask_fraction <= 0.0 {
+        return vec![true; consensus_mask.len()];
+    }
+
+    let mut penalized: Vec<(usize, f64)> = penalties
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, p)| *p > 0.0)
+        .collect();
+    if penalized.is_empty() {
+        return vec![true; consensus_mask.len()];
+    }
+
+    penalized.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let n_mask = ((hard_mask_fraction * penalized.len() as f64).round() as usize)
+        .min(penalized.len());
+
+    let mut keep_mask = vec![true; consensus_mask.len()];
+    for (idx, _) in penalized.into_iter().take(n_mask) {
+        if !consensus_mask[idx] {
+            keep_mask[idx] = false;
+        }
+    }
+    keep_mask
+}
+
+fn run_iterative_prune_refit<EqLabelT: EqLabel>(
+    opts: &ConsensusQuantOpts,
+    bundle: &EqMapBundle<EqLabelT>,
+    consensus_mask: &[bool],
+    num_threads: usize,
+    pool: Option<&rayon::ThreadPool>,
+) -> Vec<f64> {
+    let mut active_mask = vec![true; bundle.ref_names.len()];
+    let mut last_counts = vec![0.0; bundle.ref_names.len()];
+
+    for round in 0..opts.iterative_prune_rounds {
+        let masked_eff_lens: Vec<f64> = bundle
+            .eff_lengths
+            .iter()
+            .enumerate()
+            .map(|(t, &el)| if active_mask[t] { el } else { 0.0 })
+            .collect();
+
+        let eminfo = EMInfo {
+            eq_map: &bundle.packed_eq_map,
+            eff_lens: &masked_eff_lens,
+            max_iter: phase2_max_iter(opts),
+            convergence_thresh: phase2_convergence_thresh(opts),
+            presence_thresh: opts.presence_thresh,
+        };
+
+        let init = if opts.no_phase2_warm_start || !last_counts.iter().any(|&x| x > 0.0) {
+            None
+        } else {
+            Some(phase2_init_counts(&last_counts, &active_mask))
+        };
+
+        let counts = if opts.phase2_squarem {
+            if let Some(pool) = pool {
+                squarem_em_par_with_pool_init(&eminfo, init.as_deref(), pool)
+            } else if num_threads > 1 {
+                squarem_em_par_init(&eminfo, init.as_deref(), num_threads)
+            } else {
+                squarem_em_init(&eminfo, init.as_deref())
+            }
+        } else if let Some(pool) = pool {
+            em_par_with_pool_init(&eminfo, init.as_deref(), pool)
+        } else if num_threads > 1 {
+            em_par_init(&eminfo, init.as_deref(), num_threads)
+        } else {
+            em_init(&eminfo, init.as_deref())
+        };
+        last_counts = counts.clone();
+
+        let tpms = compute_tpm(&counts, &bundle.eff_lengths);
+        let metrics = compute_evidence_metrics(
+            &bundle.packed_eq_map,
+            &counts,
+            &bundle.eff_lengths,
+            opts.min_support_count,
+        );
+
+        let mut next_mask = vec![false; active_mask.len()];
+        for t in 0..active_mask.len() {
+            next_mask[t] = active_mask[t]
+                && (consensus_mask[t]
+                    || tpms[t] >= opts.iterative_rescue_tpm
+                    || metrics.ues[t] >= opts.iterative_rescue_ues);
+        }
+
+        let n_active = next_mask.iter().filter(|&&b| b).count();
+        let n_pruned = active_mask
+            .iter()
+            .zip(next_mask.iter())
+            .filter(|(old, new)| **old && !**new)
+            .count();
+        info!(
+            "    Iterative prune round {}/{}: {} active, {} pruned",
+            round + 1,
+            opts.iterative_prune_rounds,
+            n_active,
+            n_pruned
+        );
+
+        if next_mask == active_mask {
+            return counts;
+        }
+        active_mask = next_mask;
+    }
+
+    let masked_eff_lens: Vec<f64> = bundle
+        .eff_lengths
+        .iter()
+        .enumerate()
+        .map(|(t, &el)| if active_mask[t] { el } else { 0.0 })
+        .collect();
+    let eminfo = EMInfo {
+        eq_map: &bundle.packed_eq_map,
+        eff_lens: &masked_eff_lens,
+        max_iter: phase2_max_iter(opts),
+        convergence_thresh: phase2_convergence_thresh(opts),
+        presence_thresh: opts.presence_thresh,
+    };
+    let init = if opts.no_phase2_warm_start || !last_counts.iter().any(|&x| x > 0.0) {
+        None
+    } else {
+        Some(phase2_init_counts(&last_counts, &active_mask))
+    };
+    if opts.phase2_squarem {
+        if let Some(pool) = pool {
+            squarem_em_par_with_pool_init(&eminfo, init.as_deref(), pool)
+        } else if num_threads > 1 {
+            squarem_em_par_init(&eminfo, init.as_deref(), num_threads)
+        } else {
+            squarem_em_init(&eminfo, init.as_deref())
+        }
+    } else if let Some(pool) = pool {
+        em_par_with_pool_init(&eminfo, init.as_deref(), pool)
+    } else if num_threads > 1 {
+        em_par_init(&eminfo, init.as_deref(), num_threads)
+    } else {
+        em_init(&eminfo, init.as_deref())
+    }
+}
+
+fn phase1_max_iter(opts: &ConsensusQuantOpts) -> u32 {
+    opts.phase1_max_iter.unwrap_or(opts.max_iter)
+}
+
+fn phase1_convergence_thresh(opts: &ConsensusQuantOpts) -> f64 {
+    opts.phase1_convergence_thresh
+        .unwrap_or(opts.convergence_thresh)
+}
+
+fn phase2_max_iter(opts: &ConsensusQuantOpts) -> u32 {
+    opts.phase2_max_iter.unwrap_or(opts.max_iter)
+}
+
+fn phase2_convergence_thresh(opts: &ConsensusQuantOpts) -> f64 {
+    opts.phase2_convergence_thresh
+        .unwrap_or(opts.convergence_thresh)
+}
+
+fn consensus_thread_split(opts: &ConsensusQuantOpts, n_samples: usize) -> (usize, usize) {
+    let outer_threads = opts
+        .sample_parallelism
+        as usize;
+    let outer_threads = outer_threads
+        .max(1)
+        .min(opts.num_threads.max(1))
+        .min(n_samples.max(1));
+    let inner_threads = (opts.num_threads / outer_threads).max(1);
+    (outer_threads, inner_threads)
+}
+
+fn phase2_init_counts(init_counts: &[f64], active_mask: &[bool]) -> Vec<f64> {
+    init_counts
+        .iter()
+        .zip(active_mask.iter())
+        .map(|(&c, &keep)| if keep && c.is_finite() && c > 0.0 { c } else { 0.0 })
+        .collect()
+}
+
+/// Core implementation generic over EQ label type.
+fn run_dispatch<EqLabelT: EqLabel + Send + Sync>(
+    opts: &ConsensusQuantOpts,
+    samples: &[SampleEntry],
+) -> Result<()> {
+    let n_samples = samples.len();
+    let (outer_threads, inner_threads) = consensus_thread_split(opts, n_samples);
+    let serial_inner_pool = if outer_threads == 1 && inner_threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(inner_threads)
+                .build()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    // ====== Build EQ maps for all samples ======
+    info!(
+        "Building EQ maps for {} samples ({} job(s) in parallel, {} thread(s) per sample)",
+        n_samples, outer_threads, inner_threads
+    );
+
+    let mut bundles: Vec<EqMapBundle<EqLabelT>> = if outer_threads > 1 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(outer_threads)
+            .build()
+            .unwrap();
+        let results: Vec<Result<(usize, EqMapBundle<EqLabelT>)>> = pool.install(|| {
+            samples
+                .par_iter()
+                .enumerate()
+                .map(|(i, sample)| -> Result<(usize, EqMapBundle<EqLabelT>)> {
+                    info!("  [{}/{}] Building EQ map for {}", i + 1, n_samples, sample.sample_name);
+                    let rad_opts = RadProcessingOpts {
+                        input: sample.rad_path.clone(),
+                        lib_type: opts.lib_type.clone(),
+                        param_est_frags: opts.param_est_frags,
+                        fld_mean: opts.fld_mean,
+                        fld_sd: opts.fld_sd,
+                        auto_detect_samples: opts.auto_detect_samples,
+                    };
+                    let bundle = build_eq_map_from_rad(
+                        &rad_opts,
+                        EqMap::<EqLabelT>::new(OrientationProperty::OrientationAware),
+                    )?;
+                    Ok((i, bundle))
+                })
+                .collect()
+        });
+        let mut results: Vec<(usize, EqMapBundle<EqLabelT>)> =
+            results.into_iter().collect::<Result<Vec<_>>>()?;
+        results.sort_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, b)| b).collect()
+    } else {
+        let mut bs = Vec::with_capacity(n_samples);
+        for (i, sample) in samples.iter().enumerate() {
+            info!("  [{}/{}] Building EQ map for {}", i + 1, n_samples, sample.sample_name);
+            let rad_opts = RadProcessingOpts {
+                input: sample.rad_path.clone(),
+                lib_type: opts.lib_type.clone(),
+                param_est_frags: opts.param_est_frags,
+                fld_mean: opts.fld_mean,
+                fld_sd: opts.fld_sd,
+                auto_detect_samples: opts.auto_detect_samples,
+            };
+            let bundle = build_eq_map_from_rad(
+                &rad_opts,
+                EqMap::<EqLabelT>::new(OrientationProperty::OrientationAware),
+            )?;
+            bs.push(bundle);
+        }
+        bs
+    };
+
+    let n_targets = bundles[0].ref_names.len();
+
+    // ====== Optional: structural transcript variable selection ======
+    let selection_stats = if opts.txp_selection {
+        use crate::utils::txp_selection;
+        info!("Running structural transcript variable selection on merged EC graph...");
+        let stages = opts.selection_stages.clone().unwrap_or_default();
+        let indices: Vec<_> = bundles
+            .iter()
+            .map(|b| txp_selection::TranscriptEqIndex::from_packed_eq_map(&b.packed_eq_map, n_targets))
+            .collect();
+        let eqc_counts: Vec<usize> = bundles.iter().map(|b| b.packed_eq_map.len()).collect();
+        let total_eqcs: usize = eqc_counts.iter().sum();
+        let merged_index =
+            txp_selection::merge_transcript_indices(&indices, &eqc_counts, n_targets);
+        let result = txp_selection::run_selection_from_index_with_stages(
+            &merged_index,
+            n_targets,
+            total_eqcs,
+            &stages,
+        );
+        info!(
+            "Structural selection: {} kept, {} removed (from {} transcripts)",
+            result.num_kept, result.num_removed, n_targets
+        );
+        // Zero out effective lengths for removed transcripts in all bundles.
+        for bundle in &mut bundles {
+            for (t, &keep) in result.keep_mask.iter().enumerate() {
+                if !keep {
+                    bundle.eff_lengths[t] = 0.0;
+                }
+            }
+        }
+        Some((result.num_kept, result.num_removed))
+    } else {
+        None
+    };
+
+    // ====== Phase 1: Run initial per-sample EM ======
+    info!("Phase 1: running initial EM for {} samples", n_samples);
+
+    let phase1_counts: Vec<Vec<f64>> = if outer_threads > 1 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(outer_threads)
+            .build()
+            .unwrap();
+        let results: Vec<Result<(usize, Vec<f64>)>> = pool.install(|| {
+            bundles
+                .par_iter()
+                .enumerate()
+                .map(|(i, bundle)| -> Result<(usize, Vec<f64>)> {
+                    info!("  [{}/{}] Phase 1 EM for {}", i + 1, n_samples, samples[i].sample_name);
+                    let eminfo = EMInfo {
+                        eq_map: &bundle.packed_eq_map,
+                        eff_lens: &bundle.eff_lengths,
+                        max_iter: phase1_max_iter(opts),
+                        convergence_thresh: phase1_convergence_thresh(opts),
+                        presence_thresh: opts.presence_thresh,
+                    };
+                    let counts = if opts.phase1_squarem {
+                        if inner_threads > 1 {
+                            squarem_em_par(&eminfo, inner_threads)
+                        } else {
+                            squarem_em(&eminfo)
+                        }
+                    } else if inner_threads > 1 {
+                        em_par(&eminfo, inner_threads)
+                    } else {
+                        em(&eminfo)
+                    };
+                    Ok((i, counts))
+                })
+                .collect()
+        });
+        let mut results: Vec<(usize, Vec<f64>)> =
+            results.into_iter().collect::<Result<Vec<_>>>()?;
+        results.sort_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, c)| c).collect()
+    } else {
+        let mut counts_vec = Vec::with_capacity(n_samples);
+        for (i, bundle) in bundles.iter().enumerate() {
+            info!("  [{}/{}] Phase 1 EM for {}", i + 1, n_samples, samples[i].sample_name);
+            let eminfo = EMInfo {
+                eq_map: &bundle.packed_eq_map,
+                eff_lens: &bundle.eff_lengths,
+                max_iter: phase1_max_iter(opts),
+                convergence_thresh: phase1_convergence_thresh(opts),
+                presence_thresh: opts.presence_thresh,
+            };
+            let counts = if opts.phase1_squarem {
+                if let Some(pool) = serial_inner_pool.as_ref() {
+                    squarem_em_par_with_pool(&eminfo, pool)
+                } else if inner_threads > 1 {
+                    squarem_em_par(&eminfo, inner_threads)
+                } else {
+                    squarem_em(&eminfo)
+                }
+            } else if let Some(pool) = serial_inner_pool.as_ref() {
+                em_par_with_pool(&eminfo, pool)
+            } else if inner_threads > 1 {
+                em_par(&eminfo, inner_threads)
+            } else {
+                em(&eminfo)
+            };
+            counts_vec.push(counts);
+        }
+        counts_vec
+    };
+
+    // ====== Consensus filter ======
+    let filter_mode = &opts.filter_mode;
+
+    // Compute per-sample evidence and count how many samples pass for each transcript
+    let mut express_count = vec![0u32; n_targets];
+
+    let filter_label = match filter_mode {
+        FilterMode::Tpm => {
+            let tpm_threshold = opts.tpm_threshold;
+            for (i, counts) in phase1_counts.iter().enumerate() {
+                let tpms = compute_tpm(counts, &bundles[i].eff_lengths);
+                for (t, &tpm) in tpms.iter().enumerate() {
+                    if tpm > tpm_threshold {
+                        express_count[t] += 1;
+                    }
+                }
+            }
+            format!("TPM > {}", tpm_threshold)
+        }
+        FilterMode::Ues => {
+            let ues_threshold = opts.ues_threshold;
+            for (i, counts) in phase1_counts.iter().enumerate() {
+                let metrics = compute_evidence_metrics(
+                    &bundles[i].packed_eq_map,
+                    counts,
+                    &bundles[i].eff_lengths,
+                    opts.min_support_count,
+                );
+                for (t, &ues) in metrics.ues.iter().enumerate() {
+                    if ues > ues_threshold {
+                        express_count[t] += 1;
+                    }
+                }
+            }
+            format!("UES > {}", ues_threshold)
+        }
+        FilterMode::Support => {
+            let min_ecs = opts.min_ec_support;
+            for (i, counts) in phase1_counts.iter().enumerate() {
+                let metrics = compute_evidence_metrics(
+                    &bundles[i].packed_eq_map,
+                    counts,
+                    &bundles[i].eff_lengths,
+                    opts.min_support_count,
+                );
+                for (t, &sup) in metrics.support.iter().enumerate() {
+                    if sup >= min_ecs {
+                        express_count[t] += 1;
+                    }
+                }
+            }
+            format!("EC support >= {}", min_ecs)
+        }
+        FilterMode::Score => {
+            let score_threshold = opts.score_threshold;
+            for (i, counts) in phase1_counts.iter().enumerate() {
+                let tpms = compute_tpm(counts, &bundles[i].eff_lengths);
+                let metrics = compute_evidence_metrics(
+                    &bundles[i].packed_eq_map,
+                    counts,
+                    &bundles[i].eff_lengths,
+                    opts.min_support_count,
+                );
+                for t in 0..n_targets {
+                    let score = opts.score_tpm_weight * tpms[t].ln_1p()
+                        + opts.score_ues_weight * (opts.score_ues_scale * metrics.ues[t]).ln_1p()
+                        + opts.score_support_weight * (metrics.support[t] as f64).ln_1p();
+                    if score > score_threshold {
+                        express_count[t] += 1;
+                    }
+                }
+            }
+            format!(
+                "score > {} [w_tpm={}, w_ues={}, w_support={}, ues_scale={}]",
+                score_threshold,
+                opts.score_tpm_weight,
+                opts.score_ues_weight,
+                opts.score_support_weight,
+                opts.score_ues_scale
+            )
+        }
+    };
+
+    // Determine K threshold
+    let min_fraction = opts.min_fraction.unwrap_or_else(|| {
+        // Default: (N-1)/N
+        (n_samples as f64 - 1.0) / n_samples as f64
+    });
+    let min_k = ((min_fraction * n_samples as f64).ceil() as u32).max(1);
+
+    let consensus_mask: Vec<bool> = if opts.condition_aware_consensus {
+        let mut condition_names: Vec<String> = samples.iter().map(|s| s.condition.clone()).collect();
+        condition_names.sort();
+        condition_names.dedup();
+        let condition_index = |condition: &str| -> usize {
+            condition_names
+                .iter()
+                .position(|c| c == condition)
+                .expect("condition should exist")
+        };
+
+        let mut cond_counts = vec![vec![0u32; n_targets]; condition_names.len()];
+        let mut cond_reps = vec![0u32; condition_names.len()];
+        for (sample_idx, sample) in samples.iter().enumerate() {
+            let ci = condition_index(&sample.condition);
+            cond_reps[ci] += 1;
+
+            let mut sample_pass = vec![false; n_targets];
+            match filter_mode {
+                FilterMode::Tpm => {
+                    let tpms = compute_tpm(&phase1_counts[sample_idx], &bundles[sample_idx].eff_lengths);
+                    for (t, &tpm) in tpms.iter().enumerate() {
+                        sample_pass[t] = tpm > opts.tpm_threshold;
+                    }
+                }
+                FilterMode::Ues => {
+                    let metrics = compute_evidence_metrics(
+                        &bundles[sample_idx].packed_eq_map,
+                        &phase1_counts[sample_idx],
+                        &bundles[sample_idx].eff_lengths,
+                        opts.min_support_count,
+                    );
+                    for (t, &ues) in metrics.ues.iter().enumerate() {
+                        sample_pass[t] = ues > opts.ues_threshold;
+                    }
+                }
+                FilterMode::Support => {
+                    let metrics = compute_evidence_metrics(
+                        &bundles[sample_idx].packed_eq_map,
+                        &phase1_counts[sample_idx],
+                        &bundles[sample_idx].eff_lengths,
+                        opts.min_support_count,
+                    );
+                    for (t, &sup) in metrics.support.iter().enumerate() {
+                        sample_pass[t] = sup >= opts.min_ec_support;
+                    }
+                }
+                FilterMode::Score => {
+                    let tpms = compute_tpm(&phase1_counts[sample_idx], &bundles[sample_idx].eff_lengths);
+                    let metrics = compute_evidence_metrics(
+                        &bundles[sample_idx].packed_eq_map,
+                        &phase1_counts[sample_idx],
+                        &bundles[sample_idx].eff_lengths,
+                        opts.min_support_count,
+                    );
+                    for t in 0..n_targets {
+                        let score = opts.score_tpm_weight * tpms[t].ln_1p()
+                            + opts.score_ues_weight * (opts.score_ues_scale * metrics.ues[t]).ln_1p()
+                            + opts.score_support_weight * (metrics.support[t] as f64).ln_1p();
+                        sample_pass[t] = score > opts.score_threshold;
+                    }
+                }
+            }
+
+            for (t, pass) in sample_pass.into_iter().enumerate() {
+                if pass {
+                    cond_counts[ci][t] += 1;
+                }
+            }
+        }
+
+        let cond_k: Vec<u32> = cond_reps
+            .iter()
+            .map(|&nrep| ((min_fraction * nrep as f64).ceil() as u32).max(1))
+            .collect();
+
+        let mut mask = vec![false; n_targets];
+        for t in 0..n_targets {
+            mask[t] = (0..condition_names.len()).any(|ci| cond_counts[ci][t] >= cond_k[ci]);
+        }
+        info!(
+            "Condition-aware consensus enabled across {} conditions",
+            condition_names.len()
+        );
+        mask
+    } else {
+        express_count
+            .iter()
+            .map(|&c| c >= min_k)
+            .collect()
+    };
+    let n_consensus = consensus_mask.iter().filter(|&&b| b).count();
+    let n_filtered = n_targets - n_consensus;
+
+    info!(
+        "Consensus filter ({}{}): K={} (min_fraction={:.2}), {} transcripts pass, {} filtered out",
+        filter_label,
+        if opts.condition_aware_consensus { ", condition-aware" } else { "" },
+        min_k,
+        min_fraction,
+        n_consensus,
+        n_filtered
+    );
+
+    // ====== Phase 2: Re-run EM with masked effective lengths or adaptive shrinkage ======
+    if opts.iterative_prune_em {
+        info!("Phase 2: re-running EM with iterative prune-and-refit");
+    } else if opts.adaptive_penalized_em {
+        info!("Phase 2: re-running EM with adaptive penalized shrinkage");
+    } else if opts.null_sink_em {
+        info!("Phase 2: re-running EM with consensus filtering plus null sink");
+    } else {
+        info!("Phase 2: re-running EM with consensus-filtered transcript set");
+    }
+
+    let penalties = if opts.adaptive_penalized_em {
+        let penalties = compute_phase1_penalties(opts, &bundles, &phase1_counts, &consensus_mask);
+        let n_penalized = penalties.iter().filter(|&&p| p > 0.0).count();
+        let mean_penalty = if n_penalized > 0 {
+            penalties.iter().sum::<f64>() / n_penalized as f64
+        } else {
+            0.0
+        };
+        info!(
+            "Adaptive penalized EM: {} transcripts penalized, mean penalty {:.3}",
+            n_penalized, mean_penalty
+        );
+        Some(penalties)
+    } else {
+        None
+    };
+
+    let phase2_keep_mask = if let Some(ref penalties) = penalties {
+        let keep_mask = build_phase2_keep_mask(
+            &consensus_mask,
+            penalties,
+            opts.penalty_hard_mask_fraction,
+        );
+        let n_hard_masked = keep_mask.iter().filter(|&&b| !b).count();
+        if n_hard_masked > 0 {
+            info!(
+                "Adaptive penalized EM: hard-masked {} highest-penalty transcripts before shrinkage",
+                n_hard_masked
+            );
+        }
+        Some(keep_mask)
+    } else {
+        None
+    };
+
+    let phase2_results: Vec<(usize, Vec<f64>)> = if outer_threads > 1 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(outer_threads)
+            .build()
+            .unwrap();
+        let results: Vec<Result<(usize, Vec<f64>)>> = pool.install(|| {
+            samples
+                .par_iter()
+                .enumerate()
+                .map(|(i, sample)| -> Result<(usize, Vec<f64>)> {
+                    info!(
+                        "  [{}/{}] Re-estimating {}",
+                        i + 1,
+                        n_samples,
+                        sample.sample_name
+                    );
+
+                    let em_res = if opts.iterative_prune_em {
+                        run_iterative_prune_refit(
+                            opts,
+                            &bundles[i],
+                            &consensus_mask,
+                            inner_threads,
+                            None,
+                        )
+                    } else if let Some(ref penalties) = penalties {
+                        let active_mask = phase2_keep_mask.as_deref().unwrap_or(&consensus_mask);
+                        let masked_eff_lens: Vec<f64> = bundles[i]
+                            .eff_lengths
+                            .iter()
+                            .enumerate()
+                            .map(|(t, &el)| if active_mask[t] { el } else { 0.0 })
+                            .collect();
+                        let init = if opts.no_phase2_warm_start {
+                            None
+                        } else {
+                            Some(phase2_init_counts(&phase1_counts[i], active_mask))
+                        };
+                        let active_penalties: Vec<f64> = penalties
+                            .iter()
+                            .enumerate()
+                            .map(|(t, &p)| if active_mask[t] { p } else { 0.0 })
+                            .collect();
+                        let eminfo = EMInfo {
+                            eq_map: &bundles[i].packed_eq_map,
+                            eff_lens: &masked_eff_lens,
+                            max_iter: phase2_max_iter(opts),
+                            convergence_thresh: phase2_convergence_thresh(opts),
+                            presence_thresh: opts.presence_thresh,
+                        };
+                        if inner_threads > 1 {
+                            em_adaptive_shrinkage_par_init(
+                                &eminfo,
+                                init.as_deref(),
+                                &active_penalties,
+                                inner_threads,
+                            )
+                        } else {
+                            em_adaptive_shrinkage_init(
+                                &eminfo,
+                                init.as_deref(),
+                                &active_penalties,
+                            )
+                        }
+                    } else {
+                        let active_mask = phase2_keep_mask.as_deref().unwrap_or(&consensus_mask);
+                        let masked_eff_lens: Vec<f64> = bundles[i]
+                            .eff_lengths
+                            .iter()
+                            .enumerate()
+                            .map(|(t, &el)| if active_mask[t] { el } else { 0.0 })
+                            .collect();
+                        let init = if opts.no_phase2_warm_start {
+                            None
+                        } else {
+                            Some(phase2_init_counts(&phase1_counts[i], active_mask))
+                        };
+                        let eminfo = EMInfo {
+                            eq_map: &bundles[i].packed_eq_map,
+                            eff_lens: &masked_eff_lens,
+                            max_iter: phase2_max_iter(opts),
+                            convergence_thresh: phase2_convergence_thresh(opts),
+                            presence_thresh: opts.presence_thresh,
+                        };
+
+                        if opts.null_sink_em && inner_threads > 1 {
+                            if opts.phase2_squarem {
+                                squarem_em_with_sink_par_init(
+                                    &eminfo,
+                                    init.as_deref(),
+                                    opts.null_sink_strength,
+                                    opts.null_sink_min_ec_size as usize,
+                                    inner_threads,
+                                )
+                            } else {
+                                em_with_sink_par_init(
+                                    &eminfo,
+                                    init.as_deref(),
+                                    opts.null_sink_strength,
+                                    opts.null_sink_min_ec_size as usize,
+                                    inner_threads,
+                                )
+                            }
+                        } else if opts.null_sink_em {
+                            if opts.phase2_squarem {
+                                squarem_em_with_sink_init(
+                                    &eminfo,
+                                    init.as_deref(),
+                                    opts.null_sink_strength,
+                                    opts.null_sink_min_ec_size as usize,
+                                )
+                            } else {
+                                em_with_sink_init(
+                                    &eminfo,
+                                    init.as_deref(),
+                                    opts.null_sink_strength,
+                                    opts.null_sink_min_ec_size as usize,
+                                )
+                            }
+                        } else if inner_threads > 1 {
+                            if opts.phase2_squarem {
+                                squarem_em_par_init(&eminfo, init.as_deref(), inner_threads)
+                            } else {
+                                em_par_init(&eminfo, init.as_deref(), inner_threads)
+                            }
+                        } else {
+                            if opts.phase2_squarem {
+                                squarem_em_init(&eminfo, init.as_deref())
+                            } else {
+                                em_init(&eminfo, init.as_deref())
+                            }
+                        }
+                    };
+                    Ok((i, em_res))
+                })
+                .collect()
+        });
+        let mut results: Vec<(usize, Vec<f64>)> =
+            results.into_iter().collect::<Result<Vec<_>>>()?;
+        results.sort_by_key(|(i, _)| *i);
+        results
+    } else {
+        let mut results = Vec::with_capacity(n_samples);
+        for (i, sample) in samples.iter().enumerate() {
+            info!(
+                "  [{}/{}] Re-estimating {}",
+                i + 1,
+                n_samples,
+                sample.sample_name
+            );
+
+            let em_res = if opts.iterative_prune_em {
+                run_iterative_prune_refit(
+                    opts,
+                    &bundles[i],
+                    &consensus_mask,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                )
+            } else if let Some(ref penalties) = penalties {
+                let active_mask = phase2_keep_mask.as_deref().unwrap_or(&consensus_mask);
+                let masked_eff_lens: Vec<f64> = bundles[i]
+                    .eff_lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &el)| if active_mask[t] { el } else { 0.0 })
+                    .collect();
+                let init = if opts.no_phase2_warm_start {
+                    None
+                } else {
+                    Some(phase2_init_counts(&phase1_counts[i], active_mask))
+                };
+                let active_penalties: Vec<f64> = penalties
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &p)| if active_mask[t] { p } else { 0.0 })
+                    .collect();
+                let eminfo = EMInfo {
+                    eq_map: &bundles[i].packed_eq_map,
+                    eff_lens: &masked_eff_lens,
+                    max_iter: phase2_max_iter(opts),
+                    convergence_thresh: phase2_convergence_thresh(opts),
+                    presence_thresh: opts.presence_thresh,
+                };
+                if let Some(pool) = serial_inner_pool.as_ref() {
+                    em_adaptive_shrinkage_par_with_pool_init(
+                        &eminfo,
+                        init.as_deref(),
+                        &active_penalties,
+                        pool,
+                    )
+                } else if inner_threads > 1 {
+                    em_adaptive_shrinkage_par_init(
+                        &eminfo,
+                        init.as_deref(),
+                        &active_penalties,
+                        inner_threads,
+                    )
+                } else {
+                    em_adaptive_shrinkage_init(
+                        &eminfo,
+                        init.as_deref(),
+                        &active_penalties,
+                    )
+                }
+            } else {
+                let active_mask = phase2_keep_mask.as_deref().unwrap_or(&consensus_mask);
+                let masked_eff_lens: Vec<f64> = bundles[i]
+                    .eff_lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &el)| if active_mask[t] { el } else { 0.0 })
+                    .collect();
+                let init = if opts.no_phase2_warm_start {
+                    None
+                } else {
+                    Some(phase2_init_counts(&phase1_counts[i], active_mask))
+                };
+                let eminfo = EMInfo {
+                    eq_map: &bundles[i].packed_eq_map,
+                    eff_lens: &masked_eff_lens,
+                    max_iter: phase2_max_iter(opts),
+                    convergence_thresh: phase2_convergence_thresh(opts),
+                    presence_thresh: opts.presence_thresh,
+                };
+
+                if opts.null_sink_em
+                    && let Some(pool) = serial_inner_pool.as_ref()
+                {
+                    if opts.phase2_squarem {
+                        squarem_em_with_sink_par_with_pool_init(
+                            &eminfo,
+                            init.as_deref(),
+                            opts.null_sink_strength,
+                            opts.null_sink_min_ec_size as usize,
+                            pool,
+                        )
+                    } else {
+                        em_with_sink_par_with_pool_init(
+                            &eminfo,
+                            init.as_deref(),
+                            opts.null_sink_strength,
+                            opts.null_sink_min_ec_size as usize,
+                            pool,
+                        )
+                    }
+                } else if opts.null_sink_em && inner_threads > 1 {
+                    if opts.phase2_squarem {
+                        squarem_em_with_sink_par_init(
+                            &eminfo,
+                            init.as_deref(),
+                            opts.null_sink_strength,
+                            opts.null_sink_min_ec_size as usize,
+                            inner_threads,
+                        )
+                    } else {
+                        em_with_sink_par_init(
+                            &eminfo,
+                            init.as_deref(),
+                            opts.null_sink_strength,
+                            opts.null_sink_min_ec_size as usize,
+                            inner_threads,
+                        )
+                    }
+                } else if opts.null_sink_em {
+                    if opts.phase2_squarem {
+                        squarem_em_with_sink_init(
+                            &eminfo,
+                            init.as_deref(),
+                            opts.null_sink_strength,
+                            opts.null_sink_min_ec_size as usize,
+                        )
+                    } else {
+                        em_with_sink_init(
+                            &eminfo,
+                            init.as_deref(),
+                            opts.null_sink_strength,
+                            opts.null_sink_min_ec_size as usize,
+                        )
+                    }
+                } else if let Some(pool) = serial_inner_pool.as_ref() {
+                    if opts.phase2_squarem {
+                        squarem_em_par_with_pool_init(&eminfo, init.as_deref(), pool)
+                    } else {
+                        em_par_with_pool_init(&eminfo, init.as_deref(), pool)
+                    }
+                } else if inner_threads > 1 {
+                    if opts.phase2_squarem {
+                        squarem_em_par_init(&eminfo, init.as_deref(), inner_threads)
+                    } else {
+                        em_par_init(&eminfo, init.as_deref(), inner_threads)
+                    }
+                } else {
+                    if opts.phase2_squarem {
+                        squarem_em_init(&eminfo, init.as_deref())
+                    } else {
+                        em_init(&eminfo, init.as_deref())
+                    }
+                }
+            };
+            results.push((i, em_res));
+        }
+        results
+    };
+
+    for (i, em_res) in phase2_results {
+        let sample = &samples[i];
+        create_dir_all(&sample.output_dir)?;
+        let output_stem = sample.output_dir.join(&sample.sample_name);
+        let quant_output = output_stem.with_additional_extension(".quant");
+
+        io::write_results(
+            &quant_output,
+            &bundles[i].ref_names,
+            &em_res,
+            &bundles[i].ref_lengths,
+            &bundles[i].eff_lengths, // original eff_lens for reporting
+        )
+        .with_context(|| {
+            format!(
+                "failed to write quant output for {}",
+                sample.sample_name
+            )
+        })?;
+
+        // Write per-sample meta_info
+        let meta_info_output = output_stem.with_additional_extension(".meta_info.json");
+        let ofile = File::create(&meta_info_output)?;
+        let mut meta_info = json!({
+            "inferred_lib_type": format!("{:?}", bundles[i].lib_type),
+            "infrep_method": "none",
+            "mapped_frag_stats": {
+                "num_mapped_reads": bundles[i].frag_stats.num_mapped_reads,
+                "tot_mappings": bundles[i].frag_stats.tot_mappings,
+            },
+            "num_targets": n_targets,
+            "num_consensus_targets": n_consensus,
+            "consensus_min_k": min_k,
+            "consensus_min_fraction": min_fraction,
+            "filter_mode": format!("{}", filter_label),
+            "piscem_infer_version": env!("CARGO_PKG_VERSION"),
+        });
+        if let Some((kept, removed)) = selection_stats {
+            meta_info["structural_selection"] = json!({
+                "enabled": true,
+                "num_kept": kept,
+                "num_removed": removed,
+            });
+        }
+        serde_json::to_writer_pretty(ofile, &meta_info)?;
+    }
+
+    info!("Done. Wrote output for {} samples.", n_samples);
+    Ok(())
+}
+
+/// Entry point for consensus-quant subcommand.
+pub fn run(opts: &ConsensusQuantOpts) -> Result<()> {
+    let samples = parse_manifest(&opts.manifest)?;
+    info!(
+        "Parsed manifest with {} samples",
+        samples.len()
+    );
+
+    if samples.is_empty() {
+        anyhow::bail!("Consensus filtering requires at least 1 sample");
+    }
+
+    // Dispatch based on EQ class type
+    if opts.factorized_eqc_bins > 1 {
+        run_dispatch::<crate::utils::eq_maps::RangeFactorizedEqLabel>(opts, &samples)
+    } else {
+        run_dispatch::<crate::utils::eq_maps::BasicEqLabel>(opts, &samples)
+    }
+}

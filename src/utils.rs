@@ -2,6 +2,7 @@ pub mod em;
 pub mod eq_maps;
 pub mod eq_serialize;
 pub mod gibbs;
+pub mod group_lasso;
 pub mod hierarchical;
 pub mod io;
 pub mod map_record_types;

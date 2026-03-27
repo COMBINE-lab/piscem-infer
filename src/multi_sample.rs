@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use path_tools::WithAdditionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::process_rad::{RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::MultiQuantOpts;
@@ -18,6 +18,7 @@ use crate::utils::eq_maps::{
 use crate::utils::eq_serialize::{
     EqMapTypeTag, SampleMeta, deserialize_eq_map, serialize_eq_map,
 };
+use crate::utils::group_lasso;
 use crate::utils::hierarchical;
 use crate::utils::io;
 
@@ -209,6 +210,7 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                         eq_map_type: EqMapTypeTag::Basic,
                         num_bins: 1,
                         contains_ori: bundle.packed_eq_map.contains_ori,
+                        piscem_infer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     };
                     serialize_eq_map(&bundle.packed_eq_map, &meta, &sample.output_dir)?;
                     info!(
@@ -233,6 +235,7 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                         eq_map_type: EqMapTypeTag::RangeFactorized,
                         num_bins: opts.factorized_eqc_bins,
                         contains_ori: bundle.packed_eq_map.contains_ori,
+                        piscem_infer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     };
                     serialize_eq_map(&bundle.packed_eq_map, &meta, &sample.output_dir)?;
                     info!(
@@ -283,6 +286,31 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
             num_targets
         );
 
+        // Validate EQ map version matches the running binary.
+        // Stale Phase A output (from a different code version) can produce
+        // silently wrong results due to changes in EQ class construction.
+        let current_version = env!("CARGO_PKG_VERSION");
+        for (i, meta) in all_meta.iter().enumerate() {
+            match &meta.piscem_infer_version {
+                Some(v) if v != current_version => {
+                    warn!(
+                        "Version mismatch for sample '{}': EQ map was built with v{} but \
+                         running binary is v{}. Re-run without --phase-b-only to regenerate.",
+                        samples[i].sample_name, v, current_version
+                    );
+                }
+                None => {
+                    warn!(
+                        "No version tag in EQ map metadata for sample '{}'. \
+                         This may be stale Phase A output. Re-run without --phase-b-only \
+                         to regenerate with version-tagged metadata.",
+                        samples[i].sample_name
+                    );
+                }
+                _ => {}
+            }
+        }
+
         // Validate EQ map type consistency across samples
         let eq_map_type_tag = all_meta[0].eq_map_type;
         for (i, meta) in all_meta.iter().enumerate().skip(1) {
@@ -304,7 +332,11 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                     .into_iter()
                     .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
                     .collect();
-                run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                if opts.group_lasso {
+                    run_phase_b_group_lasso(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                } else {
+                    run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                }
             }
             EqMapTypeTag::RangeFactorized => {
                 // Validate NUM_BINS matches metadata
@@ -322,7 +354,11 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                     .into_iter()
                     .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
                     .collect();
-                run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                if opts.group_lasso {
+                    run_phase_b_group_lasso(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                } else {
+                    run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                }
             }
         }
 
@@ -398,6 +434,9 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
     // Spike-and-slab inclusion probabilities (used in spike-slab mode only).
     let mut gamma: Vec<f64> = vec![1.0; num_targets];
 
+    // Per-transcript adaptive concentration (used with --adaptive-variance).
+    let mut alpha_0_adaptive: Vec<f64> = vec![alpha_0; num_targets];
+
     // Pre-compute condition indices for all samples
     let sample_cond_indices: Vec<usize> = samples
         .iter()
@@ -451,7 +490,14 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
             } else {
                 // Penalized EM with pseudo-counts from hierarchical prior
                 let cond_idx = sample_cond_indices[i];
-                let alpha = if opts.spike_slab {
+                let alpha = if opts.adaptive_variance {
+                    hierarchical::compute_pseudo_counts_adaptive(
+                        &hyperparams,
+                        cond_idx,
+                        &presence_masks[i],
+                        &alpha_0_adaptive,
+                    )
+                } else if opts.spike_slab {
                     hierarchical::compute_pseudo_counts_spike_slab(
                         &hyperparams,
                         cond_idx,
@@ -636,6 +682,50 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
             }
         }
 
+        // Adaptive variance: estimate per-transcript moderated variances from
+        // unpenalized init counts (same "compute once" pattern as spike-and-slab γ).
+        if opts.adaptive_variance && is_init_iter {
+            info!("--- Variance-adaptive shrinkage ---");
+            let (sample_var, df, _mean_log) =
+                hierarchical::compute_log_count_variances(
+                    &prev_counts,
+                    &presence_masks,
+                    num_targets,
+                    1.0,
+                );
+            let (d0, s0_sq) = hierarchical::fit_variance_prior(&sample_var, &df);
+            info!("  Variance prior: d0={:.2}, s0_sq={:.4}", d0, s0_sq);
+
+            let mod_var = hierarchical::compute_moderated_variances(
+                &sample_var, &df, d0, s0_sq, alpha_0, 1.0, 1.0,
+            );
+
+            // Log summary statistics of the adaptive concentration
+            let mut sorted_a: Vec<f64> = mod_var.alpha_0_t.iter()
+                .filter(|a| **a < alpha_0 * 3.99)  // exclude clamped-at-max
+                .copied()
+                .collect();
+            sorted_a.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if !sorted_a.is_empty() {
+                let q25 = sorted_a[sorted_a.len() / 4];
+                let q50 = sorted_a[sorted_a.len() / 2];
+                let q75 = sorted_a[3 * sorted_a.len() / 4];
+                info!(
+                    "  α₀_t quartiles: Q25={:.1}, Q50={:.1}, Q75={:.1} (base={:.1})",
+                    q25, q50, q75, alpha_0
+                );
+            }
+            let n_reduced = mod_var.alpha_0_t.iter()
+                .filter(|&&a| a < alpha_0 * 0.9)
+                .count();
+            info!(
+                "  {} transcripts with ≥10% reduced shrinkage (high cross-sample variance)",
+                n_reduced
+            );
+
+            alpha_0_adaptive = mod_var.alpha_0_t;
+        }
+
         // Don't check convergence on the init iteration
         if !is_init_iter && pi_change < 1e-7 {
             converged_at = Some(outer_iter);
@@ -731,6 +821,181 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
         "convergence_thresh": opts.convergence_thresh,
         "converged": converged_at.is_some(),
         "converged_at_iteration": converged_at,
+        "samples": samples.iter().map(|s| json!({
+            "sample_name": s.sample_name,
+            "condition": s.condition,
+            "output_dir": s.output_dir.to_string_lossy(),
+        })).collect::<Vec<_>>(),
+    });
+    let mf = File::create(&meta_path)?;
+    serde_json::to_writer_pretty(mf, &meta_json)?;
+    info!("Wrote meta info to {}", meta_path.display());
+
+    Ok(())
+}
+
+/// Phase B alternative: group LASSO sparse inference.
+///
+/// Runs per-sample EM for warm-start, then joint FISTA optimization
+/// with group L2 penalty to encourage shared sparsity across samples.
+fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
+    packed_maps: &[PackedEqMap<EqLabelT>],
+    all_meta: &[SampleMeta],
+    samples: &[SampleEntry],
+    opts: &MultiQuantOpts,
+    conditions: &[String],
+    num_targets: usize,
+) -> Result<()> {
+    // Optional transcript variable selection on merged EC graph.
+    let selection_mask: Option<Vec<bool>> = if opts.txp_selection {
+        info!("Running multi-sample transcript variable selection...");
+        use crate::utils::txp_selection;
+        let stages = opts
+            .selection_stages
+            .clone()
+            .unwrap_or_default();
+        let indices: Vec<_> = packed_maps
+            .iter()
+            .map(|m| txp_selection::TranscriptEqIndex::from_packed_eq_map(m, num_targets))
+            .collect();
+        let eqc_counts: Vec<usize> = packed_maps.iter().map(|m| m.len()).collect();
+        let total_eqcs: usize = eqc_counts.iter().sum();
+        let merged_index =
+            txp_selection::merge_transcript_indices(&indices, &eqc_counts, num_targets);
+        let result = txp_selection::run_selection_from_index_with_stages(
+            &merged_index,
+            num_targets,
+            total_eqcs,
+            &stages,
+        );
+        let n_removed = result.keep_mask.iter().filter(|&&b| !b).count();
+        info!("  Selection removed {} / {} transcripts", n_removed, num_targets);
+        Some(result.keep_mask)
+    } else {
+        None
+    };
+
+    let num_samples = samples.len();
+
+    // Step 2: Build group scope
+    let sample_cond_indices: Vec<usize> = samples
+        .iter()
+        .map(|s| condition_index(&s.condition, conditions))
+        .collect();
+
+    let group_scope = if opts.gl_per_condition {
+        group_lasso::GroupScope::PerCondition {
+            condition_indices: sample_cond_indices.clone(),
+            num_conditions: conditions.len(),
+        }
+    } else {
+        group_lasso::GroupScope::AllSamples
+    };
+
+    // Step 3: Determine lambda
+    let lambda = if let Some(lam) = opts.gl_lambda {
+        info!("Using user-specified λ = {:.6e}", lam);
+        lam
+    } else {
+        // Heuristic: lambda = 0.01 * total_weight / num_targets
+        let total_weight: f64 = packed_maps.iter().map(|m| m.total_weight() as f64).sum();
+        let lam = 0.01 * total_weight / num_targets as f64;
+        info!("Auto-selected λ = {:.6e} (heuristic)", lam);
+        lam
+    };
+
+    let scope_label = if opts.gl_per_condition { "per-condition" } else { "all-samples" };
+    info!(
+        "Starting EM with group shrinkage (λ={:.6e}, max_iter={}, scope={})",
+        lambda, opts.gl_max_iter, scope_label,
+    );
+
+    // Step 4: Build effective lengths refs
+    let eff_lens_refs: Vec<&[f64]> = all_meta.iter().map(|m| m.eff_lengths.as_slice()).collect();
+
+    // Step 5: Run EM with group shrinkage
+    let result_theta = group_lasso::em_group_shrinkage(
+        packed_maps,
+        &eff_lens_refs,
+        lambda,
+        &group_scope,
+        opts.gl_max_iter,
+        opts.max_em_iter,
+        opts.gl_convergence_thresh,
+        opts.presence_thresh,
+    );
+
+    // Step 6: Count sparsity results
+    let n_zero_rows = (0..num_targets)
+        .filter(|&t| (0..num_samples).all(|s| result_theta.theta[s][t] == 0.0))
+        .count();
+    let n_active = num_targets - n_zero_rows;
+    info!(
+        "EM group shrinkage complete: {} active transcripts, {} zeroed ({:.1}% sparse)",
+        n_active,
+        n_zero_rows,
+        100.0 * n_zero_rows as f64 / num_targets as f64,
+    );
+
+    // Step 7: Write per-sample output
+    info!("Writing per-sample quantification results...");
+    for (s, sample) in samples.iter().enumerate() {
+        // Apply selection mask on top of group shrinkage result
+        let e_counts: Vec<f64> = result_theta.theta[s]
+            .iter()
+            .enumerate()
+            .map(|(t, &c)| {
+                let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
+                if structural_ok { c } else { 0.0 }
+            })
+            .collect();
+
+        create_dir_all(&sample.output_dir)
+            .with_context(|| format!("Failed to create output dir: {}", sample.output_dir.display()))?;
+
+        let quant_path = sample
+            .output_dir
+            .join(&sample.sample_name)
+            .with_additional_extension(".quant");
+        io::write_results(
+            &quant_path,
+            &all_meta[s].ref_names,
+            &e_counts,
+            &all_meta[s].ref_lengths,
+            &all_meta[s].eff_lengths,
+        )
+        .with_context(|| format!("Failed to write quant for '{}'", sample.sample_name))?;
+
+        info!("  Wrote {}", quant_path.display());
+    }
+
+    // Step 8: Write group LASSO metadata
+    create_dir_all(&opts.output)?;
+
+    let gl_path = opts.output.join("group_lasso_params.json");
+    let gl_json = json!({
+        "lambda": lambda,
+        "max_iter": opts.gl_max_iter,
+        "convergence_thresh": opts.gl_convergence_thresh,
+        "group_scope": if opts.gl_per_condition { "per_condition" } else { "all_samples" },
+        "num_targets": num_targets,
+        "num_active": n_active,
+        "num_zeroed": n_zero_rows,
+        "sparsity_fraction": n_zero_rows as f64 / num_targets as f64,
+    });
+    let gf = File::create(&gl_path)?;
+    serde_json::to_writer_pretty(gf, &gl_json)?;
+    info!("Wrote group LASSO params to {}", gl_path.display());
+
+    let meta_path = opts.output.join("meta_info.json");
+    let meta_json = json!({
+        "mode": "em_group_shrinkage",
+        "num_samples": samples.len(),
+        "num_conditions": conditions.len(),
+        "condition_names": conditions,
+        "num_targets": num_targets,
+        "lambda": lambda,
+        "group_scope": if opts.gl_per_condition { "per_condition" } else { "all_samples" },
         "samples": samples.iter().map(|s| json!({
             "sample_name": s.sample_name,
             "condition": s.condition,
@@ -963,6 +1228,7 @@ mod tests {
                     eq_map_type: EqMapTypeTag::Basic,
                     num_bins: 1,
                     contains_ori: false,
+                    piscem_infer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 };
 
                 serialize_eq_map(&packed, &meta, &sample_dir).unwrap();
@@ -1004,8 +1270,14 @@ mod tests {
             prior_weight: 0.25,
             consensus_thresh: 0.67,
             spike_slab: false,
+            adaptive_variance: false,
             txp_selection: false,
             selection_stages: None,
+            group_lasso: false,
+            gl_lambda: None,
+            gl_max_iter: 500,
+            gl_convergence_thresh: 1e-6,
+            gl_per_condition: false,
         };
 
         run(&opts).expect("Phase B should succeed");

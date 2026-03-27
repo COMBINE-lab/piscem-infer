@@ -30,12 +30,6 @@ pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq + Sync {
     type LabelRefT<'a>: TargetLabelsRef;
     fn new(labels: &[u32], probs: Option<&[f64]>) -> Self;
     fn new_ref(labels: &[u32], has_ori: bool) -> Self::LabelRefT<'_>;
-
-    /// Normalize a packed key (as returned by `extract_key_for_packed_map`)
-    /// into a canonical form by sorting target IDs and permuting any associated
-    /// data (e.g. probability bin IDs) accordingly. This ensures that EQ classes
-    /// with the same target set but different orderings are merged correctly.
-    fn normalize_packed_key(key: &mut [u32]);
 }
 
 /// This trait ensures that we can get a list of the labels of this equivalence class
@@ -82,11 +76,6 @@ impl EqLabel for BasicEqLabel {
         Self {
             targets: targets.into(),
         }
-    }
-
-    /// For basic labels, the packed key is just target IDs — sort them.
-    fn normalize_packed_key(key: &mut [u32]) {
-        key.sort_unstable();
     }
 }
 
@@ -205,22 +194,6 @@ impl EqLabel for RangeFactorizedEqLabel {
         // add back the encoding of the orientations if we have them
         targets_and_bins.extend_from_slice(oris);
         Self { targets_and_bins }
-    }
-
-    /// For RF labels, the packed key is [targets, bins]. Sort target IDs
-    /// and permute bin IDs to maintain the target-bin correspondence.
-    fn normalize_packed_key(key: &mut [u32]) {
-        let n = key.len() / 2;
-        if n <= 1 {
-            return;
-        }
-        // Build (target, bin) pairs, sort by target ID, then write back
-        let mut pairs: Vec<(u32, u32)> = (0..n).map(|i| (key[i], key[n + i])).collect();
-        pairs.sort_unstable_by_key(|&(t, _)| t);
-        for (i, (t, b)) in pairs.into_iter().enumerate() {
-            key[i] = t;
-            key[n + i] = b;
-        }
     }
 }
 
@@ -365,22 +338,13 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
     }
 
     pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
-        // Normalize packed keys (sort targets, permute associated data)
-        // and merge entries that map to the same canonical key.
-        let mut merged: AHashMap<Vec<u32>, usize> = AHashMap::new();
-        for (eq_lab, count) in eqm.full_key_iter() {
-            let mut key = eq_lab.to_vec();
-            EqLabelT::normalize_packed_key(&mut key);
-            *merged.entry(key).or_insert(0) += *count;
-        }
-
-        let mut eq_labels = Vec::<u32>::with_capacity(merged.len() * 5);
-        let mut counts = Vec::<usize>::with_capacity(merged.len());
-        let mut eq_label_starts = Vec::<u32>::with_capacity(merged.len() + 1);
+        let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
+        let mut counts = Vec::<usize>::with_capacity(eqm.len());
+        let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
 
         eq_label_starts.push(0);
-        for (key, count) in &merged {
-            eq_labels.extend_from_slice(key);
+        for (eq_lab, count) in eqm.full_key_iter() {
+            eq_labels.extend_from_slice(eq_lab);
             eq_label_starts.push(eq_labels.len() as u32);
             counts.push(*count);
         }

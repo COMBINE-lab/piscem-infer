@@ -29,6 +29,10 @@ pub struct SampleMeta {
     pub eq_map_type: EqMapTypeTag,
     pub num_bins: u32,
     pub contains_ori: bool,
+    /// Version of piscem-infer that produced this EQ map.
+    /// Used to detect stale Phase A output when code changes affect EQ class structure.
+    #[serde(default)]
+    pub piscem_infer_version: Option<String>,
 }
 
 /// Tag to distinguish equivalence class map types during deserialization.
@@ -233,6 +237,7 @@ mod tests {
             eq_map_type: EqMapTypeTag::Basic,
             num_bins: 1,
             contains_ori: false,
+            piscem_infer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
 
         let tmp_dir = TempDir::new().unwrap();
@@ -283,6 +288,7 @@ mod tests {
             eq_map_type: EqMapTypeTag::Basic,
             num_bins: 1,
             contains_ori: false,
+            piscem_infer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
 
         let tmp_dir = TempDir::new().unwrap();

@@ -124,44 +124,6 @@ fn m_step_par<EqLabelT: EqLabel>(
 }
 
 #[inline]
-fn m_step_with_sink_par<EqLabelT: EqLabel>(
-    eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
-    prev_count: &mut [AtomicF64],
-    inv_eff_lens: &[f64],
-    curr_counts: &mut [AtomicF64],
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-) {
-    eq_iterates.par_iter().for_each_with(
-        (&curr_counts, Vec::with_capacity(64)),
-        |(curr_counts, weights), (k, v)| {
-            let count = **v as f64;
-            let num_targets = k.target_labels().len();
-            weights.clear();
-            let mut denom = 0.0_f64;
-            for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
-                let w = cond_prob
-                    * prev_count[*e as usize].load(Ordering::Relaxed)
-                    * inv_eff_lens[*e as usize];
-                weights.push(w);
-                denom += w;
-            }
-            if denom > 1e-8 {
-                let sink_weight =
-                    sink_strength * sink_ambiguity_factor(num_targets, sink_min_ec_size) * denom;
-                let total = denom + sink_weight;
-                let count_over_total = count / total;
-                for (target_id, w) in k.target_labels().iter().zip(weights.iter()) {
-                    let inc = count_over_total * w;
-                    curr_counts[*target_id as usize].fetch_add(inc, Ordering::AcqRel);
-                }
-            }
-            weights.clear();
-        },
-    );
-}
-
-#[inline]
 fn m_step<EqLabelT: EqLabel>(
     eq_map: &PackedEqMap<EqLabelT>,
     eq_counts: &[usize],
@@ -184,50 +146,6 @@ fn m_step<EqLabelT: EqLabel>(
             let count_over_denom = count / denom;
             for (target_id, w) in k.target_labels().iter().zip(weights.iter()) {
                 curr_counts[*target_id as usize] += count_over_denom * w;
-            }
-        }
-        weights.clear();
-    }
-}
-
-#[inline]
-fn sink_ambiguity_factor(num_targets: usize, min_ec_size: usize) -> f64 {
-    if num_targets < min_ec_size || num_targets <= 1 {
-        0.0
-    } else {
-        1.0 - (1.0 / num_targets as f64)
-    }
-}
-
-#[inline]
-fn m_step_with_sink<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
-    eq_counts: &[usize],
-    prev_count: &[f64],
-    inv_eff_lens: &[f64],
-    curr_counts: &mut [f64],
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-) {
-    let mut weights: Vec<f64> = Vec::with_capacity(64);
-
-    for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
-        let count = *v as f64;
-        let num_targets = k.target_labels().len();
-
-        let mut denom = 0.0_f64;
-        for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
-            let w = cond_prob * prev_count[*e as usize] * inv_eff_lens[*e as usize];
-            weights.push(w);
-            denom += w;
-        }
-        if denom > 1e-8 {
-            let sink_weight =
-                sink_strength * sink_ambiguity_factor(num_targets, sink_min_ec_size) * denom;
-            let total = denom + sink_weight;
-            let count_over_total = count / total;
-            for (target_id, w) in k.target_labels().iter().zip(weights.iter()) {
-                curr_counts[*target_id as usize] += count_over_total * w;
             }
         }
         weights.clear();
@@ -262,16 +180,6 @@ impl Default for SquaremOptions {
     }
 }
 
-#[inline]
-fn sink_squarem_options() -> SquaremOptions {
-    SquaremOptions {
-        min_step: 1e-3,
-        max_step: 2.0,
-        burn_in_steps: 50,
-        acceleration_interval: 8,
-    }
-}
-
 fn initial_counts(eff_lens: &[f64], total_weight: f64, init_counts: Option<&[f64]>) -> Vec<f64> {
     if let Some(init) = init_counts {
         let counts = init
@@ -284,8 +192,17 @@ fn initial_counts(eff_lens: &[f64], total_weight: f64, init_counts: Option<&[f64
         }
     }
 
-    let avg = total_weight / (eff_lens.len() as f64);
-    vec![avg; eff_lens.len()]
+    // Uniform over active transcripts (eff_len > 0); zero for masked ones.
+    let n_active = eff_lens.iter().filter(|&&el| el > 0.0).count() as f64;
+    if n_active > 0.0 {
+        let avg = total_weight / n_active;
+        eff_lens
+            .iter()
+            .map(|&el| if el > 0.0 { avg } else { 0.0 })
+            .collect()
+    } else {
+        vec![0.0; eff_lens.len()]
+    }
 }
 
 #[inline]
@@ -301,14 +218,34 @@ fn compute_inv_eff_lens(eff_lens: &[f64]) -> Vec<f64> {
 
 #[inline]
 fn compute_rel_diff(prev_counts: &[f64], curr_counts: &[f64], presence_thresh: f64) -> f64 {
-    let mut rel_diff = 0.0_f64;
+    let mut sum_abs_rel = 0.0_f64;
+    let mut n = 0_u64;
     for (&prev, &curr) in prev_counts.iter().zip(curr_counts.iter()) {
         if prev > presence_thresh {
-            let rd = (curr - prev) / prev;
-            rel_diff = if rel_diff > rd { rel_diff } else { rd };
+            sum_abs_rel += ((curr - prev) / prev).abs();
+            n += 1;
         }
     }
-    rel_diff
+    if n > 0 { sum_abs_rel / n as f64 } else { 0.0 }
+}
+
+#[inline]
+fn compute_rel_diff_atomic(
+    prev_counts: &[AtomicF64],
+    curr_counts: &[AtomicF64],
+    presence_thresh: f64,
+) -> f64 {
+    let mut sum_abs_rel = 0.0_f64;
+    let mut n = 0_u64;
+    for (prev, curr) in prev_counts.iter().zip(curr_counts.iter()) {
+        let p = prev.load(Ordering::Relaxed);
+        let c = curr.load(Ordering::Relaxed);
+        if p > presence_thresh {
+            sum_abs_rel += ((c - p) / p).abs();
+            n += 1;
+        }
+    }
+    if n > 0 { sum_abs_rel / n as f64 } else { 0.0 }
 }
 
 #[inline]
@@ -361,27 +298,6 @@ fn em_step_plain<EqLabelT: EqLabel>(
 }
 
 #[inline]
-fn em_step_with_sink<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
-    inv_eff_lens: &[f64],
-    prev_counts: &[f64],
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    out: &mut [f64],
-) {
-    out.fill(0.0);
-    m_step_with_sink(
-        eq_map,
-        &eq_map.counts,
-        prev_counts,
-        inv_eff_lens,
-        out,
-        sink_strength,
-        sink_min_ec_size,
-    );
-}
-
-#[inline]
 fn m_step_par_from_slice<EqLabelT: EqLabel>(
     eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
     prev_count: &[f64],
@@ -412,42 +328,6 @@ fn m_step_par_from_slice<EqLabelT: EqLabel>(
 }
 
 #[inline]
-fn m_step_with_sink_par_from_slice<EqLabelT: EqLabel>(
-    eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
-    prev_count: &[f64],
-    inv_eff_lens: &[f64],
-    curr_counts: &mut [AtomicF64],
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-) {
-    eq_iterates.par_iter().for_each_with(
-        (&curr_counts, Vec::with_capacity(64)),
-        |(curr_counts, weights), (k, v)| {
-            let count = **v as f64;
-            let num_targets = k.target_labels().len();
-            weights.clear();
-            let mut denom = 0.0_f64;
-            for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
-                let w = cond_prob * prev_count[*e as usize] * inv_eff_lens[*e as usize];
-                weights.push(w);
-                denom += w;
-            }
-            if denom > 1e-8 {
-                let sink_weight =
-                    sink_strength * sink_ambiguity_factor(num_targets, sink_min_ec_size) * denom;
-                let total = denom + sink_weight;
-                let count_over_total = count / total;
-                for (target_id, w) in k.target_labels().iter().zip(weights.iter()) {
-                    let inc = count_over_total * w;
-                    curr_counts[*target_id as usize].fetch_add(inc, Ordering::AcqRel);
-                }
-            }
-            weights.clear();
-        },
-    );
-}
-
-#[inline]
 fn em_step_plain_par_in_pool<EqLabelT: EqLabel>(
     eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
     inv_eff_lens: &[f64],
@@ -460,35 +340,6 @@ fn em_step_plain_par_in_pool<EqLabelT: EqLabel>(
             .par_iter()
             .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
         m_step_par_from_slice::<EqLabelT>(eq_iterates, prev_counts, inv_eff_lens, curr_counts);
-    });
-    curr_counts
-        .iter()
-        .map(|x| x.load(Ordering::Relaxed))
-        .collect::<Vec<f64>>()
-}
-
-#[inline]
-fn em_step_with_sink_par_in_pool<EqLabelT: EqLabel>(
-    eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
-    inv_eff_lens: &[f64],
-    prev_counts: &[f64],
-    curr_counts: &mut [AtomicF64],
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    pool: &ThreadPool,
-) -> Vec<f64> {
-    install_in_pool(Some(pool), || {
-        curr_counts
-            .par_iter()
-            .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
-        m_step_with_sink_par_from_slice::<EqLabelT>(
-            eq_iterates,
-            prev_counts,
-            inv_eff_lens,
-            curr_counts,
-            sink_strength,
-            sink_min_ec_size,
-        );
     });
     curr_counts
         .iter()
@@ -566,12 +417,7 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                         &mut curr_counts,
                     );
 
-                    for i in 0..curr_counts.len() {
-                        if prev_counts[i] > presence_thresh {
-                            let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
-                            rel_diff = if rel_diff > rd { rel_diff } else { rd };
-                        }
-                    }
+                    rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
 
                     std::mem::swap(&mut prev_counts, &mut curr_counts);
                     curr_counts.fill(0.0_f64);
@@ -580,7 +426,6 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                         break;
                     }
                     niter += 1;
-                    rel_diff = 0.0_f64;
                 }
 
                 prev_counts.iter_mut().for_each(|x| {
@@ -666,14 +511,7 @@ pub fn em_par_with_pool_init<EqLabelT: EqLabel>(
                 &mut curr_counts,
             );
 
-            for i in 0..curr_counts.len() {
-                let pci = prev_counts[i].load(Ordering::Relaxed);
-                if pci > presence_thresh {
-                    let cci = curr_counts[i].load(Ordering::Relaxed);
-                    let rd = (cci - pci) / pci;
-                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
-                }
-            }
+            rel_diff = compute_rel_diff_atomic(&prev_counts, &curr_counts, presence_thresh);
             last_rel_diff = rel_diff;
 
             std::mem::swap(&mut prev_counts, &mut curr_counts);
@@ -688,7 +526,6 @@ pub fn em_par_with_pool_init<EqLabelT: EqLabel>(
             if niter.is_multiple_of(100) {
                 info!("iteration {}; rel diff {:.3}", niter, rel_diff);
             }
-            rel_diff = 0.0_f64;
         }
 
         prev_counts.iter_mut().for_each(|x| {
@@ -762,6 +599,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
         em_step_plain(eq_map, &inv_eff_lens, &x1, &mut x2);
         em_steps += 1;
 
+        let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
         let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
             for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
             {
@@ -773,7 +611,10 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
             if em_steps < max_iter {
                 em_step_plain(eq_map, &inv_eff_lens, &x_sq, &mut x_next);
                 em_steps += 1;
-                if x_next.iter().any(|x| x.is_finite() && *x > 0.0) {
+                let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
+                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0)
+                    && candidate_rel < ordinary_rel
+                {
                     accel_accepts += 1;
                     &x_next
                 } else {
@@ -819,18 +660,6 @@ pub fn squarem_em_par_with_pool<EqLabelT: EqLabel>(
     pool: &ThreadPool,
 ) -> Vec<f64> {
     squarem_em_par_with_pool_init(em_info, None, pool)
-}
-
-pub fn squarem_em_par_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    nthreads: usize,
-) -> Vec<f64> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(nthreads)
-        .build()
-        .unwrap();
-    squarem_em_par_with_pool_init(em_info, init_counts, &pool)
 }
 
 pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
@@ -890,6 +719,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
         );
         em_steps += 1;
 
+        let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
         let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
             let mut x_sq = vec![0.0f64; eff_lens.len()];
             for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
@@ -908,7 +738,10 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
                     pool,
                 );
                 em_steps += 1;
-                if x_next.iter().any(|x| x.is_finite() && *x > 0.0) {
+                let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
+                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0)
+                    && candidate_rel < ordinary_rel
+                {
                     accel_accepts += 1;
                     x_next
                 } else {
@@ -940,515 +773,6 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
         em_steps, accel_attempts, accel_accepts, last_rel_diff
     );
     final_counts
-}
-
-#[allow(dead_code)]
-pub fn em_with_sink<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-) -> Vec<f64> {
-    em_with_sink_init(em_info, None, sink_strength, sink_min_ec_size)
-}
-
-pub fn em_with_sink_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-) -> Vec<f64> {
-    let converge_thresh = em_info.convergence_thresh;
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-
-    let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
-    let mut curr_counts = vec![0.0f64; eff_lens.len()];
-
-    let mut rel_diff = 0.0_f64;
-    let mut last_rel_diff = f64::INFINITY;
-    let mut niter = 0_u32;
-
-    while niter < max_iter {
-        m_step_with_sink(
-            eq_map,
-            &eq_map.counts,
-            &prev_counts,
-            &inv_eff_lens,
-            &mut curr_counts,
-            sink_strength,
-            sink_min_ec_size,
-        );
-
-        for i in 0..curr_counts.len() {
-            if prev_counts[i] > presence_thresh {
-                let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
-                rel_diff = if rel_diff > rd { rel_diff } else { rd };
-            }
-        }
-        last_rel_diff = rel_diff;
-
-        std::mem::swap(&mut prev_counts, &mut curr_counts);
-        curr_counts.fill(0.0f64);
-
-        if rel_diff < converge_thresh {
-            break;
-        }
-        niter += 1;
-        if niter.is_multiple_of(100) {
-            info!("iteration {}; rel diff {:.3}", niter, rel_diff);
-        }
-        rel_diff = 0.0_f64;
-    }
-
-    prev_counts.iter_mut().for_each(|x| {
-        if *x < presence_thresh {
-            *x = 0.0
-        }
-    });
-    m_step_with_sink(
-        eq_map,
-        &eq_map.counts,
-        &prev_counts,
-        &inv_eff_lens,
-        &mut curr_counts,
-        sink_strength,
-        sink_min_ec_size,
-    );
-
-    curr_counts
-}
-
-#[allow(dead_code)]
-pub fn em_with_sink_par<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    nthreads: usize,
-) -> Vec<f64> {
-    em_with_sink_par_init(em_info, None, sink_strength, sink_min_ec_size, nthreads)
-}
-
-#[allow(dead_code)]
-pub fn em_with_sink_par_with_pool<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    pool: &ThreadPool,
-) -> Vec<f64> {
-    em_with_sink_par_with_pool_init(em_info, None, sink_strength, sink_min_ec_size, pool)
-}
-
-pub fn em_with_sink_par_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    nthreads: usize,
-) -> Vec<f64> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(nthreads)
-        .build()
-        .unwrap();
-    em_with_sink_par_with_pool_init(
-        em_info,
-        init_counts,
-        sink_strength,
-        sink_min_ec_size,
-        &pool,
-    )
-}
-
-pub fn em_with_sink_par_with_pool_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    pool: &ThreadPool,
-) -> Vec<f64> {
-    let converge_thresh = em_info.convergence_thresh;
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-
-    let init = initial_counts(eff_lens, total_weight, init_counts);
-    let mut prev_counts: Vec<AtomicF64> = init.iter().map(|x| AtomicF64::new(*x)).collect();
-    let mut curr_counts: Vec<AtomicF64> = vec![0.0f64; eff_lens.len()]
-        .iter()
-        .map(|x| AtomicF64::new(*x))
-        .collect();
-    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
-        eq_map.iter_labels().zip(&eq_map.counts).collect();
-
-    let mut rel_diff = 0.0_f64;
-    let mut last_rel_diff = f64::INFINITY;
-    let mut niter = 0_u32;
-
-    install_in_pool(Some(pool), || {
-        while niter < max_iter {
-            m_step_with_sink_par::<EqLabelT>(
-                &eq_iterates,
-                &mut prev_counts,
-                &inv_eff_lens,
-                &mut curr_counts,
-                sink_strength,
-                sink_min_ec_size,
-            );
-
-            for i in 0..curr_counts.len() {
-                let pci = prev_counts[i].load(Ordering::Relaxed);
-                if pci > presence_thresh {
-                    let cci = curr_counts[i].load(Ordering::Relaxed);
-                    let rd = (cci - pci) / pci;
-                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
-                }
-            }
-
-            std::mem::swap(&mut prev_counts, &mut curr_counts);
-            curr_counts
-                .par_iter()
-                .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
-
-            if rel_diff < converge_thresh {
-                break;
-            }
-            niter += 1;
-            if niter.is_multiple_of(100) {
-                info!("iteration {}; rel diff {:.3}", niter, rel_diff);
-            }
-            rel_diff = 0.0_f64;
-        }
-
-        prev_counts.iter_mut().for_each(|x| {
-            if x.load(Ordering::Relaxed) < presence_thresh {
-                x.store(0.0, Ordering::Relaxed);
-            }
-        });
-        m_step_with_sink_par::<EqLabelT>(
-            &eq_iterates,
-            &mut prev_counts,
-            &inv_eff_lens,
-            &mut curr_counts,
-            sink_strength,
-            sink_min_ec_size,
-        );
-    });
-
-    curr_counts
-        .iter()
-        .map(|x| x.load(Ordering::Relaxed))
-        .collect::<Vec<f64>>()
-}
-
-pub fn squarem_em_with_sink_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-) -> Vec<f64> {
-    let opts = sink_squarem_options();
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-
-    let mut x0 = initial_counts(eff_lens, total_weight, init_counts);
-    project_counts(&mut x0, eff_lens, total_weight);
-
-    let mut x1 = vec![0.0f64; eff_lens.len()];
-    let mut x2 = vec![0.0f64; eff_lens.len()];
-    let mut x_sq = vec![0.0f64; eff_lens.len()];
-    let mut x_next = vec![0.0f64; eff_lens.len()];
-    let mut em_steps = 0_u32;
-    let mut last_rel_diff = f64::INFINITY;
-    let mut accel_attempts = 0_u32;
-    let mut accel_accepts = 0_u32;
-
-    while em_steps < max_iter {
-        em_step_with_sink(
-            eq_map,
-            &inv_eff_lens,
-            &x0,
-            sink_strength,
-            sink_min_ec_size,
-            &mut x1,
-        );
-        em_steps += 1;
-        let rel1 = compute_rel_diff(&x0, &x1, presence_thresh);
-        last_rel_diff = rel1;
-        if rel1 < em_info.convergence_thresh || em_steps >= max_iter {
-            x0 = x1.clone();
-            break;
-        }
-
-        if !should_try_squarem(em_steps, last_rel_diff, opts) || em_steps >= max_iter {
-            if em_steps.is_multiple_of(100) {
-                info!(
-                    "sink squarem phase: em_steps={} rel_diff={:.6} accel_attempts={} accel_accepts={}",
-                    em_steps, last_rel_diff, accel_attempts, accel_accepts
-                );
-            }
-            x0.clone_from_slice(&x1);
-            continue;
-        }
-
-        accel_attempts += 1;
-        em_step_with_sink(
-            eq_map,
-            &inv_eff_lens,
-            &x1,
-            sink_strength,
-            sink_min_ec_size,
-            &mut x2,
-        );
-        em_steps += 1;
-
-        let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
-        let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
-            for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
-            {
-                let r = b - a;
-                let v = c - (2.0 * b) + a;
-                *sq = a - (2.0 * alpha * r) + (alpha * alpha * v);
-            }
-            project_counts(&mut x_sq, eff_lens, total_weight);
-            if em_steps < max_iter {
-                em_step_with_sink(
-                    eq_map,
-                    &inv_eff_lens,
-                    &x_sq,
-                    sink_strength,
-                    sink_min_ec_size,
-                    &mut x_next,
-                );
-                em_steps += 1;
-                let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
-                if x_next.iter().any(|x| x.is_finite() && *x > 0.0) && candidate_rel < ordinary_rel
-                {
-                    accel_accepts += 1;
-                    &x_next
-                } else {
-                    &x2
-                }
-            } else {
-                &x2
-            }
-        } else {
-            &x2
-        };
-
-        let rel_diff = compute_rel_diff(&x0, candidate, presence_thresh);
-        x0.clone_from_slice(candidate);
-        last_rel_diff = rel_diff;
-        if em_steps.is_multiple_of(100) {
-            info!(
-                "sink squarem phase: em_steps={} rel_diff={:.6} accel_attempts={} accel_accepts={}",
-                em_steps, rel_diff, accel_attempts, accel_accepts
-            );
-        }
-        if rel_diff < em_info.convergence_thresh {
-            break;
-        }
-    }
-
-    x0.iter_mut().for_each(|x| {
-        if *x < presence_thresh {
-            *x = 0.0;
-        }
-    });
-    em_step_with_sink(
-        eq_map,
-        &inv_eff_lens,
-        &x0,
-        sink_strength,
-        sink_min_ec_size,
-        &mut x1,
-    );
-    info!(
-        "SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
-        em_steps, accel_attempts, accel_accepts, last_rel_diff
-    );
-    x1
-}
-
-pub fn squarem_em_with_sink_par_with_pool_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    pool: &ThreadPool,
-) -> Vec<f64> {
-    let opts = sink_squarem_options();
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
-        eq_map.iter_labels().zip(&eq_map.counts).collect();
-    let mut curr_counts: Vec<AtomicF64> = vec![0.0f64; eff_lens.len()]
-        .iter()
-        .map(|x| AtomicF64::new(*x))
-        .collect();
-
-    let mut x0 = initial_counts(eff_lens, total_weight, init_counts);
-    project_counts(&mut x0, eff_lens, total_weight);
-    let mut em_steps = 0_u32;
-    let mut last_rel_diff = f64::INFINITY;
-    let mut accel_attempts = 0_u32;
-    let mut accel_accepts = 0_u32;
-
-    while em_steps < max_iter {
-        let x1 = em_step_with_sink_par_in_pool::<EqLabelT>(
-            &eq_iterates,
-            &inv_eff_lens,
-            &x0,
-            &mut curr_counts,
-            sink_strength,
-            sink_min_ec_size,
-            pool,
-        );
-        em_steps += 1;
-        let rel1 = compute_rel_diff(&x0, &x1, presence_thresh);
-        last_rel_diff = rel1;
-        if rel1 < em_info.convergence_thresh || em_steps >= max_iter {
-            x0 = x1;
-            break;
-        }
-
-        if !should_try_squarem(em_steps, last_rel_diff, opts) || em_steps >= max_iter {
-            if em_steps.is_multiple_of(100) {
-                info!(
-                    "sink squarem par phase: em_steps={} rel_diff={:.6} accel_attempts={} accel_accepts={}",
-                    em_steps, last_rel_diff, accel_attempts, accel_accepts
-                );
-            }
-            x0 = x1;
-            continue;
-        }
-
-        accel_attempts += 1;
-        let x2 = em_step_with_sink_par_in_pool::<EqLabelT>(
-            &eq_iterates,
-            &inv_eff_lens,
-            &x1,
-            &mut curr_counts,
-            sink_strength,
-            sink_min_ec_size,
-            pool,
-        );
-        em_steps += 1;
-
-        let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
-        let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
-            let mut x_sq = vec![0.0f64; eff_lens.len()];
-            for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
-            {
-                let r = b - a;
-                let v = c - (2.0 * b) + a;
-                *sq = a - (2.0 * alpha * r) + (alpha * alpha * v);
-            }
-            project_counts(&mut x_sq, eff_lens, total_weight);
-            if em_steps < max_iter {
-                let x_next = em_step_with_sink_par_in_pool::<EqLabelT>(
-                    &eq_iterates,
-                    &inv_eff_lens,
-                    &x_sq,
-                    &mut curr_counts,
-                    sink_strength,
-                    sink_min_ec_size,
-                    pool,
-                );
-                em_steps += 1;
-                let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
-                if x_next.iter().any(|x| x.is_finite() && *x > 0.0) && candidate_rel < ordinary_rel
-                {
-                    accel_accepts += 1;
-                    x_next
-                } else {
-                    x2
-                }
-            } else {
-                x2
-            }
-        } else {
-            x2
-        };
-
-        let rel_diff = compute_rel_diff(&x0, &candidate, presence_thresh);
-        last_rel_diff = rel_diff;
-        if em_steps.is_multiple_of(100) {
-            info!(
-                "sink squarem par phase: em_steps={} rel_diff={:.6} accel_attempts={} accel_accepts={}",
-                em_steps, rel_diff, accel_attempts, accel_accepts
-            );
-        }
-        x0 = candidate;
-        if rel_diff < em_info.convergence_thresh {
-            break;
-        }
-    }
-
-    x0.iter_mut().for_each(|x| {
-        if *x < presence_thresh {
-            *x = 0.0;
-        }
-    });
-    let final_counts = em_step_with_sink_par_in_pool::<EqLabelT>(
-        &eq_iterates,
-        &inv_eff_lens,
-        &x0,
-        &mut curr_counts,
-        sink_strength,
-        sink_min_ec_size,
-        pool,
-    );
-    info!(
-        "SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
-        em_steps, accel_attempts, accel_accepts, last_rel_diff
-    );
-    final_counts
-}
-
-pub fn squarem_em_with_sink_par_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    sink_strength: f64,
-    sink_min_ec_size: usize,
-    nthreads: usize,
-) -> Vec<f64> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(nthreads)
-        .build()
-        .unwrap();
-    squarem_em_with_sink_par_with_pool_init(
-        em_info,
-        init_counts,
-        sink_strength,
-        sink_min_ec_size,
-        &pool,
-    )
 }
 
 /// Run EM with pseudo-count regularization from a hierarchical prior.
@@ -1499,13 +823,7 @@ pub fn em_penalized<EqLabelT: EqLabel>(
             *c += a;
         }
 
-        for i in 0..curr_counts.len() {
-            if prev_counts[i] > presence_thresh {
-                let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
-                rel_diff = if rel_diff > rd { rel_diff } else { rd };
-            }
-        }
-        last_rel_diff = rel_diff;
+        rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
         last_rel_diff = rel_diff;
 
         std::mem::swap(&mut prev_counts, &mut curr_counts);
@@ -1518,7 +836,6 @@ pub fn em_penalized<EqLabelT: EqLabel>(
         if niter.is_multiple_of(100) {
             info!("iteration {}; rel diff {:.3}", niter, rel_diff);
         }
-        rel_diff = 0.0_f64;
     }
 
     prev_counts.iter_mut().for_each(|x| {
@@ -1605,14 +922,7 @@ pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
                 c.fetch_add(a, Ordering::AcqRel);
             }
 
-            for i in 0..curr_counts.len() {
-                let pci = prev_counts[i].load(Ordering::Relaxed);
-                if pci > presence_thresh {
-                    let cci = curr_counts[i].load(Ordering::Relaxed);
-                    let rd = (cci - pci) / pci;
-                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
-                }
-            }
+            rel_diff = compute_rel_diff_atomic(&prev_counts, &curr_counts, presence_thresh);
 
             std::mem::swap(&mut prev_counts, &mut curr_counts);
             curr_counts
@@ -1626,7 +936,6 @@ pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
             if niter.is_multiple_of(100) {
                 info!("iteration {}; rel diff {:.3}", niter, rel_diff);
             }
-            rel_diff = 0.0_f64;
         }
 
         prev_counts.iter_mut().for_each(|x| {
@@ -1691,13 +1000,7 @@ pub fn em_init<EqLabelT: EqLabel>(
             &mut curr_counts,
         );
 
-        //std::mem::swap(&)
-        for i in 0..curr_counts.len() {
-            if prev_counts[i] > presence_thresh {
-                let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
-                rel_diff = if rel_diff > rd { rel_diff } else { rd };
-            }
-        }
+        rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
 
         last_rel_diff = rel_diff;
         std::mem::swap(&mut prev_counts, &mut curr_counts);
@@ -1710,7 +1013,6 @@ pub fn em_init<EqLabelT: EqLabel>(
         if niter.is_multiple_of(100) {
             info!("iteration {}; rel diff {:.3}", niter, rel_diff);
         }
-        rel_diff = 0.0_f64;
     }
 
     prev_counts.iter_mut().for_each(|x| {
@@ -1733,216 +1035,3 @@ pub fn em_init<EqLabelT: EqLabel>(
     curr_counts
 }
 
-/// Run EM with transcript-specific multiplicative shrinkage after each M-step.
-///
-/// Each update applies `curr_counts[t] /= 1 + penalty[t]`, which discourages
-/// weakly supported transcripts without hard-masking them out of the model.
-#[allow(dead_code)]
-pub fn em_adaptive_shrinkage<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    penalty: &[f64],
-) -> Vec<f64> {
-    em_adaptive_shrinkage_init(em_info, None, penalty)
-}
-
-pub fn em_adaptive_shrinkage_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    penalty: &[f64],
-) -> Vec<f64> {
-    let converge_thresh = em_info.convergence_thresh;
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-
-    let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
-    let mut curr_counts = vec![0.0f64; eff_lens.len()];
-
-    let mut rel_diff = 0.0_f64;
-    let mut niter = 0_u32;
-
-    while niter < max_iter {
-        m_step(
-            eq_map,
-            &eq_map.counts,
-            &prev_counts,
-            &inv_eff_lens,
-            &mut curr_counts,
-        );
-
-        for (c, &p) in curr_counts.iter_mut().zip(penalty.iter()) {
-            *c /= 1.0 + p;
-        }
-
-        for i in 0..curr_counts.len() {
-            if prev_counts[i] > presence_thresh {
-                let rd = (curr_counts[i] - prev_counts[i]) / prev_counts[i];
-                rel_diff = if rel_diff > rd { rel_diff } else { rd };
-            }
-        }
-
-        std::mem::swap(&mut prev_counts, &mut curr_counts);
-        curr_counts.fill(0.0_f64);
-
-        if rel_diff < converge_thresh {
-            break;
-        }
-        niter += 1;
-        if niter.is_multiple_of(100) {
-            info!("iteration {}; rel diff {:.3}", niter, rel_diff);
-        }
-        rel_diff = 0.0_f64;
-    }
-
-    prev_counts.iter_mut().for_each(|x| {
-        if *x < presence_thresh {
-            *x = 0.0
-        }
-    });
-    m_step(
-        eq_map,
-        &eq_map.counts,
-        &prev_counts,
-        &inv_eff_lens,
-        &mut curr_counts,
-    );
-    for (c, &p) in curr_counts.iter_mut().zip(penalty.iter()) {
-        *c /= 1.0 + p;
-    }
-
-    curr_counts
-}
-
-/// Parallel version of adaptive shrinkage EM.
-#[allow(dead_code)]
-pub fn em_adaptive_shrinkage_par<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    penalty: &[f64],
-    nthreads: usize,
-) -> Vec<f64> {
-    em_adaptive_shrinkage_par_init(em_info, None, penalty, nthreads)
-}
-
-#[allow(dead_code)]
-pub fn em_adaptive_shrinkage_par_with_pool<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    penalty: &[f64],
-    pool: &ThreadPool,
-) -> Vec<f64> {
-    em_adaptive_shrinkage_par_with_pool_init(em_info, None, penalty, pool)
-}
-
-pub fn em_adaptive_shrinkage_par_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    penalty: &[f64],
-    nthreads: usize,
-) -> Vec<f64> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(nthreads)
-        .build()
-        .unwrap();
-    em_adaptive_shrinkage_par_with_pool_init(em_info, init_counts, penalty, &pool)
-}
-
-pub fn em_adaptive_shrinkage_par_with_pool_init<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    penalty: &[f64],
-    pool: &ThreadPool,
-) -> Vec<f64> {
-    let converge_thresh = em_info.convergence_thresh;
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-
-    let init = initial_counts(eff_lens, total_weight, init_counts);
-    let mut prev_counts: Vec<AtomicF64> = init.iter().map(|x| AtomicF64::new(*x)).collect();
-    let mut curr_counts: Vec<AtomicF64> = vec![0.0f64; eff_lens.len()]
-        .iter()
-        .map(|x| AtomicF64::new(*x))
-        .collect();
-    let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
-        eq_map.iter_labels().zip(&eq_map.counts).collect();
-
-    let mut rel_diff = 0.0_f64;
-    let mut niter = 0_u32;
-
-    install_in_pool(Some(pool), || {
-        while niter < max_iter {
-            m_step_par::<EqLabelT>(
-                &eq_iterates,
-                &mut prev_counts,
-                &inv_eff_lens,
-                &mut curr_counts,
-            );
-
-            for (c, &p) in curr_counts.iter().zip(penalty.iter()) {
-                let val = c.load(Ordering::Relaxed) / (1.0 + p);
-                c.store(val, Ordering::Relaxed);
-            }
-
-            for i in 0..curr_counts.len() {
-                let pci = prev_counts[i].load(Ordering::Relaxed);
-                if pci > presence_thresh {
-                    let cci = curr_counts[i].load(Ordering::Relaxed);
-                    let rd = (cci - pci) / pci;
-                    rel_diff = if rel_diff > rd { rel_diff } else { rd };
-                }
-            }
-
-            std::mem::swap(&mut prev_counts, &mut curr_counts);
-            curr_counts
-                .par_iter()
-                .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
-
-            if rel_diff < converge_thresh {
-                break;
-            }
-            niter += 1;
-            if niter.is_multiple_of(100) {
-                info!("iteration {}; rel diff {:.3}", niter, rel_diff);
-            }
-            rel_diff = 0.0_f64;
-        }
-
-        prev_counts.iter_mut().for_each(|x| {
-            if x.load(Ordering::Relaxed) < presence_thresh {
-                x.store(0.0, Ordering::Relaxed);
-            }
-        });
-        m_step_par::<EqLabelT>(
-            &eq_iterates,
-            &mut prev_counts,
-            &inv_eff_lens,
-            &mut curr_counts,
-        );
-        for (c, &p) in curr_counts.iter().zip(penalty.iter()) {
-            let val = c.load(Ordering::Relaxed) / (1.0 + p);
-            c.store(val, Ordering::Relaxed);
-        }
-    });
-
-    curr_counts
-        .iter()
-        .map(|x| x.load(Ordering::Relaxed))
-        .collect::<Vec<f64>>()
-}

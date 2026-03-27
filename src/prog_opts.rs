@@ -20,8 +20,6 @@ pub enum FilterMode {
     Ues,
     /// Effective EC support count: number of ECs contributing non-trivially
     Support,
-    /// Multi-feature empirical score combining TPM, UES, and EC support
-    Score,
 }
 
 impl FromStr for FilterMode {
@@ -31,8 +29,7 @@ impl FromStr for FilterMode {
             "tpm" => Ok(Self::Tpm),
             "ues" => Ok(Self::Ues),
             "support" => Ok(Self::Support),
-            "score" => Ok(Self::Score),
-            other => bail!("unknown filter mode '{}'; expected tpm, ues, support, or score", other),
+            other => bail!("unknown filter mode '{}'; expected tpm, ues, or support", other),
         }
     }
 }
@@ -43,13 +40,12 @@ impl Serialize for FilterMode {
             Self::Tpm => serializer.serialize_str("tpm"),
             Self::Ues => serializer.serialize_str("ues"),
             Self::Support => serializer.serialize_str("support"),
-            Self::Score => serializer.serialize_str("score"),
         }
     }
 }
 
 const PRESENCE_THRESH: f64 = 1e-8;
-const RELDIFF_THRESH: f64 = 1e-3;
+const RELDIFF_THRESH: f64 = 5e-4;
 const MAX_EM_ITER: u32 = 1500;
 
 fn greater_than_0(s: &str) -> std::result::Result<u32, String> {
@@ -112,9 +108,9 @@ pub struct QuantOpts {
     /// presence threshold for EM
     #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
-    /// enable SQUAREM acceleration for the EM solver
+    /// disable SQUAREM acceleration for the EM solver
     #[arg(long, help_heading = "EM Algorithm")]
-    pub squarem: bool,
+    pub no_squarem: bool,
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use to perform initial coarse-grained
     /// estimation of the fragment length distribution. These fragments will have
@@ -312,9 +308,9 @@ pub struct ConsensusQuantOpts {
     /// --convergence-thresh.
     #[arg(long, help_heading = "EM Algorithm")]
     pub phase1_convergence_thresh: Option<f64>,
-    /// enable SQUAREM acceleration for the phase-1 EM solver
+    /// disable SQUAREM acceleration for the phase-1 EM solver
     #[arg(long, help_heading = "EM Algorithm")]
-    pub phase1_squarem: bool,
+    pub no_phase1_squarem: bool,
     /// phase-2 override for the EM iteration cap. If unset, uses --max-iter.
     #[arg(long, help_heading = "EM Algorithm")]
     pub phase2_max_iter: Option<u32>,
@@ -322,9 +318,6 @@ pub struct ConsensusQuantOpts {
     /// --convergence-thresh.
     #[arg(long, help_heading = "EM Algorithm")]
     pub phase2_convergence_thresh: Option<f64>,
-    /// enable SQUAREM acceleration for the phase-2 EM solver
-    #[arg(long, help_heading = "EM Algorithm")]
-    pub phase2_squarem: bool,
 
     // --- Consensus Filter ---
     /// filter mode: how to decide if a transcript is "expressed" in a sample.
@@ -357,71 +350,6 @@ pub struct ConsensusQuantOpts {
     /// a transcript's support. Used by ues and support modes. (default: 0.5)
     #[arg(long, default_value_t = 0.5, help_heading = "Consensus Filter")]
     pub min_support_count: f64,
-    /// weight on log1p(TPM) in score mode
-    #[arg(long, default_value_t = 0.25, help_heading = "Consensus Filter")]
-    pub score_tpm_weight: f64,
-    /// weight on log1p(score_ues_scale * UES) in score mode
-    #[arg(long, default_value_t = 1.5, help_heading = "Consensus Filter")]
-    pub score_ues_weight: f64,
-    /// weight on log1p(EC support) in score mode
-    #[arg(long, default_value_t = 1.0, help_heading = "Consensus Filter")]
-    pub score_support_weight: f64,
-    /// scaling factor applied to UES before log1p in score mode
-    #[arg(long, default_value_t = 1000.0, help_heading = "Consensus Filter")]
-    pub score_ues_scale: f64,
-    /// threshold above which the score-mode empirical selector marks a
-    /// transcript expressed in a sample
-    #[arg(long, default_value_t = 4.0, help_heading = "Consensus Filter")]
-    pub score_threshold: f64,
-    /// use adaptive penalized EM in phase 2 instead of hard masking.
-    /// Transcripts that fail consensus are softly shrunk rather than removed.
-    #[arg(long, help_heading = "Consensus Filter")]
-    pub adaptive_penalized_em: bool,
-    /// base shrinkage strength for adaptive penalized EM
-    #[arg(long, default_value_t = 4.0, help_heading = "Consensus Filter")]
-    pub penalty_strength: f64,
-    /// weight on log1p(mean TPM) when computing penalty relief
-    #[arg(long, default_value_t = 0.25, help_heading = "Consensus Filter")]
-    pub penalty_tpm_weight: f64,
-    /// weight on log1p(penalty_ues_scale * mean UES) when computing penalty relief
-    #[arg(long, default_value_t = 1.5, help_heading = "Consensus Filter")]
-    pub penalty_ues_weight: f64,
-    /// weight on log1p(mean support) when computing penalty relief
-    #[arg(long, default_value_t = 1.0, help_heading = "Consensus Filter")]
-    pub penalty_support_weight: f64,
-    /// scaling factor applied to mean UES before log1p in adaptive penalized EM
-    #[arg(long, default_value_t = 1000.0, help_heading = "Consensus Filter")]
-    pub penalty_ues_scale: f64,
-    /// fraction of non-consensus transcripts with the largest penalties to
-    /// hard-mask before adaptive penalized EM. Remaining non-consensus
-    /// transcripts are softly shrunk.
-    #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]
-    pub penalty_hard_mask_fraction: f64,
-    /// use iterative prune-and-refit EM in phase 2. After each EM pass,
-    /// transcripts are kept if they pass the consensus rule or are rescued by
-    /// strong TPM / UES evidence.
-    #[arg(long, help_heading = "Consensus Filter")]
-    pub iterative_prune_em: bool,
-    /// maximum number of prune/refit rounds when --iterative-prune-em is enabled
-    #[arg(long, default_value_t = 3, help_heading = "Consensus Filter")]
-    pub iterative_prune_rounds: u32,
-    /// rescue TPM threshold for iterative prune/refit
-    #[arg(long, default_value_t = 1.0, help_heading = "Consensus Filter")]
-    pub iterative_rescue_tpm: f64,
-    /// rescue UES threshold for iterative prune/refit
-    #[arg(long, default_value_t = 0.05, help_heading = "Consensus Filter")]
-    pub iterative_rescue_ues: f64,
-    /// enable a null sink in phase 2 so ambiguous ECs can leave a fraction of
-    /// their mass unattributed instead of forcing all mass onto transcripts.
-    #[arg(long, help_heading = "Consensus Filter")]
-    pub null_sink_em: bool,
-    /// base strength of the null sink. For ambiguous ECs, the sink gets weight
-    /// `null_sink_strength * ambiguity_factor * transcript_denom`.
-    #[arg(long, default_value_t = 0.25, help_heading = "Consensus Filter")]
-    pub null_sink_strength: f64,
-    /// minimum EC size required before the null sink is allowed to compete.
-    #[arg(long, default_value_t = 2, help_heading = "Consensus Filter")]
-    pub null_sink_min_ec_size: u32,
     /// disable phase-2 warm starts from the phase-1 abundance estimates.
     #[arg(long, help_heading = "Consensus Filter")]
     pub no_phase2_warm_start: bool,

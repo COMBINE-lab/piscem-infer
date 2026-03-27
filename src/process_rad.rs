@@ -703,7 +703,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         presence_thresh,
     };
 
-    let em_res = if quant_opts.squarem {
+    let em_res = if !quant_opts.no_squarem {
         if let Some(pool) = em_pool.as_ref() {
             squarem_em_par_with_pool(&eminfo, pool)
         } else {

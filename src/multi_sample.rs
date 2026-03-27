@@ -190,6 +190,7 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                 fld_mean: opts.fld_mean,
                 fld_sd: opts.fld_sd,
                 auto_detect_samples: opts.auto_detect_samples,
+                num_threads: 1, // multi-sample: parallelism is across samples
             };
 
             let eqmap_ori = OrientationProperty::OrientationAware;

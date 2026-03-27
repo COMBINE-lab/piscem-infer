@@ -202,6 +202,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync>(
                         fld_mean: opts.fld_mean,
                         fld_sd: opts.fld_sd,
                         auto_detect_samples: opts.auto_detect_samples,
+                        num_threads: 1, // EQ map building is I/O-bound; prefer sample parallelism
                     };
                     let bundle = build_eq_map_from_rad(
                         &rad_opts,
@@ -226,6 +227,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync>(
                 fld_mean: opts.fld_mean,
                 fld_sd: opts.fld_sd,
                 auto_detect_samples: opts.auto_detect_samples,
+                num_threads: inner_threads,
             };
             let bundle = build_eq_map_from_rad(
                 &rad_opts,

@@ -297,6 +297,13 @@ impl<EqLabelT: EqLabel> EqMap<EqLabelT> {
             .and_modify(|counter| *counter += 1)
             .or_insert(1)
     }
+
+    /// Merge another EqMap into this one by summing counts for shared labels.
+    pub fn merge(&mut self, other: EqMap<EqLabelT>) {
+        for (lab, count) in other.count_map {
+            *self.count_map.entry(lab).or_insert(0) += count;
+        }
+    }
 }
 
 pub struct PackedEqMap<EqLabelT> {

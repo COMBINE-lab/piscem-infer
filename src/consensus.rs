@@ -162,7 +162,7 @@ fn phase2_init_counts(init_counts: &[f64], active_mask: &[bool]) -> Vec<f64> {
 }
 
 /// Core implementation generic over EQ label type.
-fn run_dispatch<EqLabelT: EqLabel + Send + Sync>(
+fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     opts: &ConsensusQuantOpts,
     samples: &[SampleEntry],
 ) -> Result<()> {

@@ -65,10 +65,11 @@ pub struct EqMapBundle<EqLabelT: EqLabel> {
     pub lib_type: LibraryType,
 }
 
-use libradicl::rad_types::{self, MappedFragmentOrientation};
+use libradicl::rad_types::{self, MappedFragmentOrientation, TagMap};
 use libradicl::{
     chunk,
     header::RadPrelude,
+    readers::ParallelRadReader,
     record::{PiscemBulkReadRecord, PiscemBulkRecordContext},
 };
 
@@ -365,7 +366,7 @@ pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Resul
 /// Build an equivalence class map from a RAD file, including FLD estimation
 /// and effective length computation. This is the common "Phase A" work shared
 /// between single-sample `quant` and multi-sample `multi-quant`.
-pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send>(
+pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send + 'static>(
     opts: &RadProcessingOpts,
     eqc_map: EqMap<EqLabelT>,
 ) -> anyhow::Result<EqMapBundle<EqLabelT>> {
@@ -553,24 +554,44 @@ pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send>(
         Fld::Parametric(ParametricFLD::new(fl_mean, fl_sd, 65_536_usize))
     };
 
-    let (packed_eq_map, frag_lengths) = process(
-        &mut br,
-        prelude.hdr.num_chunks as usize,
-        &tag_context,
-        lib_type,
-        &mut frag_stats,
-        ref_lengths,
-        eqc_map,
-        fld,
-        opts.num_threads,
-    );
+    // Extract values needed after processing before we potentially move prelude/file_tag_map.
+    let ref_names = prelude.hdr.ref_names.clone();
+    let num_chunks = prelude.hdr.num_chunks as usize;
+    let ref_lengths_owned = ref_lengths.to_vec();
+
+    let n_threads = opts.num_threads.max(1);
+    let (packed_eq_map, frag_lengths) = if n_threads > 1 {
+        process_parallel(
+            br,
+            prelude,
+            file_tag_map,
+            lib_type,
+            &mut frag_stats,
+            &ref_lengths_owned,
+            eqc_map,
+            fld,
+            n_threads,
+        )
+    } else {
+        process(
+            &mut br,
+            num_chunks,
+            &tag_context,
+            lib_type,
+            &mut frag_stats,
+            &ref_lengths_owned,
+            eqc_map,
+            fld,
+            1,
+        )
+    };
 
     let cond_means = if paired_end {
         conditional_means(&frag_lengths)
     } else {
         conditional_means_from_params(fl_mean, fl_sd, 65_536_usize)
     };
-    let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
+    let eff_lengths = adjust_ref_lengths(&ref_lengths_owned, &cond_means);
 
     info!(
         "num mapped reads = {}",
@@ -592,8 +613,8 @@ pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send>(
     Ok(EqMapBundle {
         packed_eq_map,
         eff_lengths,
-        ref_lengths: ref_lengths.to_vec(),
-        ref_names: prelude.hdr.ref_names.clone(),
+        ref_lengths: ref_lengths_owned,
+        ref_names,
         frag_lengths,
         frag_stats,
         ref_sig_json,
@@ -601,7 +622,7 @@ pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send>(
     })
 }
 
-pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send>(
+pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
     quant_opts: QuantOpts,
     eqc_map: EqMap<EqLabelT>,
 ) -> anyhow::Result<()> {
@@ -823,6 +844,172 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send>(
     });
     serde_json::to_writer_pretty(ofile, &meta_info)?;
     Ok(())
+}
+
+/// Parallel EQ map building using libradicl's ParallelRadReader.
+/// The reader thread fills a lock-free ArrayQueue with MetaChunks;
+/// N worker threads pop MetaChunks, iterate their chunks, and build
+/// thread-local EqMaps which are merged at the end.
+#[allow(clippy::too_many_arguments)]
+fn process_parallel<EqLabelT: EqLabel + Send + 'static>(
+    reader: BufReader<File>,
+    prelude: RadPrelude,
+    file_tag_map: TagMap,
+    lib_type: LibraryType,
+    mapped_stats: &mut MappedFragStats,
+    ref_lengths: &[u32],
+    eqmap: EqMap<EqLabelT>,
+    fld_pdf: Fld,
+    num_threads: usize,
+) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
+    let n_workers = num_threads;
+    let contains_ori = eqmap.contains_ori;
+
+    let mut rad_reader =
+        ParallelRadReader::<PiscemBulkReadRecord, BufReader<File>>::from_prelude_and_file_tag_map(
+            reader,
+            prelude,
+            file_tag_map,
+            std::num::NonZeroUsize::new(n_workers).unwrap(),
+        );
+
+    let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(1));
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} Processed {human_pos} reads [{elapsed_precise}]",
+        )
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    pb.enable_steady_tick(Duration::from_secs(1));
+
+    // Clone shared state for workers.
+    let queue = rad_reader.get_queue();
+    let done = rad_reader.is_done();
+
+    // Spawn worker threads before starting chunk parsing (as required by ParallelRadReader).
+    let ref_lengths_arc = std::sync::Arc::new(ref_lengths.to_vec());
+    let fld_arc = std::sync::Arc::new(fld_pdf);
+    let pb_clone = pb.clone();
+
+    let handles: Vec<_> = (0..n_workers)
+        .map(|worker_id| {
+            let q = queue.clone();
+            let rd = done.clone();
+            let rl = ref_lengths_arc.clone();
+            let fld = fld_arc.clone();
+            let pbc = pb_clone.clone();
+            std::thread::spawn(move || {
+                let mut state = WorkerState {
+                    eqmap: EqMap::new(if contains_ori {
+                        OrientationProperty::OrientationAware
+                    } else {
+                        OrientationProperty::OrientationAgnostic
+                    }),
+                    frag_lengths: vec![0u32; 65_536],
+                    stats: MappedFragStats::default(),
+                    unique_frags: 0,
+                };
+
+                // Use the FLD enum to get the concrete FldPDF impl.
+                loop {
+                    while let Some(meta_chunk) = q.pop() {
+                        for chunk in meta_chunk.iter() {
+                            pbc.inc(chunk.nrec as u64);
+                            match fld.as_ref() {
+                                Fld::Empirical(f) => {
+                                    process_chunk(&chunk, lib_type, &rl, f, &mut state)
+                                }
+                                Fld::Parametric(f) => {
+                                    process_chunk(&chunk, lib_type, &rl, f, &mut state)
+                                }
+                            }
+                        }
+                    }
+                    if rd.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Drain any remaining items.
+                        while let Some(meta_chunk) = q.pop() {
+                            for chunk in meta_chunk.iter() {
+                                pbc.inc(chunk.nrec as u64);
+                                match fld.as_ref() {
+                                    Fld::Empirical(f) => {
+                                        process_chunk(&chunk, lib_type, &rl, f, &mut state)
+                                    }
+                                    Fld::Parametric(f) => {
+                                        process_chunk(&chunk, lib_type, &rl, f, &mut state)
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+
+                tracing::debug!("EQ map worker {} finished", worker_id);
+                state
+            })
+        })
+        .collect();
+
+    // Main thread: fill the work queue (blocks until all chunks are enqueued).
+    let _ = rad_reader
+        .start_chunk_parsing(libradicl::readers::EMPTY_METACHUNK_CALLBACK);
+
+    // Collect and merge worker results.
+    let mut merged = EqMap::new(if contains_ori {
+        OrientationProperty::OrientationAware
+    } else {
+        OrientationProperty::OrientationAgnostic
+    });
+    let mut frag_lengths = vec![0u32; 65_536];
+    let mut unique_frags = 0u32;
+
+    for handle in handles {
+        let state = handle.join().unwrap();
+        mapped_stats.tot_mappings += state.stats.tot_mappings;
+        mapped_stats.num_mapped_reads += state.stats.num_mapped_reads;
+        for i in 0..7 {
+            mapped_stats.mapped_ori_count[i] += state.stats.mapped_ori_count[i];
+            mapped_stats.filtered_ori_count[i] += state.stats.filtered_ori_count[i];
+        }
+        for (dst, src) in frag_lengths.iter_mut().zip(state.frag_lengths.iter()) {
+            *dst += src;
+        }
+        unique_frags += state.unique_frags;
+        merged.merge(state.eqmap);
+    }
+
+    pb.finish_with_message(format!(
+        "Done — processed {} reads",
+        HumanCount(mapped_stats.num_mapped_reads as u64)
+    ));
+
+    let count_table_pass = build_ori_table(&mapped_stats.mapped_ori_count);
+    info!(
+        "mapping counts passing filtering\n{}\n",
+        Table::new(count_table_pass)
+            .with(Style::rounded())
+            .to_string()
+    );
+    let count_table_filter = build_ori_table(&mapped_stats.filtered_ori_count);
+    info!(
+        "mapping counts failing filtering\n{}\n",
+        Table::new(count_table_filter)
+            .with(Style::rounded())
+            .to_string()
+    );
+
+    const TARGET_UNIQUE_FRAGS: u32 = 5_000;
+    if unique_frags < TARGET_UNIQUE_FRAGS {
+        warn!(
+            "Only observed {} uniquely-mapped fragments (< threshold of {}), the fragment length distribution estimate may not be robust",
+            unique_frags, TARGET_UNIQUE_FRAGS
+        );
+    }
+
+    let packed_eq_map = PackedEqMap::from_eq_map(&merged);
+    (packed_eq_map, frag_lengths)
 }
 
 #[allow(clippy::too_many_arguments)]

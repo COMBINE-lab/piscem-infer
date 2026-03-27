@@ -3,7 +3,7 @@ pub enum Fld {
     Parametric(ParametricFLD),
 }
 
-pub trait FldPDF {
+pub trait FldPDF: Sync {
     fn pdf(&self, i: usize) -> f64;
     fn cdf(&self, i: usize) -> f64;
     #[allow(dead_code)]

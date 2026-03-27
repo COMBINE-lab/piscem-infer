@@ -10,6 +10,44 @@ use std::str::FromStr;
 use crate::utils::map_record_types::LibraryType;
 use crate::utils::txp_selection::SelectionStages;
 
+/// Filter mode for consensus-quant: how to decide if a transcript is "expressed" in a sample.
+#[derive(Debug, Clone, Default)]
+pub enum FilterMode {
+    /// Simple TPM threshold (default)
+    #[default]
+    Tpm,
+    /// Unique Evidence Score: count-weighted average posterior share per EC
+    Ues,
+    /// Effective EC support count: number of ECs contributing non-trivially
+    Support,
+    /// Multi-feature empirical score combining TPM, UES, and EC support
+    Score,
+}
+
+impl FromStr for FilterMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "tpm" => Ok(Self::Tpm),
+            "ues" => Ok(Self::Ues),
+            "support" => Ok(Self::Support),
+            "score" => Ok(Self::Score),
+            other => bail!("unknown filter mode '{}'; expected tpm, ues, support, or score", other),
+        }
+    }
+}
+
+impl Serialize for FilterMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Tpm => serializer.serialize_str("tpm"),
+            Self::Ues => serializer.serialize_str("ues"),
+            Self::Support => serializer.serialize_str("support"),
+            Self::Score => serializer.serialize_str("score"),
+        }
+    }
+}
+
 const PRESENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 1e-3;
 const MAX_EM_ITER: u32 = 1500;
@@ -74,7 +112,9 @@ pub struct QuantOpts {
     /// presence threshold for EM
     #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
-
+    /// enable SQUAREM acceleration for the EM solver
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub squarem: bool,
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use to perform initial coarse-grained
     /// estimation of the fragment length distribution. These fragments will have
@@ -116,6 +156,11 @@ pub struct QuantOpts {
     /// (only used when --lib-type is set to 'auto')
     #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]
     pub auto_detect_samples: usize,
+    /// optional file listing transcript IDs to keep during inference
+    /// (one transcript ID per line). Transcripts not listed are masked out
+    /// during EM by setting their effective lengths to 0.
+    #[arg(long, help_heading = "Advanced")]
+    pub transcript_mask: Option<PathBuf>,
     /// enable transcript variable selection (removes structurally redundant
     /// transcripts before EM using EC graph analysis)
     #[arg(long, help_heading = "Advanced")]
@@ -170,6 +215,11 @@ pub struct MultiQuantOpts {
     /// Computes soft inclusion probabilities per transcript, updated each iteration.
     #[arg(long, help_heading = "Hierarchical")]
     pub spike_slab: bool,
+    /// use per-transcript variance-adaptive shrinkage (moderated variances).
+    /// Estimates cross-sample variance for each transcript and reduces
+    /// shrinkage for high-variance (potentially DE) transcripts.
+    #[arg(long, help_heading = "Hierarchical")]
+    pub adaptive_variance: bool,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation
@@ -203,6 +253,27 @@ pub struct MultiQuantOpts {
     #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
     pub selection_stages: Option<SelectionStages>,
 
+    // --- Group LASSO ---
+    /// use group LASSO sparse inference instead of hierarchical EM.
+    /// Encourages entire transcript rows to go to zero across all samples
+    /// via a convex L2-norm penalty on the abundance matrix.
+    #[arg(long, conflicts_with_all = ["spike_slab", "prior_weight"], help_heading = "Group LASSO")]
+    pub group_lasso: bool,
+    /// regularization parameter λ for group LASSO penalty.
+    /// If not set, selected automatically via BIC.
+    #[arg(long, requires = "group_lasso", help_heading = "Group LASSO")]
+    pub gl_lambda: Option<f64>,
+    /// max iterations for FISTA proximal gradient descent
+    #[arg(long, default_value_t = 500, requires = "group_lasso", help_heading = "Group LASSO")]
+    pub gl_max_iter: u32,
+    /// convergence threshold for FISTA (relative objective change)
+    #[arg(long, default_value_t = 1e-6, requires = "group_lasso", help_heading = "Group LASSO")]
+    pub gl_convergence_thresh: f64,
+    /// apply group sparsity per-condition instead of across all samples.
+    /// Allows condition-specific transcript expression patterns.
+    #[arg(long, requires = "group_lasso", help_heading = "Group LASSO")]
+    pub gl_per_condition: bool,
+
     // --- Workflow ---
     /// only run Phase A (per-sample EQ class building + serialization)
     #[arg(long, conflicts_with = "phase_b_only", help_heading = "Workflow")]
@@ -210,6 +281,187 @@ pub struct MultiQuantOpts {
     /// only run Phase B (joint hierarchical inference from serialized EQ classes)
     #[arg(long, conflicts_with = "phase_a_only", help_heading = "Workflow")]
     pub phase_b_only: bool,
+}
+
+#[derive(Args, Serialize, Clone, Debug)]
+pub struct ConsensusQuantOpts {
+    // --- Input / Output ---
+    /// path to a manifest file listing samples (CSV, JSON, or YAML).
+    /// Format detected by extension (.csv, .json, .yaml/.yml).
+    /// CSV columns: sample_name, condition, rad_path, output_dir
+    #[arg(short, long, help_heading = "Input / Output")]
+    pub manifest: PathBuf,
+    /// the expected library type (or 'auto' for automatic detection)
+    #[arg(short, long, value_parser = clap::value_parser!(LibTypeArg), help_heading = "Input / Output")]
+    pub lib_type: LibTypeArg,
+
+    // --- EM Algorithm ---
+    /// max iterations to run the EM
+    #[arg(long, default_value_t = MAX_EM_ITER, help_heading = "EM Algorithm")]
+    pub max_iter: u32,
+    /// convergence threshold for EM
+    #[arg(long, default_value_t = RELDIFF_THRESH, help_heading = "EM Algorithm")]
+    pub convergence_thresh: f64,
+    /// presence threshold for EM
+    #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
+    pub presence_thresh: f64,
+    /// phase-1 override for the EM iteration cap. If unset, uses --max-iter.
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub phase1_max_iter: Option<u32>,
+    /// phase-1 override for the EM convergence threshold. If unset, uses
+    /// --convergence-thresh.
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub phase1_convergence_thresh: Option<f64>,
+    /// enable SQUAREM acceleration for the phase-1 EM solver
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub phase1_squarem: bool,
+    /// phase-2 override for the EM iteration cap. If unset, uses --max-iter.
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub phase2_max_iter: Option<u32>,
+    /// phase-2 override for the EM convergence threshold. If unset, uses
+    /// --convergence-thresh.
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub phase2_convergence_thresh: Option<f64>,
+    /// enable SQUAREM acceleration for the phase-2 EM solver
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub phase2_squarem: bool,
+
+    // --- Consensus Filter ---
+    /// filter mode: how to decide if a transcript is "expressed" in a sample.
+    /// tpm = simple TPM threshold; ues = unique evidence score;
+    /// support = effective EC support count
+    #[arg(long, default_value = "tpm", value_parser = clap::value_parser!(FilterMode), help_heading = "Consensus Filter")]
+    pub filter_mode: FilterMode,
+    /// minimum fraction of samples in which a transcript must be expressed
+    /// to pass the consensus filter. Default: (N-1)/N.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub min_fraction: Option<f64>,
+    /// require consensus within any one condition instead of globally across
+    /// all samples. A transcript passes if it is supported in enough
+    /// replicates within at least one condition.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub condition_aware_consensus: bool,
+    /// TPM threshold above which a transcript is considered expressed
+    /// in a given sample. Only used with --filter-mode tpm. (default: 0.0)
+    #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]
+    pub tpm_threshold: f64,
+    /// UES threshold above which a transcript is considered expressed.
+    /// Only used with --filter-mode ues. (default: 0.01)
+    #[arg(long, default_value_t = 0.01, help_heading = "Consensus Filter")]
+    pub ues_threshold: f64,
+    /// minimum number of ECs with non-trivial contribution for a transcript
+    /// to be considered expressed. Only used with --filter-mode support. (default: 2)
+    #[arg(long, default_value_t = 2, help_heading = "Consensus Filter")]
+    pub min_ec_support: u32,
+    /// minimum assigned fragment count from an EC for it to count toward
+    /// a transcript's support. Used by ues and support modes. (default: 0.5)
+    #[arg(long, default_value_t = 0.5, help_heading = "Consensus Filter")]
+    pub min_support_count: f64,
+    /// weight on log1p(TPM) in score mode
+    #[arg(long, default_value_t = 0.25, help_heading = "Consensus Filter")]
+    pub score_tpm_weight: f64,
+    /// weight on log1p(score_ues_scale * UES) in score mode
+    #[arg(long, default_value_t = 1.5, help_heading = "Consensus Filter")]
+    pub score_ues_weight: f64,
+    /// weight on log1p(EC support) in score mode
+    #[arg(long, default_value_t = 1.0, help_heading = "Consensus Filter")]
+    pub score_support_weight: f64,
+    /// scaling factor applied to UES before log1p in score mode
+    #[arg(long, default_value_t = 1000.0, help_heading = "Consensus Filter")]
+    pub score_ues_scale: f64,
+    /// threshold above which the score-mode empirical selector marks a
+    /// transcript expressed in a sample
+    #[arg(long, default_value_t = 4.0, help_heading = "Consensus Filter")]
+    pub score_threshold: f64,
+    /// use adaptive penalized EM in phase 2 instead of hard masking.
+    /// Transcripts that fail consensus are softly shrunk rather than removed.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub adaptive_penalized_em: bool,
+    /// base shrinkage strength for adaptive penalized EM
+    #[arg(long, default_value_t = 4.0, help_heading = "Consensus Filter")]
+    pub penalty_strength: f64,
+    /// weight on log1p(mean TPM) when computing penalty relief
+    #[arg(long, default_value_t = 0.25, help_heading = "Consensus Filter")]
+    pub penalty_tpm_weight: f64,
+    /// weight on log1p(penalty_ues_scale * mean UES) when computing penalty relief
+    #[arg(long, default_value_t = 1.5, help_heading = "Consensus Filter")]
+    pub penalty_ues_weight: f64,
+    /// weight on log1p(mean support) when computing penalty relief
+    #[arg(long, default_value_t = 1.0, help_heading = "Consensus Filter")]
+    pub penalty_support_weight: f64,
+    /// scaling factor applied to mean UES before log1p in adaptive penalized EM
+    #[arg(long, default_value_t = 1000.0, help_heading = "Consensus Filter")]
+    pub penalty_ues_scale: f64,
+    /// fraction of non-consensus transcripts with the largest penalties to
+    /// hard-mask before adaptive penalized EM. Remaining non-consensus
+    /// transcripts are softly shrunk.
+    #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]
+    pub penalty_hard_mask_fraction: f64,
+    /// use iterative prune-and-refit EM in phase 2. After each EM pass,
+    /// transcripts are kept if they pass the consensus rule or are rescued by
+    /// strong TPM / UES evidence.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub iterative_prune_em: bool,
+    /// maximum number of prune/refit rounds when --iterative-prune-em is enabled
+    #[arg(long, default_value_t = 3, help_heading = "Consensus Filter")]
+    pub iterative_prune_rounds: u32,
+    /// rescue TPM threshold for iterative prune/refit
+    #[arg(long, default_value_t = 1.0, help_heading = "Consensus Filter")]
+    pub iterative_rescue_tpm: f64,
+    /// rescue UES threshold for iterative prune/refit
+    #[arg(long, default_value_t = 0.05, help_heading = "Consensus Filter")]
+    pub iterative_rescue_ues: f64,
+    /// enable a null sink in phase 2 so ambiguous ECs can leave a fraction of
+    /// their mass unattributed instead of forcing all mass onto transcripts.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub null_sink_em: bool,
+    /// base strength of the null sink. For ambiguous ECs, the sink gets weight
+    /// `null_sink_strength * ambiguity_factor * transcript_denom`.
+    #[arg(long, default_value_t = 0.25, help_heading = "Consensus Filter")]
+    pub null_sink_strength: f64,
+    /// minimum EC size required before the null sink is allowed to compete.
+    #[arg(long, default_value_t = 2, help_heading = "Consensus Filter")]
+    pub null_sink_min_ec_size: u32,
+    /// disable phase-2 warm starts from the phase-1 abundance estimates.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub no_phase2_warm_start: bool,
+
+    // --- Fragment Length Distribution ---
+    /// number of (unique) mappings to use for fragment length distribution estimation
+    #[arg(long, default_value_t = 500_000_isize, help_heading = "Fragment Length Distribution")]
+    pub param_est_frags: isize,
+    /// mean of fragment length distribution
+    /// (required, and used, only for unpaired fragments)
+    #[arg(long, requires = "fld_sd", help_heading = "Fragment Length Distribution")]
+    pub fld_mean: Option<f64>,
+    /// standard deviation of fragment length distribution
+    /// (required, and used, only for unpaired fragments)
+    #[arg(long, requires = "fld_mean", help_heading = "Fragment Length Distribution")]
+    pub fld_sd: Option<f64>,
+
+    // --- Advanced ---
+    /// number of probability bins for RangeFactorized equivalence classes (1 = basic)
+    #[arg(long, default_value_t = 64_u32, value_parser = greater_than_0, help_heading = "Advanced")]
+    pub factorized_eqc_bins: u32,
+    /// number of threads to use
+    #[arg(long, default_value_t = 16, help_heading = "Advanced")]
+    pub num_threads: usize,
+    /// number of samples to process concurrently in consensus-quant.
+    /// The total thread budget from --num-threads is split across these jobs.
+    #[arg(long, default_value_t = 1, value_parser = greater_than_0, help_heading = "Advanced")]
+    pub sample_parallelism: u32,
+    /// number of mapped reads to sample for automatic library type detection
+    #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]
+    pub auto_detect_samples: usize,
+    /// enable transcript variable selection on the merged EC graph across all
+    /// samples. Removes structurally redundant transcripts before Phase 1 EM
+    /// using signature collapse, unique-EC peeling, and subset dominance.
+    #[arg(long, help_heading = "Advanced")]
+    pub txp_selection: bool,
+    /// which selection stages to run (comma-separated: collapse,peeling,dominance).
+    /// Only used when --txp-selection is enabled. Default: all stages.
+    #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
+    pub selection_stages: Option<SelectionStages>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -220,6 +472,9 @@ pub enum Commands {
     /// hierarchical multi-sample quantification
     #[command(arg_required_else_help = true)]
     MultiQuant(MultiQuantOpts),
+    /// consensus-filtered multi-sample quantification (two-pass EM)
+    #[command(arg_required_else_help = true)]
+    ConsensusQuant(ConsensusQuantOpts),
 }
 
 /// quantify target abundance from bulk-sequencing data

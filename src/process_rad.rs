@@ -10,7 +10,7 @@ use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::Duration;
 use std::{
@@ -20,7 +20,7 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
-use crate::utils::gibbs::do_gibbs;
+use crate::utils::gibbs::{do_gibbs, do_gibbs_with_pool};
 use crate::utils::eq_maps::{
     BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
 };
@@ -35,8 +35,9 @@ use crate::{
 use crate::{
     fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
-        EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
-        em, em_par,
+        EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params,
+        do_bootstrap, do_bootstrap_with_pool, em, em_par_with_pool, squarem_em,
+        squarem_em_par_with_pool,
     },
 };
 
@@ -86,6 +87,22 @@ impl MappedFragStats {
             filtered_ori_count: [0u32; 7],
         }
     }
+}
+
+fn read_transcript_mask(path: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open transcript mask file: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut keep = std::collections::HashSet::new();
+    for line in reader.lines() {
+        let line = line?;
+        let txp = line.trim();
+        if txp.is_empty() || txp.starts_with('#') {
+            continue;
+        }
+        keep.insert(txp.to_string());
+    }
+    Ok(keep)
 }
 
 #[derive(Tabled)]
@@ -239,6 +256,97 @@ fn detect_lib_type_from_sample<T: Read>(
     Ok(detected)
 }
 
+fn detect_lib_type_and_fld_from_sample<T: Read>(
+    br: &mut BufReader<T>,
+    nchunk: usize,
+    record_context: &PiscemBulkRecordContext,
+    paired_end: bool,
+    max_samples: usize,
+    mut param_est_frags: isize,
+) -> anyhow::Result<(LibraryType, Vec<u32>)> {
+    let mut counts = OrientationCounts::default();
+    let mut sampled = 0usize;
+    let requested_samples = param_est_frags;
+    let mut sampled_for_lib_type = false;
+    let mut temp_frag_lengths_by_ori = vec![vec![0u32; 65_536]; 7];
+
+    'sample: for _ in 0..nchunk {
+        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
+        for mappings in &c.reads {
+            if sampled < max_samples {
+                for o in &mappings.dirs {
+                    counts.add(*o);
+                }
+                sampled += 1;
+                if sampled >= max_samples {
+                    sampled_for_lib_type = true;
+                }
+            }
+
+            let ft = rad_types::MappingType::from_u8(mappings.frag_type);
+            let nm = mappings.positions.len();
+            if nm == 1
+                && !ft.is_orphan()
+                && let (Some(o), Some(fl)) =
+                    (mappings.dirs.first(), mappings.frag_lengths.first())
+            {
+                temp_frag_lengths_by_ori[u32::from(*o) as usize][*fl as usize] += 1;
+                param_est_frags -= 1;
+            }
+
+            if sampled_for_lib_type && param_est_frags <= 0 {
+                break 'sample;
+            }
+        }
+    }
+
+    info!(
+        "Auto-detection sampled {} reads: forward={}, reverse={}, FR={}, RF={}, FF={}, RR={}, unknown={}",
+        sampled,
+        counts.forward, counts.reverse,
+        counts.forward_reverse, counts.reverse_forward,
+        counts.forward_forward, counts.reverse_reverse,
+        counts.unknown
+    );
+
+    if sampled == 0 {
+        anyhow::bail!("No mapped reads found in sample for library type auto-detection");
+    }
+
+    let (detected, ratio) = detect_library_type(&counts, paired_end);
+    check_strand_warnings(detected, ratio, paired_end);
+
+    info!(
+        "Auto-detected library type: {} (forward-strand ratio: {:.4})",
+        detected, ratio
+    );
+
+    let mut temp_frag_lengths = vec![0u32; 65_536];
+    for (ori_idx, ori_counts) in temp_frag_lengths_by_ori.into_iter().enumerate() {
+        let ori = MappedFragmentOrientation::from(ori_idx as u32);
+        if detected.is_compatible_with(ori) {
+            for (dst, src) in temp_frag_lengths.iter_mut().zip(ori_counts.into_iter()) {
+                *dst += src;
+            }
+        }
+    }
+
+    if param_est_frags <= 0 {
+        let cmeans = conditional_means(&temp_frag_lengths);
+        info!(
+            "computed conditional means ... last is {}",
+            cmeans.last().expect("present")
+        );
+    } else {
+        let nseen = requested_samples - param_est_frags;
+        warn!(
+            "insufficient uniquely mapped reads from which to estimate the fragment length distribution. {requested_samples} requested but only {nseen} were observed!"
+        );
+    }
+
+    Ok((detected, temp_frag_lengths))
+}
+
 pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Result<()> {
     let eqmap_orientation_status = OrientationProperty::OrientationAware;
     match eq_map_t {
@@ -390,39 +498,51 @@ pub fn build_eq_map_from_rad<EqLabelT: EqLabel>(
 
     let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
 
-    let lib_type: LibraryType = match &opts.lib_type {
+    let mut frag_stats = MappedFragStats::new();
+    let (lib_type, est_frag_lengths): (LibraryType, Option<Vec<u32>>) = match &opts.lib_type {
         LibTypeArg::Explicit(lt) => {
             info!("Using user-specified library type: {}", lt);
-            *lt
+            let est_frag_lengths = if paired_end {
+                let file_offset = br.stream_position()?;
+                let temp_frag_lens = compute_fld_from_sample(
+                    &mut br,
+                    prelude.hdr.num_chunks as usize,
+                    &tag_context,
+                    *lt,
+                    opts.param_est_frags,
+                )?;
+                br.seek(std::io::SeekFrom::Start(file_offset))?;
+                Some(temp_frag_lens)
+            } else {
+                None
+            };
+            (*lt, est_frag_lengths)
         }
         LibTypeArg::Auto => {
             let file_offset = br.stream_position()?;
-            let detected = detect_lib_type_from_sample(
-                &mut br,
-                prelude.hdr.num_chunks as usize,
-                &tag_context,
-                paired_end,
-                opts.auto_detect_samples,
-            )?;
-            br.seek(std::io::SeekFrom::Start(file_offset))?;
-            detected
+            if paired_end {
+                let (detected, temp_frag_lens) = detect_lib_type_and_fld_from_sample(
+                    &mut br,
+                    prelude.hdr.num_chunks as usize,
+                    &tag_context,
+                    paired_end,
+                    opts.auto_detect_samples,
+                    opts.param_est_frags,
+                )?;
+                br.seek(std::io::SeekFrom::Start(file_offset))?;
+                (detected, Some(temp_frag_lens))
+            } else {
+                let detected = detect_lib_type_from_sample(
+                    &mut br,
+                    prelude.hdr.num_chunks as usize,
+                    &tag_context,
+                    paired_end,
+                    opts.auto_detect_samples,
+                )?;
+                br.seek(std::io::SeekFrom::Start(file_offset))?;
+                (detected, None)
+            }
         }
-    };
-
-    let mut frag_stats = MappedFragStats::new();
-    let est_frag_lengths: Option<Vec<u32>> = if paired_end {
-        let file_offset = br.stream_position()?;
-        let temp_frag_lens = compute_fld_from_sample(
-            &mut br,
-            prelude.hdr.num_chunks as usize,
-            &tag_context,
-            lib_type,
-            opts.param_est_frags,
-        )?;
-        br.seek(std::io::SeekFrom::Start(file_offset))?;
-        Some(temp_frag_lens)
-    } else {
-        None
     };
 
     let fld: Fld = if let Some(est_frag_lengths) = est_frag_lengths {
@@ -490,6 +610,15 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let num_gibbs_samples = quant_opts.num_gibbs_samples;
     let gibbs_thinning_factor = quant_opts.gibbs_thinning_factor;
     let num_threads = quant_opts.num_threads;
+    let em_pool = if num_threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()?,
+        )
+    } else {
+        None
+    };
 
     // if there is a parent directory
     if let Some(p) = output.parent()
@@ -510,6 +639,34 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let bundle = build_eq_map_from_rad(&rad_opts, eqc_map)?;
     let frag_lengths = bundle.frag_lengths;
 
+    let transcript_mask = if let Some(mask_path) = quant_opts.transcript_mask.as_deref() {
+        info!("Applying transcript mask from {}", mask_path.display());
+        let keep = read_transcript_mask(mask_path)?;
+        let mask: Vec<bool> = bundle
+            .ref_names
+            .iter()
+            .map(|txp| keep.contains(txp))
+            .collect();
+        let n_kept = mask.iter().filter(|&&b| b).count();
+        let n_missing = keep
+            .iter()
+            .filter(|txp| !bundle.ref_names.iter().any(|name| name == *txp))
+            .count();
+        info!(
+            "Transcript mask keeps {} / {} transcripts{}",
+            n_kept,
+            bundle.ref_names.len(),
+            if n_missing > 0 {
+                format!(", {} IDs not found in reference", n_missing)
+            } else {
+                String::new()
+            }
+        );
+        Some(mask)
+    } else {
+        None
+    };
+
     // Optional transcript variable selection
     let selection_mask = if quant_opts.txp_selection {
         info!("Running transcript variable selection...");
@@ -527,16 +684,33 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         None
     };
 
+    let inference_eff_lens: Vec<f64> = if let Some(ref mask) = transcript_mask {
+        bundle
+            .eff_lengths
+            .iter()
+            .enumerate()
+            .map(|(t, &el)| if mask[t] { el } else { 0.0 })
+            .collect()
+    } else {
+        bundle.eff_lengths.clone()
+    };
+
     let eminfo = EMInfo {
         eq_map: &bundle.packed_eq_map,
-        eff_lens: &bundle.eff_lengths,
+        eff_lens: &inference_eff_lens,
         max_iter,
         convergence_thresh,
         presence_thresh,
     };
 
-    let em_res = if num_threads > 1 {
-        em_par(&eminfo, num_threads)
+    let em_res = if quant_opts.squarem {
+        if let Some(pool) = em_pool.as_ref() {
+            squarem_em_par_with_pool(&eminfo, pool)
+        } else {
+            squarem_em(&eminfo)
+        }
+    } else if let Some(pool) = em_pool.as_ref() {
+        em_par_with_pool(&eminfo, pool)
     } else {
         em(&eminfo)
     };
@@ -573,10 +747,11 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     if num_bootstraps > 0 {
         info!("performing bootstraps");
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global()?;
-        let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
+        let bootstraps = if let Some(pool) = em_pool.as_ref() {
+            do_bootstrap_with_pool(&eminfo, num_bootstraps, pool)
+        } else {
+            do_bootstrap(&eminfo, num_bootstraps)
+        };
 
         let mut new_arrays = vec![];
         let mut bs_fields = vec![];
@@ -595,11 +770,17 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     if num_gibbs_samples > 0 {
         info!("performing Gibbs sampling ({num_gibbs_samples} samples, thinning factor {gibbs_thinning_factor})");
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global()?;
-        let gibbs_samples =
-            do_gibbs(&eminfo, &em_res, num_gibbs_samples, gibbs_thinning_factor);
+        let gibbs_samples = if let Some(pool) = em_pool.as_ref() {
+            do_gibbs_with_pool(
+                &eminfo,
+                &em_res,
+                num_gibbs_samples,
+                gibbs_thinning_factor,
+                pool,
+            )
+        } else {
+            do_gibbs(&eminfo, &em_res, num_gibbs_samples, gibbs_thinning_factor)
+        };
 
         let mut new_arrays = vec![];
         let mut gs_fields = vec![];

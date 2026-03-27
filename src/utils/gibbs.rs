@@ -3,6 +3,7 @@ use rand::rng;
 use rand_distr::weighted::WeightedIndex;
 use rand_distr::Gamma;
 use rayon::prelude::*;
+use rayon::ThreadPool;
 use tracing::info;
 
 use crate::utils::em::EMInfo;
@@ -13,6 +14,26 @@ pub fn do_gibbs<EqLabelT: EqLabel>(
     em_result: &[f64],
     num_samples: usize,
     thinning_factor: usize,
+) -> Vec<Vec<f64>> {
+    do_gibbs_in_pool(em_info, em_result, num_samples, thinning_factor, None)
+}
+
+pub fn do_gibbs_with_pool<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    em_result: &[f64],
+    num_samples: usize,
+    thinning_factor: usize,
+    pool: &ThreadPool,
+) -> Vec<Vec<f64>> {
+    do_gibbs_in_pool(em_info, em_result, num_samples, thinning_factor, Some(pool))
+}
+
+fn do_gibbs_in_pool<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    em_result: &[f64],
+    num_samples: usize,
+    thinning_factor: usize,
+    pool: Option<&ThreadPool>,
 ) -> Vec<Vec<f64>> {
     let eq_map = em_info.eq_map;
     let eff_lens = em_info.eff_lens;
@@ -45,67 +66,127 @@ pub fn do_gibbs<EqLabelT: EqLabel>(
     const MIN_ALPHA: f64 = 1e-8;
 
     // Run chains in parallel, each chain produces samples sequentially
-    let all_samples: Vec<Vec<Vec<f64>>> = (0..num_chains)
-        .into_par_iter()
-        .map(|chain_id| {
-            let my_samples = samples_per_chain + if chain_id < remainder { 1 } else { 0 };
-            if my_samples == 0 {
-                return vec![];
-            }
+    let all_samples: Vec<Vec<Vec<f64>>> = if let Some(pool) = pool {
+        pool.install(|| {
+            (0..num_chains)
+                .into_par_iter()
+                .map(|chain_id| {
+                    let my_samples = samples_per_chain + if chain_id < remainder { 1 } else { 0 };
+                    if my_samples == 0 {
+                        return vec![];
+                    }
 
-            info!("Gibbs chain {} collecting {} samples", chain_id, my_samples);
-            let mut rng = rng();
-            let mut counts: Vec<f64> = em_result.to_vec();
-            let mut mu = vec![0.0_f64; num_targets];
-            let mut weights: Vec<f64> = Vec::with_capacity(64);
-            let mut chain_samples: Vec<Vec<f64>> = Vec::with_capacity(my_samples);
+                    info!("Gibbs chain {} collecting {} samples", chain_id, my_samples);
+                    let mut rng = rng();
+                    let mut counts: Vec<f64> = em_result.to_vec();
+                    let mut mu = vec![0.0_f64; num_targets];
+                    let mut weights: Vec<f64> = Vec::with_capacity(64);
+                    let mut chain_samples: Vec<Vec<f64>> = Vec::with_capacity(my_samples);
 
-            for sample_idx in 0..my_samples {
-                // Run thinning_factor internal Gibbs iterations per collected sample
-                for _ in 0..thinning_factor {
-                    gibbs_iteration(
-                        eq_map,
-                        eff_lens,
-                        &prior,
-                        &mut counts,
-                        &mut mu,
-                        &mut weights,
-                        &mut rng,
-                    );
-                }
+                    for sample_idx in 0..my_samples {
+                        for _ in 0..thinning_factor {
+                            gibbs_iteration(
+                                eq_map,
+                                eff_lens,
+                                &prior,
+                                &mut counts,
+                                &mut mu,
+                                &mut weights,
+                                &mut rng,
+                            );
+                        }
 
-                // Convert Gamma-drawn fractions (mu) to expected count scale
-                // following salmon: output[i] = mu[i] * effLen[i] * totalMapped / sum(mu[j] * effLen[j])
-                let mut sample = vec![0.0_f64; num_targets];
-                let mut denom = 0.0_f64;
-                for i in 0..num_targets {
-                    sample[i] = mu[i] * eff_lens[i];
-                    denom += sample[i];
-                }
-                if denom > 0.0 {
-                    let scale = total_mapped_fragments / denom;
-                    for x in sample.iter_mut() {
-                        *x *= scale;
-                        if *x < MIN_ALPHA {
-                            *x = 0.0;
+                        let mut sample = vec![0.0_f64; num_targets];
+                        let mut denom = 0.0_f64;
+                        for i in 0..num_targets {
+                            sample[i] = mu[i] * eff_lens[i];
+                            denom += sample[i];
+                        }
+                        if denom > 0.0 {
+                            let scale = total_mapped_fragments / denom;
+                            for x in sample.iter_mut() {
+                                *x *= scale;
+                                if *x < MIN_ALPHA {
+                                    *x = 0.0;
+                                }
+                            }
+                        }
+                        chain_samples.push(sample);
+
+                        if (sample_idx + 1) % 50 == 0 {
+                            info!(
+                                "Gibbs chain {}: collected {}/{} samples",
+                                chain_id,
+                                sample_idx + 1,
+                                my_samples
+                            );
                         }
                     }
-                }
-                chain_samples.push(sample);
 
-                if (sample_idx + 1) % 50 == 0 {
-                    info!(
-                        "Gibbs chain {}: collected {}/{} samples",
-                        chain_id,
-                        sample_idx + 1,
-                        my_samples
-                    );
-                }
-            }
-
-            chain_samples
+                    chain_samples
+                })
+                .collect()
         })
-        .collect();
+    } else {
+        (0..num_chains)
+            .into_par_iter()
+            .map(|chain_id| {
+                let my_samples = samples_per_chain + if chain_id < remainder { 1 } else { 0 };
+                if my_samples == 0 {
+                    return vec![];
+                }
+
+                info!("Gibbs chain {} collecting {} samples", chain_id, my_samples);
+                let mut rng = rng();
+                let mut counts: Vec<f64> = em_result.to_vec();
+                let mut mu = vec![0.0_f64; num_targets];
+                let mut weights: Vec<f64> = Vec::with_capacity(64);
+                let mut chain_samples: Vec<Vec<f64>> = Vec::with_capacity(my_samples);
+
+                for sample_idx in 0..my_samples {
+                    for _ in 0..thinning_factor {
+                        gibbs_iteration(
+                            eq_map,
+                            eff_lens,
+                            &prior,
+                            &mut counts,
+                            &mut mu,
+                            &mut weights,
+                            &mut rng,
+                        );
+                    }
+
+                    let mut sample = vec![0.0_f64; num_targets];
+                    let mut denom = 0.0_f64;
+                    for i in 0..num_targets {
+                        sample[i] = mu[i] * eff_lens[i];
+                        denom += sample[i];
+                    }
+                    if denom > 0.0 {
+                        let scale = total_mapped_fragments / denom;
+                        for x in sample.iter_mut() {
+                            *x *= scale;
+                            if *x < MIN_ALPHA {
+                                *x = 0.0;
+                            }
+                        }
+                    }
+                    chain_samples.push(sample);
+
+                    if (sample_idx + 1) % 50 == 0 {
+                        info!(
+                            "Gibbs chain {}: collected {}/{} samples",
+                            chain_id,
+                            sample_idx + 1,
+                            my_samples
+                        );
+                    }
+                }
+
+                chain_samples
+            })
+            .collect()
+    };
 
     // Flatten: collect all chain samples into a single vector
     let total_samples: usize = all_samples.iter().map(|c| c.len()).sum();

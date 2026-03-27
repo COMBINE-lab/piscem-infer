@@ -140,14 +140,16 @@ fn phase2_convergence_thresh(opts: &ConsensusQuantOpts) -> f64 {
 }
 
 fn consensus_thread_split(opts: &ConsensusQuantOpts, n_samples: usize) -> (usize, usize) {
-    let outer_threads = opts
-        .sample_parallelism
-        as usize;
-    let outer_threads = outer_threads
-        .max(1)
-        .min(opts.num_threads.max(1))
-        .min(n_samples.max(1));
-    let inner_threads = (opts.num_threads / outer_threads).max(1);
+    let num_threads = opts.num_threads.max(1);
+    let outer_threads = if opts.sample_parallelism == 0 {
+        // Auto: use up to n_samples concurrent jobs, but keep ≥2 inner threads
+        // for EM parallelism when possible.
+        n_samples.min(num_threads / 2).max(1)
+    } else {
+        (opts.sample_parallelism as usize).max(1)
+    };
+    let outer_threads = outer_threads.min(num_threads).min(n_samples.max(1));
+    let inner_threads = (num_threads / outer_threads).max(1);
     (outer_threads, inner_threads)
 }
 

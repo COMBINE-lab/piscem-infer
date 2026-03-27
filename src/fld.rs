@@ -11,10 +11,7 @@ pub trait FldPDF {
 }
 
 pub struct ParametricFLD {
-    mu: f64,
-    sigma: f64,
-    inv_sigma: f64,
-    inv_denom: f64,
+    probs: Vec<f64>,
     cum_probs: Vec<f64>,
 }
 
@@ -26,28 +23,24 @@ impl ParametricFLD {
         let denom = denom_b - denom_a;
         let inv_denom = 1.0_f64 / denom;
 
-        let cum_probs: Vec<f64> = (0..upper)
-            .scan(0.0, |sum, x| {
-                let px = inv_sigma * (distrs::Normal::pdf(x as f64, mu, sigma) * inv_denom);
+        let probs: Vec<f64> = (0..upper)
+            .map(|x| inv_sigma * (distrs::Normal::pdf(x as f64, mu, sigma) * inv_denom))
+            .collect();
+        let cum_probs: Vec<f64> = probs
+            .iter()
+            .scan(0.0, |sum, &px| {
                 *sum += px;
                 Some(*sum)
             })
             .collect();
 
-        Self {
-            mu,
-            sigma,
-            inv_sigma,
-            inv_denom,
-            cum_probs,
-        }
+        Self { probs, cum_probs }
     }
 }
 
 impl FldPDF for ParametricFLD {
     fn pdf(&self, i: usize) -> f64 {
-        let x = i as f64;
-        self.inv_sigma * (distrs::Normal::pdf(x, self.mu, self.sigma) * self.inv_denom)
+        *self.probs.get(i).unwrap_or(&0.0)
     }
     fn survival(&self, i: usize) -> f64 {
         (1.0 - self.cum_probs.get(i).unwrap_or(&1.0)) + f64::MIN_POSITIVE

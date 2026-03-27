@@ -376,7 +376,8 @@ pub struct ConsensusQuantOpts {
     pub num_threads: usize,
     /// number of samples to process concurrently in consensus-quant.
     /// The total thread budget from --num-threads is split across these jobs.
-    #[arg(long, default_value_t = 1, value_parser = greater_than_0, help_heading = "Advanced")]
+    /// Default (0) auto-selects based on sample count and thread budget.
+    #[arg(long, default_value_t = 0, help_heading = "Advanced")]
     pub sample_parallelism: u32,
     /// number of mapped reads to sample for automatic library type detection
     #[arg(long, default_value_t = 10_000, help_heading = "Advanced")]

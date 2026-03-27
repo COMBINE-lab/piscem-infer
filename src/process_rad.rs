@@ -867,15 +867,6 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     fld_pdf: D,
     mut eqmap: EqMap<EqLabelT>,
 ) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
-    /*
-    let eqmap_orientation_status = if eqmap.contains_ori {
-        OrientationProperty::OrientationAware
-    } else {
-        OrientationProperty::OrientationAgnostic
-    };
-    */
-
-    //let map = &mut eqmap.count_map;
     let mut frag_lengths = vec![0u32; 65_536];
     const TARGET_UNIQUE_FRAGS: u32 = 5_000;
     let mut unique_frags = 0u32;

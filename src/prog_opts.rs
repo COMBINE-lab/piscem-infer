@@ -351,6 +351,11 @@ pub struct ConsensusQuantOpts {
     /// to be considered expressed. Only used with --filter-mode support. (default: 2)
     #[arg(long, default_value_t = 2, help_heading = "Consensus Filter")]
     pub min_ec_support: u32,
+    /// scale the EC support threshold per transcript based on its ambiguity
+    /// (average EC size). Transcripts in highly shared EC neighborhoods require
+    /// more supporting ECs. Threshold = max(min_ec_support, ceil(log2(avg_ec_size))).
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub adaptive_ec_support: bool,
     /// minimum assigned fragment count from an EC for it to count toward
     /// a transcript's support. Used by ues and support modes. (default: 0.5)
     #[arg(long, default_value_t = 0.5, help_heading = "Consensus Filter")]

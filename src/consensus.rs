@@ -30,6 +30,9 @@ struct EvidenceMetrics {
     /// Effective support count: number of distinct ECs contributing ≥ min_count
     /// assigned fragments to this transcript.
     support: Vec<u32>,
+    /// Count-weighted average EC size for this transcript's contributing ECs.
+    /// High values indicate the transcript lives in highly ambiguous EC neighborhoods.
+    mean_ec_size: Vec<f64>,
 }
 
 /// Compute per-transcript UES and effective support count from converged EM counts.
@@ -59,6 +62,9 @@ fn compute_evidence_metrics<EqLabelT: EqLabel>(
     let mut ues_num = vec![0.0f64; n_targets];
     let mut ues_den = vec![0.0f64; n_targets];
     let mut support = vec![0u32; n_targets];
+    // Accumulators for mean EC size: weighted sum of EC sizes and total weight
+    let mut ec_size_sum = vec![0.0f64; n_targets];
+    let mut ec_size_weight = vec![0.0f64; n_targets];
 
     let mut weights: Vec<f64> = Vec::with_capacity(64);
 
@@ -67,6 +73,7 @@ fn compute_evidence_metrics<EqLabelT: EqLabel>(
         if ec_count == 0.0 {
             continue;
         }
+        let ec_size = label.target_labels().len() as f64;
 
         // Compute weights (same as EM M-step)
         let mut denom = 0.0f64;
@@ -79,26 +86,34 @@ fn compute_evidence_metrics<EqLabelT: EqLabel>(
         if denom > 1e-8 {
             for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
                 let t = *tid as usize;
-                let share = w / denom; // posterior share for this transcript in this EC
+                let share = w / denom;
                 let assigned = ec_count * share;
                 ues_num[t] += assigned * share;
                 ues_den[t] += assigned;
                 if assigned >= min_support_count {
                     support[t] += 1;
                 }
+                ec_size_sum[t] += assigned * ec_size;
+                ec_size_weight[t] += assigned;
             }
         }
         weights.clear();
     }
 
-    // Finalize UES
+    // Finalize UES and mean EC size
     let ues: Vec<f64> = ues_num
         .iter()
         .zip(ues_den.iter())
         .map(|(&num, &den)| if den > 0.0 { num / den } else { 0.0 })
         .collect();
 
-    EvidenceMetrics { ues, support }
+    let mean_ec_size: Vec<f64> = ec_size_sum
+        .iter()
+        .zip(ec_size_weight.iter())
+        .map(|(&s, &w)| if w > 0.0 { s / w } else { 0.0 })
+        .collect();
+
+    EvidenceMetrics { ues, support, mean_ec_size }
 }
 
 /// Compute TPM from estimated counts and effective lengths.
@@ -349,6 +364,45 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     // ====== Consensus filter ======
     let filter_mode = &opts.filter_mode;
+    let base_min_ecs = opts.min_ec_support;
+
+    // Compute per-transcript adaptive EC support threshold if requested.
+    let adaptive_thresh: Option<Vec<u32>> = if opts.adaptive_ec_support
+        && matches!(filter_mode, FilterMode::Support)
+    {
+        let mut max_ec_size = vec![0.0f64; n_targets];
+        for (i, counts) in phase1_counts.iter().enumerate() {
+            let metrics = compute_evidence_metrics(
+                &bundles[i].packed_eq_map,
+                counts,
+                &bundles[i].eff_lengths,
+                opts.min_support_count,
+            );
+            for (t, &sz) in metrics.mean_ec_size.iter().enumerate() {
+                if sz > max_ec_size[t] {
+                    max_ec_size[t] = sz;
+                }
+            }
+        }
+        let thresh: Vec<u32> = max_ec_size
+            .iter()
+            .map(|&sz| {
+                if sz > 1.0 {
+                    base_min_ecs.max(sz.log2().ceil() as u32)
+                } else {
+                    base_min_ecs
+                }
+            })
+            .collect();
+        let n_elevated = thresh.iter().filter(|&&t| t > base_min_ecs).count();
+        info!(
+            "Adaptive EC support: {} transcripts have elevated threshold (base={})",
+            n_elevated, base_min_ecs
+        );
+        Some(thresh)
+    } else {
+        None
+    };
 
     // Compute per-sample evidence and count how many samples pass for each transcript
     let mut express_count = vec![0u32; n_targets];
@@ -384,7 +438,6 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             format!("UES > {}", ues_threshold)
         }
         FilterMode::Support => {
-            let min_ecs = opts.min_ec_support;
             for (i, counts) in phase1_counts.iter().enumerate() {
                 let metrics = compute_evidence_metrics(
                     &bundles[i].packed_eq_map,
@@ -393,12 +446,17 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     opts.min_support_count,
                 );
                 for (t, &sup) in metrics.support.iter().enumerate() {
-                    if sup >= min_ecs {
+                    let thresh = adaptive_thresh.as_ref().map_or(base_min_ecs, |v| v[t]);
+                    if sup >= thresh {
                         express_count[t] += 1;
                     }
                 }
             }
-            format!("EC support >= {}", min_ecs)
+            format!(
+                "EC support >= {}{}",
+                base_min_ecs,
+                if opts.adaptive_ec_support { " (adaptive)" } else { "" }
+            )
         }
     };
 
@@ -455,7 +513,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         opts.min_support_count,
                     );
                     for (t, &sup) in metrics.support.iter().enumerate() {
-                        sample_pass[t] = sup >= opts.min_ec_support;
+                        let thresh = adaptive_thresh.as_ref().map_or(base_min_ecs, |v| v[t]);
+                        sample_pass[t] = sup >= thresh;
                     }
                 }
             }

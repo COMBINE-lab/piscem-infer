@@ -591,6 +591,126 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         n_filtered
     );
 
+    // ====== Gene-level rescue ======
+    // For transcripts that fail consensus, check if their gene's total TPM
+    // passes consensus. If so, rescue all transcripts of that gene.
+    // Gene names are parsed from GENCODE-style pipe-delimited transcript names
+    // (field 6, 0-indexed field 5).
+    let consensus_mask = {
+        let mut mask = consensus_mask;
+
+        // Parse gene name from transcript name (field index 5 in pipe-delimited GENCODE IDs).
+        let gene_names: Vec<Option<&str>> = bundles[0]
+            .ref_names
+            .iter()
+            .map(|name| name.split('|').nth(5))
+            .collect();
+
+        // Build gene -> transcript indices mapping.
+        let mut gene_to_txps: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (t, gene) in gene_names.iter().enumerate() {
+            if let Some(g) = gene {
+                gene_to_txps.entry(g).or_default().push(t);
+            }
+        }
+
+        // Compute per-gene TPM in each sample from Phase 1 estimates.
+        // A gene "passes" in a sample if its total TPM >= 10 (strong signal).
+        const GENE_TPM_FLOOR: f64 = 10.0;
+        let mut gene_express_count: std::collections::HashMap<&str, u32> =
+            std::collections::HashMap::new();
+        let mut gene_mean_tpm: std::collections::HashMap<&str, f64> =
+            std::collections::HashMap::new();
+        let n_samp = phase1_counts.len() as f64;
+        for counts in &phase1_counts {
+            let tpms = compute_tpm(counts, &bundles[0].eff_lengths);
+            let mut gene_tpm: std::collections::HashMap<&str, f64> =
+                std::collections::HashMap::new();
+            for (t, &tpm) in tpms.iter().enumerate() {
+                if let Some(g) = gene_names[t] {
+                    *gene_tpm.entry(g).or_insert(0.0) += tpm;
+                }
+            }
+            for (gene, &tpm) in &gene_tpm {
+                *gene_mean_tpm.entry(gene).or_insert(0.0) += tpm / n_samp;
+                if tpm >= GENE_TPM_FLOOR {
+                    *gene_express_count.entry(gene).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Compute mean Phase 1 TPM per transcript (across all samples) for
+        // ranking isoforms within a gene.
+        let mean_phase1_tpm: Vec<f64> = {
+            let n = phase1_counts.len() as f64;
+            let mut mean_tpm = vec![0.0f64; n_targets];
+            for counts in &phase1_counts {
+                let tpms = compute_tpm(counts, &bundles[0].eff_lengths);
+                for (t, &tpm) in tpms.iter().enumerate() {
+                    mean_tpm[t] += tpm / n;
+                }
+            }
+            mean_tpm
+        };
+
+        // Rescue transcripts of genes that pass gene-level consensus but have
+        // no individual transcript in the consensus set. Only rescue the top
+        // isoforms (by Phase 1 TPM) to avoid flooding the EM with weak isoforms.
+        let mut n_gene_rescued = 0usize;
+        let mut n_genes_rescued = 0usize;
+        for (gene, txps) in &gene_to_txps {
+            // Skip if any transcript already passes consensus.
+            if txps.iter().any(|&t| mask[t]) {
+                continue;
+            }
+            // Check gene-level consensus.
+            let gene_count = gene_express_count.get(gene).copied().unwrap_or(0);
+            if gene_count >= min_k {
+                // Sort isoforms by Phase 1 TPM (descending).
+                let mut ranked: Vec<(usize, f64)> = txps
+                    .iter()
+                    .filter(|&&t| bundles[0].eff_lengths[t] > 0.0)
+                    .map(|&t| (t, mean_phase1_tpm[t]))
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                // Rescue top isoforms that collectively capture >= 90% of the
+                // gene's total Phase 1 TPM, or at least the top 1.
+                let gene_total: f64 = ranked.iter().map(|(_, tpm)| tpm).sum();
+                let mut cumulative = 0.0f64;
+                let mut n_rescued_here = 0usize;
+                for &(t, tpm) in &ranked {
+                    mask[t] = true;
+                    n_gene_rescued += 1;
+                    n_rescued_here += 1;
+                    cumulative += tpm;
+                    if cumulative >= 0.9 * gene_total && n_rescued_here >= 1 {
+                        break;
+                    }
+                }
+                n_genes_rescued += 1;
+            }
+        }
+
+        if n_gene_rescued > 0 {
+            info!(
+                "Gene-level rescue: {} genes ({} transcripts) rescued by gene-level TPM consensus",
+                n_genes_rescued, n_gene_rescued
+            );
+        }
+
+        let n_consensus_after = mask.iter().filter(|&&b| b).count();
+        if n_consensus_after > n_consensus {
+            info!(
+                "After gene rescue: {} transcripts pass (was {})",
+                n_consensus_after, n_consensus
+            );
+        }
+
+        mask
+    };
+
     // ====== Phase 2: Re-run EM with consensus-masked effective lengths ======
     info!("Phase 2: re-running EM with consensus-filtered transcript set");
 

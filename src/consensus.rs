@@ -578,6 +578,10 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             .map(|&c| c >= min_k)
             .collect()
     };
+
+    // Save the strict (pre-rescue) mask for Phase 2 EM — rescued transcripts
+    // will use Phase 1 estimates instead of Phase 2 re-estimation.
+    let strict_mask = consensus_mask.clone();
     let n_consensus = consensus_mask.iter().filter(|&&b| b).count();
     let n_filtered = n_targets - n_consensus;
 
@@ -730,16 +734,17 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         n_samples,
                         sample.sample_name
                     );
+                    // Phase 2 EM uses strict consensus only (no rescued transcripts).
                     let masked_eff_lens: Vec<f64> = bundles[i]
                         .eff_lengths
                         .iter()
                         .enumerate()
-                        .map(|(t, &el)| if consensus_mask[t] { el } else { 0.0 })
+                        .map(|(t, &el)| if strict_mask[t] { el } else { 0.0 })
                         .collect();
                     let init = if opts.no_phase2_warm_start {
                         None
                     } else {
-                        Some(phase2_init_counts(&phase1_counts[i], &consensus_mask))
+                        Some(phase2_init_counts(&phase1_counts[i], &strict_mask))
                     };
                     let eminfo = EMInfo {
                         eq_map: &bundles[i].packed_eq_map,
@@ -774,12 +779,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 .eff_lengths
                 .iter()
                 .enumerate()
-                .map(|(t, &el)| if consensus_mask[t] { el } else { 0.0 })
+                .map(|(t, &el)| if strict_mask[t] { el } else { 0.0 })
                 .collect();
             let init = if opts.no_phase2_warm_start {
                 None
             } else {
-                Some(phase2_init_counts(&phase1_counts[i], &consensus_mask))
+                Some(phase2_init_counts(&phase1_counts[i], &strict_mask))
             };
             let eminfo = EMInfo {
                 eq_map: &bundles[i].packed_eq_map,
@@ -800,7 +805,16 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         results
     };
 
-    for (i, em_res) in phase2_results {
+    for (i, mut em_res) in phase2_results {
+        // For rescued transcripts (in consensus_mask but not strict_mask),
+        // use Phase 1 estimated counts instead of Phase 2. This avoids
+        // FC distortion from read redistribution among rescued transcripts.
+        for t in 0..n_targets {
+            if consensus_mask[t] && !strict_mask[t] {
+                em_res[t] = phase1_counts[i][t];
+            }
+        }
+
         let sample = &samples[i];
         create_dir_all(&sample.output_dir)?;
         let output_stem = sample.output_dir.join(&sample.sample_name);

@@ -617,7 +617,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
         // Compute per-gene TPM in each sample from Phase 1 estimates.
         // A gene "passes" in a sample if its total TPM >= 10 (strong signal).
-        const GENE_TPM_FLOOR: f64 = 10.0;
+        const GENE_TPM_FLOOR: f64 = 3.0;
         let mut gene_express_count: std::collections::HashMap<&str, u32> =
             std::collections::HashMap::new();
         let mut gene_mean_tpm: std::collections::HashMap<&str, f64> =

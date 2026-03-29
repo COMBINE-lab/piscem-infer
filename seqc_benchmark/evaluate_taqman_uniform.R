@@ -105,6 +105,18 @@ methods <- list(
     reader = read_salmon,
     path_fn = function(s, r) file.path(benchdir, "quant_salmon", paste0(s, "_", r), "quant.sf")
   ),
+  "Salmon gcB" = list(
+    reader = read_salmon,
+    path_fn = function(s, r) file.path(benchdir, "quant_salmon_gcbias", paste0(s, "_", r), "quant.sf")
+  ),
+  "Pos5+CG" = list(
+    reader = read_piscem,
+    path_fn = function(s, r) file.path(benchdir, "quant_sel_pos5_condgene", paste0(s, "_", r), paste0(s, "_", r, ".quant"))
+  ),
+  "Adpt+Pos5" = list(
+    reader = read_piscem,
+    path_fn = function(s, r) file.path(benchdir, "quant_sel_adapt_pos5", paste0(s, "_", r), paste0(s, "_", r, ".quant"))
+  ),
   "Cond+Gene" = list(
     reader = read_piscem,
     path_fn = function(s, r) file.path(benchdir, "quant_sel_adapt_condgene", paste0(s, "_", r), paste0(s, "_", r, ".quant"))

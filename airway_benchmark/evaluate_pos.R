@@ -8,7 +8,8 @@ methods <- list(
   "Sel+Supp(8)"    = "quant/sel_support_all8_fast",
   "Sel+Adapt(8)"   = "quant/sel_support_all8_adaptive",
   "Sel+Pos5(8)"    = "quant/sel_support_all8_pos5",
-  "Pos5+Cov(8)"    = "quant/sel_support_all8_pos5_cov"
+  "Pos5+Cov(8)"    = "quant/sel_support_all8_pos5_cov",
+  "Pos5+CG(8)"     = "quant/sel_pos5_condgene"
 )
 
 load_method <- function(dir) {

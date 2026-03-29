@@ -78,6 +78,8 @@ impl SelectionStages {
 ///
 /// Uses flat arrays with offsets (same layout as PackedEqMap) for cache locality.
 /// `eqc_ids[offsets[t]..offsets[t+1]]` gives the sorted EQ class indices for transcript t.
+/// When positional ECs are enabled, `pos_bins` is parallel to `eqc_ids` and stores
+/// the position bin for each (transcript, EC) edge.
 #[allow(dead_code)]
 pub struct TranscriptEqIndex {
     /// Flat packed list of EQ class indices, sorted per transcript.
@@ -85,6 +87,8 @@ pub struct TranscriptEqIndex {
     /// Offset array: transcript t's EQ classes span eqc_ids[offsets[t]..offsets[t+1]].
     /// Length = num_targets + 1.
     pub offsets: Vec<u32>,
+    /// Per-edge position bins, parallel to eqc_ids. Empty if pos bins disabled.
+    pub pos_bins: Vec<u32>,
 }
 
 impl TranscriptEqIndex {
@@ -112,27 +116,49 @@ impl TranscriptEqIndex {
         }
         let total_edges = *offsets.last().unwrap() as usize;
 
-        // Second pass: fill in EQ class IDs using write cursors.
+        // Check if position bins are available.
+        let has_pos = packed_map.len() > 0
+            && packed_map.refs_for_eqc(0).target_pos_bins().is_some();
+
+        // Second pass: fill in EQ class IDs (and pos bins) using write cursors.
         let mut eqc_ids = vec![0u32; total_edges];
-        let mut cursors = vec![0u32; num_targets]; // current write position per transcript
+        let mut pos_bins_vec = if has_pos { vec![0u32; total_edges] } else { Vec::new() };
+        let mut cursors = vec![0u32; num_targets];
         for eqc_idx in 0..packed_map.len() {
             let label = packed_map.refs_for_eqc(eqc_idx);
-            for &tid in label.target_labels() {
+            let label_pos_bins = label.target_pos_bins();
+            for (i, &tid) in label.target_labels().iter().enumerate() {
                 let t = tid as usize;
-                let pos = offsets[t] + cursors[t];
-                eqc_ids[pos as usize] = eqc_idx as u32;
+                let slot = (offsets[t] + cursors[t]) as usize;
+                eqc_ids[slot] = eqc_idx as u32;
+                if has_pos {
+                    pos_bins_vec[slot] = label_pos_bins.map_or(0, |pb| pb[i]);
+                }
                 cursors[t] += 1;
             }
         }
 
-        // Sort each transcript's EQ class list (needed for signature comparison).
+        // Sort each transcript's edges by EQ class ID, keeping pos_bins in sync.
         for t in 0..num_targets {
             let s = offsets[t] as usize;
             let e = offsets[t + 1] as usize;
-            eqc_ids[s..e].sort_unstable();
+            if has_pos {
+                // Sort (eqc_id, pos_bin) pairs together by eqc_id.
+                let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e].iter()
+                    .zip(pos_bins_vec[s..e].iter())
+                    .map(|(&a, &b)| (a, b))
+                    .collect();
+                pairs.sort_unstable_by_key(|&(eqc, _)| eqc);
+                for (j, &(eqc, pb)) in pairs.iter().enumerate() {
+                    eqc_ids[s + j] = eqc;
+                    pos_bins_vec[s + j] = pb;
+                }
+            } else {
+                eqc_ids[s..e].sort_unstable();
+            }
         }
 
-        Self { eqc_ids, offsets }
+        Self { eqc_ids, offsets, pos_bins: pos_bins_vec }
     }
 
     /// Returns the number of transcripts in this index.
@@ -147,6 +173,23 @@ impl TranscriptEqIndex {
         let s = self.offsets[t] as usize;
         let e = self.offsets[t + 1] as usize;
         &self.eqc_ids[s..e]
+    }
+
+    /// Position bins for transcript t's edges (parallel to signature).
+    /// Returns None if pos bins are not available.
+    pub fn pos_bins_for(&self, t: usize) -> Option<&[u32]> {
+        if self.pos_bins.is_empty() {
+            None
+        } else {
+            let s = self.offsets[t] as usize;
+            let e = self.offsets[t + 1] as usize;
+            Some(&self.pos_bins[s..e])
+        }
+    }
+
+    /// Returns true if this index carries position bin information.
+    pub fn has_pos_bins(&self) -> bool {
+        !self.pos_bins.is_empty()
     }
 
     /// Returns the number of EQ classes containing transcript `t`.
@@ -693,28 +736,49 @@ pub fn merge_transcript_indices(
     }
     let total_edges = *offsets.last().unwrap() as usize;
 
-    // Second pass: fill in remapped EQ class IDs.
+    // Check if any index has pos bins.
+    let has_pos = indices.iter().any(|idx| !idx.pos_bins.is_empty());
+
+    // Second pass: fill in remapped EQ class IDs (and pos bins).
     let mut eqc_ids = vec![0u32; total_edges];
+    let mut pos_bins_vec = if has_pos { vec![0u32; total_edges] } else { Vec::new() };
     let mut cursors = vec![0u32; num_targets];
     for (sample_idx, index) in indices.iter().enumerate() {
         let offset = eqc_offsets[sample_idx];
         for t in 0..num_targets {
-            for &eqc in index.signature(t) {
-                let pos = (offsets[t] + cursors[t]) as usize;
-                eqc_ids[pos] = eqc + offset;
+            let sig = index.signature(t);
+            let sig_start = index.offsets[t] as usize;
+            for (j, &eqc) in sig.iter().enumerate() {
+                let slot = (offsets[t] + cursors[t]) as usize;
+                eqc_ids[slot] = eqc + offset;
+                if has_pos && !index.pos_bins.is_empty() {
+                    pos_bins_vec[slot] = index.pos_bins[sig_start + j];
+                }
                 cursors[t] += 1;
             }
         }
     }
 
-    // Sort each transcript's merged signature.
+    // Sort each transcript's merged signature, keeping pos_bins in sync.
     for t in 0..num_targets {
         let s = offsets[t] as usize;
         let e = offsets[t + 1] as usize;
-        eqc_ids[s..e].sort_unstable();
+        if has_pos {
+            let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e].iter()
+                .zip(pos_bins_vec[s..e].iter())
+                .map(|(&a, &b)| (a, b))
+                .collect();
+            pairs.sort_unstable_by_key(|&(eqc, _)| eqc);
+            for (j, &(eqc, pb)) in pairs.iter().enumerate() {
+                eqc_ids[s + j] = eqc;
+                pos_bins_vec[s + j] = pb;
+            }
+        } else {
+            eqc_ids[s..e].sort_unstable();
+        }
     }
 
-    TranscriptEqIndex { eqc_ids, offsets }
+    TranscriptEqIndex { eqc_ids, offsets, pos_bins: pos_bins_vec }
 }
 
 /// Peeling algorithm that works from TranscriptEqIndex + SignatureGroups,
@@ -792,23 +856,17 @@ pub fn unique_ec_peeling_from_index(
     required
 }
 
-/// Run variable selection from a merged TranscriptEqIndex with coverage plausibility
-/// for dominance testing. Uses the per-sample packed maps to look up position bins.
-///
-/// `eqc_counts[i]` is the number of ECs in sample i's packed map.
-/// Global EC `g` maps to sample `s` local EC `g - sum(eqc_counts[0..s])`.
+/// Run variable selection from a merged TranscriptEqIndex with coverage plausibility.
+/// The index must carry pos_bins (from `from_packed_eq_map` or `merge_transcript_indices`).
+/// Falls back to standard dominance when pos bins are not available.
 pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
     index: &TranscriptEqIndex,
     num_targets: usize,
     num_eqcs: usize,
     stages: &SelectionStages,
-    packed_maps: &[&PackedEqMap<EqLabelT>],
-    eqc_counts: &[usize],
+    _packed_maps: &[&PackedEqMap<EqLabelT>], // kept for API compat; pos bins now in index
+    _eqc_counts: &[usize],
 ) -> SelectionResult {
-    use crate::utils::eq_maps::NUM_POS_BINS;
-
-    let n_pos_bins = NUM_POS_BINS.get().copied().unwrap_or(1.0) as usize;
-
     let groups = signature_collapse(index);
     let n_no_eqc = (0..num_targets).filter(|&t| index.degree(t) == 0).count();
     info!(
@@ -830,47 +888,8 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
     };
 
     let dominated = if stages.dominance {
-        let dom = if n_pos_bins > 1 && !packed_maps.is_empty() {
-            // Build cumulative EC offsets for reverse-mapping global EC → (sample, local_ec).
-            let eqc_offsets: Vec<u32> = {
-                let mut offsets = Vec::with_capacity(eqc_counts.len());
-                let mut acc = 0u32;
-                for &c in eqc_counts {
-                    offsets.push(acc);
-                    acc += c as u32;
-                }
-                offsets
-            };
-
-            // Build lookup: global_eqc → (sample_idx, local_eqc)
-            let resolve_global_eqc = |global: u32| -> (usize, usize) {
-                let mut sample = eqc_offsets.len() - 1;
-                for (s, &off) in eqc_offsets.iter().enumerate().rev() {
-                    if global >= off {
-                        sample = s;
-                        break;
-                    }
-                }
-                (sample, (global - eqc_offsets[sample]) as usize)
-            };
-
-            // Build position bin lookup from per-sample packed maps.
-            let mut eqc_txp_posbin: std::collections::HashMap<(u32, u32), u32> =
-                std::collections::HashMap::new();
-            for (sample_idx, map) in packed_maps.iter().enumerate() {
-                let offset = eqc_offsets[sample_idx];
-                for local_eqc in 0..map.len() {
-                    let label = map.refs_for_eqc(local_eqc);
-                    if let Some(pos_bins) = label.target_pos_bins() {
-                        let global_eqc = offset + local_eqc as u32;
-                        for (tid, &pb) in label.target_labels().iter().zip(pos_bins.iter()) {
-                            eqc_txp_posbin.insert((global_eqc, *tid), pb);
-                        }
-                    }
-                }
-            }
-
-            // Run dominance with coverage plausibility using the global lookup.
+        let dom = if index.has_pos_bins() {
+            // Use coverage plausibility from the index's pos_bins.
             let num_groups = groups.num_groups();
             let mut dominated = vec![false; num_groups];
 
@@ -886,6 +905,18 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                 let rep = groups.representatives[gi] as usize;
                 for &eqc in index.signature(rep) {
                     eqc_to_groups[eqc as usize].push(gi as u32);
+                }
+            }
+
+            // Build reverse map: (eqc, transcript) → position in transcript's signature.
+            // This lets us look up j's pos_bin for a given EC efficiently.
+            let mut eqc_txp_sigpos: std::collections::HashMap<(u32, u32), usize> =
+                std::collections::HashMap::new();
+            for t in 0..num_targets {
+                let sig = index.signature(t);
+                let base = index.offsets[t] as usize;
+                for (j, &eqc) in sig.iter().enumerate() {
+                    eqc_txp_sigpos.insert((eqc, t as u32), base + j);
                 }
             }
 
@@ -908,11 +939,11 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                     if sig_j.len() <= deg_i { continue; }
                     if !is_sorted_subset(sig_i, sig_j) { continue; }
 
-                    // Coverage plausibility: check j's position bins from i's ECs.
-                    let tid_j = rep_j as u32;
+                    // Coverage plausibility: check j's pos bins from i's shared ECs.
                     let mut j_bins_used = [false; 32];
                     for &eqc in sig_i {
-                        if let Some(&pb) = eqc_txp_posbin.get(&(eqc, tid_j)) {
+                        if let Some(&sig_pos) = eqc_txp_sigpos.get(&(eqc, rep_j as u32)) {
+                            let pb = index.pos_bins[sig_pos];
                             j_bins_used[(pb as usize).min(31)] = true;
                         }
                     }

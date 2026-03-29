@@ -734,6 +734,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
             None,
             quant_opts.pos_bins as usize,
             quant_opts.coverage_smooth_rounds,
+            quant_opts.coverage_epsilon,
         )
     } else if !quant_opts.no_squarem {
         if let Some(pool) = em_pool.as_ref() {

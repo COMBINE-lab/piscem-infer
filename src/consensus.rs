@@ -17,7 +17,7 @@ use crate::process_rad::{EqMapBundle, RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::{ConsensusQuantOpts, FilterMode};
 use crate::utils::em::{
     EMInfo, em, em_init, em_par, em_par_init, em_par_with_pool, em_par_with_pool_init,
-    squarem_em, squarem_em_par, squarem_em_par_with_pool,
+    em_with_coverage, squarem_em, squarem_em_par, squarem_em_par_with_pool,
 };
 use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap, TargetLabelsRef};
 use crate::utils::io;
@@ -312,7 +312,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         convergence_thresh: phase1_convergence_thresh(opts),
                         presence_thresh: opts.presence_thresh,
                     };
-                    let counts = if !opts.no_phase1_squarem {
+                    let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
+                        em_with_coverage(
+                            &eminfo, None,
+                            opts.pos_bins as usize,
+                            opts.coverage_smooth_rounds,
+                            opts.coverage_epsilon,
+                        )
+                    } else if !opts.no_phase1_squarem {
                         if inner_threads > 1 {
                             squarem_em_par(&eminfo, inner_threads)
                         } else {
@@ -342,7 +349,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 convergence_thresh: phase1_convergence_thresh(opts),
                 presence_thresh: opts.presence_thresh,
             };
-            let counts = if !opts.no_phase1_squarem {
+            let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
+                em_with_coverage(
+                    &eminfo, None,
+                    opts.pos_bins as usize,
+                    opts.coverage_smooth_rounds,
+                    opts.coverage_epsilon,
+                )
+            } else if !opts.no_phase1_squarem {
                 if let Some(pool) = serial_inner_pool.as_ref() {
                     squarem_em_par_with_pool(&eminfo, pool)
                 } else if inner_threads > 1 {

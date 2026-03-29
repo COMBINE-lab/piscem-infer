@@ -420,6 +420,114 @@ pub fn subset_dominance(
     dominated
 }
 
+/// Subset dominance with coverage plausibility check.
+/// Like `subset_dominance`, but additionally verifies that the dominating
+/// transcript's position bins (from the shared ECs) are spread across
+/// multiple bins — not clustered in a way that implies implausible coverage.
+///
+/// If positional ECs are not enabled (no pos_bins in the labels), falls back
+/// to the standard subset dominance test.
+pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
+    index: &TranscriptEqIndex,
+    groups: &SignatureGroups,
+    packed_map: &PackedEqMap<EqLabelT>,
+    num_targets: usize,
+) -> Vec<bool> {
+    use crate::utils::eq_maps::NUM_POS_BINS;
+
+    let n_pos_bins = NUM_POS_BINS.get().copied().unwrap_or(1.0) as usize;
+    if n_pos_bins <= 1 {
+        // No positional information — fall back to standard dominance.
+        return subset_dominance(index, groups);
+    }
+
+    // Build a lookup: for each (eqc_idx, transcript_id) → pos_bin.
+    // We store this as a flat HashMap for fast access.
+    let mut eqc_txp_posbin: std::collections::HashMap<(u32, u32), u32> =
+        std::collections::HashMap::new();
+    for eqc_idx in 0..packed_map.len() {
+        let label = packed_map.refs_for_eqc(eqc_idx);
+        if let Some(pos_bins) = label.target_pos_bins() {
+            for (tid, &pb) in label.target_labels().iter().zip(pos_bins.iter()) {
+                eqc_txp_posbin.insert((eqc_idx as u32, *tid), pb);
+            }
+        }
+    }
+
+    let num_groups = groups.num_groups();
+    let mut dominated = vec![false; num_groups];
+
+    let mut group_order: Vec<usize> = (0..num_groups).collect();
+    group_order.sort_unstable_by_key(|&gi| {
+        index.degree(groups.representatives[gi] as usize)
+    });
+
+    let max_eqc = index.eqc_ids.iter().copied().max()
+        .map(|m| m as usize + 1).unwrap_or(0);
+    let mut eqc_to_groups: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
+    for gi in 0..num_groups {
+        let rep = groups.representatives[gi] as usize;
+        for &eqc in index.signature(rep) {
+            eqc_to_groups[eqc as usize].push(gi as u32);
+        }
+    }
+
+    for &gi in &group_order {
+        if dominated[gi] { continue; }
+        let rep_i = groups.representatives[gi] as usize;
+        let sig_i = index.signature(rep_i);
+        if sig_i.is_empty() { continue; }
+        let deg_i = sig_i.len();
+
+        let rarest_eqc = sig_i.iter()
+            .min_by_key(|&&eqc| eqc_to_groups[eqc as usize].len())
+            .unwrap();
+
+        for &candidate_gj in &eqc_to_groups[*rarest_eqc as usize] {
+            let gj = candidate_gj as usize;
+            if gj == gi || dominated[gj] { continue; }
+            let rep_j = groups.representatives[gj] as usize;
+            let sig_j = index.signature(rep_j);
+            if sig_j.len() <= deg_i { continue; }
+
+            if !is_sorted_subset(sig_i, sig_j) { continue; }
+
+            // sig_i ⊆ sig_j confirmed. Now check coverage plausibility:
+            // For each EC in sig_i, what position bin does transcript j have?
+            // If j's bins are spread across ≥ 2 distinct bins, the coverage is plausible.
+            let mut j_bins_used = [false; 32]; // up to 32 pos bins
+            let tid_j = rep_j as u32;
+            for &eqc in sig_i {
+                if let Some(&pb) = eqc_txp_posbin.get(&(eqc, tid_j)) {
+                    j_bins_used[(pb as usize).min(31)] = true;
+                }
+            }
+            let n_distinct_bins = j_bins_used.iter().filter(|&&b| b).count();
+
+            // Plausibility: j must use reads from at least 2 distinct position bins.
+            // If all of i's reads map to a single position on j, j's coverage
+            // would be a spike — implausible, so i is NOT dominated.
+            if n_distinct_bins >= 2 {
+                dominated[gi] = true;
+                break;
+            }
+            // Otherwise: single-bin coverage on j → don't mark i as dominated.
+        }
+    }
+
+    let n_saved = {
+        let standard = subset_dominance(index, groups);
+        let n_standard = standard.iter().filter(|&&d| d).count();
+        let n_coverage = dominated.iter().filter(|&&d| d).count();
+        n_standard - n_coverage
+    };
+    if n_saved > 0 {
+        info!("  Coverage plausibility rescued {} groups from dominance removal", n_saved);
+    }
+
+    dominated
+}
+
 /// Check if sorted slice `a` is a subset of sorted slice `b`.
 /// Both must be sorted in ascending order.
 fn is_sorted_subset(a: &[u32], b: &[u32]) -> bool {
@@ -501,9 +609,9 @@ pub fn run_selection_with_stages<EqLabelT: EqLabel>(
         vec![false; groups.num_groups()]
     };
 
-    // Stage 3: Subset dominance.
+    // Stage 3: Subset dominance (with coverage plausibility when pos bins are enabled).
     let dominated = if stages.dominance {
-        let dom = subset_dominance(&index, &groups);
+        let dom = subset_dominance_with_coverage(&index, &groups, packed_map, num_targets);
         let n_dominated = dom.iter().filter(|&&d| d).count();
         info!(
             "  Stage 3 (subset dominance): {} / {} groups are dominated (removable)",

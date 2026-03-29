@@ -116,6 +116,10 @@ pub struct QuantOpts {
     /// that encourage uniform transcript coverage.
     #[arg(long, default_value_t = 0, help_heading = "EM Algorithm")]
     pub coverage_smooth_rounds: usize,
+    /// smoothing parameter for coverage weights (higher = gentler smoothing).
+    /// Controls how aggressively non-uniform coverage is penalized.
+    #[arg(long, default_value_t = 1.0, help_heading = "EM Algorithm")]
+    pub coverage_epsilon: f64,
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use to perform initial coarse-grained
     /// estimation of the fragment length distribution. These fragments will have
@@ -326,6 +330,12 @@ pub struct ConsensusQuantOpts {
     /// disable SQUAREM acceleration for the phase-1 EM solver
     #[arg(long, help_heading = "EM Algorithm")]
     pub no_phase1_squarem: bool,
+    /// number of coverage-smoothing EM rounds in Phase 1 (0 = disabled).
+    #[arg(long, default_value_t = 0, help_heading = "EM Algorithm")]
+    pub coverage_smooth_rounds: usize,
+    /// smoothing parameter for coverage weights (higher = gentler).
+    #[arg(long, default_value_t = 5.0, help_heading = "EM Algorithm")]
+    pub coverage_epsilon: f64,
     /// phase-2 override for the EM iteration cap. If unset, uses --max-iter.
     #[arg(long, help_heading = "EM Algorithm")]
     pub phase2_max_iter: Option<u32>,

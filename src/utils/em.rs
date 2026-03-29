@@ -1088,9 +1088,9 @@ pub fn coverage_weights_from_profile(
     profile: &[f64],
     n_targets: usize,
     n_pos_bins: usize,
+    epsilon: f64,
 ) -> Vec<f64> {
     let mut weights = vec![1.0f64; n_targets * n_pos_bins];
-    let epsilon = 1.0; // smoothing to avoid division by zero
 
     for t in 0..n_targets {
         let base = t * n_pos_bins;
@@ -1126,11 +1126,12 @@ pub fn em_with_coverage<EqLabelT: EqLabel>(
     init_counts: Option<&[f64]>,
     n_pos_bins: usize,
     n_coverage_rounds: usize,
+    coverage_epsilon: f64,
 ) -> Vec<f64> {
     let n_targets = em_info.eff_lens.len();
 
-    // Initial EM (standard)
-    let mut counts = em_init(em_info, init_counts);
+    // Initial EM (SQUAREM-accelerated)
+    let mut counts = squarem_em_init(em_info, init_counts);
 
     if n_pos_bins <= 1 || n_coverage_rounds == 0 {
         return counts;
@@ -1143,7 +1144,7 @@ pub fn em_with_coverage<EqLabelT: EqLabel>(
         );
 
         // Compute coverage weights
-        let cov_weights = coverage_weights_from_profile(&profile, n_targets, n_pos_bins);
+        let cov_weights = coverage_weights_from_profile(&profile, n_targets, n_pos_bins, coverage_epsilon);
 
         // Run coverage-weighted EM
         counts = em_coverage_weighted(em_info, Some(&counts), &cov_weights, n_pos_bins);
@@ -1154,72 +1155,18 @@ pub fn em_with_coverage<EqLabelT: EqLabel>(
     counts
 }
 
-/// EM with per-target, per-position-bin coverage weights.
-fn em_coverage_weighted<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    init_counts: Option<&[f64]>,
-    cov_weights: &[f64], // flattened n_targets × n_pos_bins
+/// One coverage-weighted M-step: redistribute reads using coverage weights.
+#[inline]
+fn m_step_coverage_weighted<EqLabelT: EqLabel>(
+    eq_map: &PackedEqMap<EqLabelT>,
+    prev_counts: &[f64],
+    inv_eff_lens: &[f64],
+    cov_weights: &[f64],
     n_pos_bins: usize,
-) -> Vec<f64> {
-    let converge_thresh = em_info.convergence_thresh;
-    let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
-    let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
-
-    let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
-    let mut curr_counts = vec![0.0f64; eff_lens.len()];
-    let mut rel_diff;
-    let mut niter = 0_u32;
-
-    while niter < max_iter {
-        // Coverage-weighted M-step
-        let mut weights: Vec<f64> = Vec::with_capacity(64);
-        for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
-            let ec_count = count as f64;
-            let pos_bins = label.target_pos_bins();
-
-            let mut denom = 0.0f64;
-            for (i, (tid, cond_prob)) in label.target_labels().iter()
-                .zip(label.target_probs())
-                .enumerate()
-            {
-                let t = *tid as usize;
-                let b = pos_bins.map_or(0, |pb| pb[i] as usize).min(n_pos_bins - 1);
-                let cw = cov_weights[t * n_pos_bins + b];
-                let w = cond_prob * cw * prev_counts[t] * inv_eff_lens[t];
-                weights.push(w);
-                denom += w;
-            }
-
-            if denom > 1e-8 {
-                let count_over_denom = ec_count / denom;
-                for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
-                    curr_counts[*tid as usize] += count_over_denom * w;
-                }
-            }
-            weights.clear();
-        }
-
-        rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
-        std::mem::swap(&mut prev_counts, &mut curr_counts);
-        curr_counts.fill(0.0);
-
-        if rel_diff < converge_thresh {
-            break;
-        }
-        niter += 1;
-    }
-
-    // Final step
-    prev_counts.iter_mut().for_each(|x| {
-        if *x < presence_thresh { *x = 0.0 }
-    });
-
-    // One more M-step to get final counts
-    let mut final_weights: Vec<f64> = Vec::with_capacity(64);
+    out: &mut [f64],
+) {
+    out.fill(0.0);
+    let mut weights: Vec<f64> = Vec::with_capacity(64);
     for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
         let ec_count = count as f64;
         let pos_bins = label.target_pos_bins();
@@ -1232,19 +1179,104 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
             let b = pos_bins.map_or(0, |pb| pb[i] as usize).min(n_pos_bins - 1);
             let cw = cov_weights[t * n_pos_bins + b];
             let w = cond_prob * cw * prev_counts[t] * inv_eff_lens[t];
-            final_weights.push(w);
+            weights.push(w);
             denom += w;
         }
         if denom > 1e-8 {
             let count_over_denom = ec_count / denom;
-            for (tid, &w) in label.target_labels().iter().zip(final_weights.iter()) {
-                curr_counts[*tid as usize] += count_over_denom * w;
+            for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
+                out[*tid as usize] += count_over_denom * w;
             }
         }
-        final_weights.clear();
+        weights.clear();
+    }
+}
+
+/// SQUAREM-accelerated EM with coverage weights.
+fn em_coverage_weighted<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    init_counts: Option<&[f64]>,
+    cov_weights: &[f64],
+    n_pos_bins: usize,
+) -> Vec<f64> {
+    let opts = SquaremOptions::default();
+    let presence_thresh = em_info.presence_thresh;
+    let eq_map = em_info.eq_map;
+    let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
+    let max_iter = em_info.max_iter;
+    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+
+    let mut x0 = initial_counts(eff_lens, total_weight, init_counts);
+    project_counts(&mut x0, eff_lens, total_weight);
+
+    let mut x1 = vec![0.0f64; eff_lens.len()];
+    let mut x2 = vec![0.0f64; eff_lens.len()];
+    let mut x_sq = vec![0.0f64; eff_lens.len()];
+    let mut x_next = vec![0.0f64; eff_lens.len()];
+    let mut em_steps = 0_u32;
+    let mut last_rel_diff = f64::INFINITY;
+    let mut accel_attempts = 0_u32;
+    let mut accel_accepts = 0_u32;
+
+    while em_steps < max_iter {
+        m_step_coverage_weighted(eq_map, &x0, &inv_eff_lens, cov_weights, n_pos_bins, &mut x1);
+        em_steps += 1;
+        let rel1 = compute_rel_diff(&x0, &x1, presence_thresh);
+        last_rel_diff = rel1;
+        if rel1 < em_info.convergence_thresh || em_steps >= max_iter {
+            x0 = x1.clone();
+            break;
+        }
+
+        if !should_try_squarem(em_steps, last_rel_diff, opts) || em_steps >= max_iter {
+            x0.clone_from_slice(&x1);
+            continue;
+        }
+
+        accel_attempts += 1;
+        m_step_coverage_weighted(eq_map, &x1, &inv_eff_lens, cov_weights, n_pos_bins, &mut x2);
+        em_steps += 1;
+
+        let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
+        let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
+            for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter()) {
+                let r = b - a;
+                let v = c - (2.0 * b) + a;
+                *sq = a - (2.0 * alpha * r) + (alpha * alpha * v);
+            }
+            project_counts(&mut x_sq, eff_lens, total_weight);
+            if em_steps < max_iter {
+                m_step_coverage_weighted(eq_map, &x_sq, &inv_eff_lens, cov_weights, n_pos_bins, &mut x_next);
+                em_steps += 1;
+                let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
+                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel {
+                    accel_accepts += 1;
+                    &x_next
+                } else {
+                    &x2
+                }
+            } else {
+                &x2
+            }
+        } else {
+            &x2
+        };
+
+        let rel_diff = compute_rel_diff(&x0, candidate, presence_thresh);
+        x0.clone_from_slice(candidate);
+        if rel_diff < em_info.convergence_thresh {
+            break;
+        }
     }
 
-    info!("Coverage-weighted EM: {} iterations", niter);
-    curr_counts
+    x0.iter_mut().for_each(|x| { if *x < presence_thresh { *x = 0.0 } });
+    m_step_coverage_weighted(eq_map, &x0, &inv_eff_lens, cov_weights, n_pos_bins, &mut x1);
+
+    info!(
+        "Coverage SQUAREM: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
+        em_steps, accel_attempts, accel_accepts, last_rel_diff
+    );
+    x1
 }
 

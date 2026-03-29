@@ -57,6 +57,9 @@ pub trait TargetLabels {
 pub trait TargetLabelsRef: Sync {
     fn target_labels(&self) -> &[u32];
     fn target_probs(&self) -> impl Iterator<Item = f64>;
+    /// Returns the position bin for each target, or None if positional
+    /// binning is not enabled.
+    fn target_pos_bins(&self) -> Option<&[u32]>;
 }
 
 // === basic equivalence classes
@@ -150,6 +153,11 @@ impl<'a> TargetLabelsRef for BasicEqLabelRef<'a> {
             self.targets.len()
         };
         std::iter::repeat_n(1.0_f64, nt)
+    }
+
+    #[inline]
+    fn target_pos_bins(&self) -> Option<&[u32]> {
+        None // Basic ECs have no positional information
     }
 }
 
@@ -287,6 +295,18 @@ impl<'a> TargetLabelsRef for RangeFactorizedEqLabelRef<'a> {
             bin_iterator: self.targets_and_bins[l..2 * l].iter(),
             num_bins,
             half_bin_width,
+        }
+    }
+
+    #[inline]
+    fn target_pos_bins(&self) -> Option<&[u32]> {
+        let has_pos = NUM_POS_BINS.get().is_some_and(|&n| n > 1.0);
+        if has_pos {
+            let nseg = rf_num_segments(self.contains_ori);
+            let l = self.targets_and_bins.len() / nseg;
+            Some(&self.targets_and_bins[2 * l..3 * l])
+        } else {
+            None
         }
     }
 }

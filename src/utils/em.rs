@@ -1035,3 +1035,216 @@ pub fn em_init<EqLabelT: EqLabel>(
     curr_counts
 }
 
+/// Compute per-transcript coverage profile from converged EM counts.
+/// Returns a flattened `n_targets × n_pos_bins` array where
+/// `profile[t * n_pos_bins + b]` = assigned reads to transcript t from pos_bin b.
+pub fn compute_coverage_profile<EqLabelT: EqLabel>(
+    eq_map: &PackedEqMap<EqLabelT>,
+    em_counts: &[f64],
+    eff_lens: &[f64],
+    n_targets: usize,
+    n_pos_bins: usize,
+) -> Vec<f64> {
+    let inv_eff_lens: Vec<f64> = eff_lens
+        .iter()
+        .map(|x| { let y = 1.0 / *x; if y.is_finite() { y } else { 0.0 } })
+        .collect();
+
+    let mut profile = vec![0.0f64; n_targets * n_pos_bins];
+
+    for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
+        let ec_count = count as f64;
+        if ec_count == 0.0 { continue; }
+
+        let pos_bins = label.target_pos_bins();
+
+        // Compute posterior shares (same as M-step)
+        let mut denom = 0.0f64;
+        let mut weights: Vec<f64> = Vec::new();
+        for (tid, cond_prob) in label.target_labels().iter().zip(label.target_probs()) {
+            let w = cond_prob * em_counts[*tid as usize] * inv_eff_lens[*tid as usize];
+            weights.push(w);
+            denom += w;
+        }
+
+        if denom > 1e-8 {
+            for (i, (tid, &w)) in label.target_labels().iter().zip(weights.iter()).enumerate() {
+                let t = *tid as usize;
+                let assigned = ec_count * w / denom;
+                let b = pos_bins.map_or(0, |pb| pb[i] as usize).min(n_pos_bins - 1);
+                profile[t * n_pos_bins + b] += assigned;
+            }
+        }
+    }
+
+    profile
+}
+
+/// Compute coverage-consistency weights from a coverage profile.
+/// For each transcript, bins with below-average coverage get higher weight,
+/// bins with above-average coverage get lower weight.
+/// Returns flattened `n_targets × n_pos_bins` weights, normalized per transcript.
+pub fn coverage_weights_from_profile(
+    profile: &[f64],
+    n_targets: usize,
+    n_pos_bins: usize,
+) -> Vec<f64> {
+    let mut weights = vec![1.0f64; n_targets * n_pos_bins];
+    let epsilon = 1.0; // smoothing to avoid division by zero
+
+    for t in 0..n_targets {
+        let base = t * n_pos_bins;
+        let total: f64 = profile[base..base + n_pos_bins].iter().sum();
+        if total < 1.0 {
+            // Transcript has negligible coverage — uniform weights
+            continue;
+        }
+        let expected_per_bin = total / n_pos_bins as f64;
+
+        for b in 0..n_pos_bins {
+            // Inverse weighting: under-covered bins get higher weight
+            weights[base + b] = expected_per_bin / (profile[base + b] + epsilon);
+        }
+
+        // Normalize weights to sum to n_pos_bins (preserves total mass)
+        let w_sum: f64 = weights[base..base + n_pos_bins].iter().sum();
+        if w_sum > 0.0 {
+            let scale = n_pos_bins as f64 / w_sum;
+            for b in 0..n_pos_bins {
+                weights[base + b] *= scale;
+            }
+        }
+    }
+
+    weights
+}
+
+/// Run a coverage-aware EM: standard EM followed by coverage profile
+/// estimation and a second EM pass with coverage weights.
+pub fn em_with_coverage<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    init_counts: Option<&[f64]>,
+    n_pos_bins: usize,
+    n_coverage_rounds: usize,
+) -> Vec<f64> {
+    let n_targets = em_info.eff_lens.len();
+
+    // Initial EM (standard)
+    let mut counts = em_init(em_info, init_counts);
+
+    if n_pos_bins <= 1 || n_coverage_rounds == 0 {
+        return counts;
+    }
+
+    for round in 0..n_coverage_rounds {
+        // Compute coverage profile from current estimates
+        let profile = compute_coverage_profile(
+            em_info.eq_map, &counts, em_info.eff_lens, n_targets, n_pos_bins,
+        );
+
+        // Compute coverage weights
+        let cov_weights = coverage_weights_from_profile(&profile, n_targets, n_pos_bins);
+
+        // Run coverage-weighted EM
+        counts = em_coverage_weighted(em_info, Some(&counts), &cov_weights, n_pos_bins);
+
+        info!("Coverage EM round {}/{} complete", round + 1, n_coverage_rounds);
+    }
+
+    counts
+}
+
+/// EM with per-target, per-position-bin coverage weights.
+fn em_coverage_weighted<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    init_counts: Option<&[f64]>,
+    cov_weights: &[f64], // flattened n_targets × n_pos_bins
+    n_pos_bins: usize,
+) -> Vec<f64> {
+    let converge_thresh = em_info.convergence_thresh;
+    let presence_thresh = em_info.presence_thresh;
+    let eq_map = em_info.eq_map;
+    let eff_lens = em_info.eff_lens;
+    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
+    let max_iter = em_info.max_iter;
+    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+
+    let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
+    let mut curr_counts = vec![0.0f64; eff_lens.len()];
+    let mut rel_diff;
+    let mut niter = 0_u32;
+
+    while niter < max_iter {
+        // Coverage-weighted M-step
+        let mut weights: Vec<f64> = Vec::with_capacity(64);
+        for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
+            let ec_count = count as f64;
+            let pos_bins = label.target_pos_bins();
+
+            let mut denom = 0.0f64;
+            for (i, (tid, cond_prob)) in label.target_labels().iter()
+                .zip(label.target_probs())
+                .enumerate()
+            {
+                let t = *tid as usize;
+                let b = pos_bins.map_or(0, |pb| pb[i] as usize).min(n_pos_bins - 1);
+                let cw = cov_weights[t * n_pos_bins + b];
+                let w = cond_prob * cw * prev_counts[t] * inv_eff_lens[t];
+                weights.push(w);
+                denom += w;
+            }
+
+            if denom > 1e-8 {
+                let count_over_denom = ec_count / denom;
+                for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
+                    curr_counts[*tid as usize] += count_over_denom * w;
+                }
+            }
+            weights.clear();
+        }
+
+        rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
+        std::mem::swap(&mut prev_counts, &mut curr_counts);
+        curr_counts.fill(0.0);
+
+        if rel_diff < converge_thresh {
+            break;
+        }
+        niter += 1;
+    }
+
+    // Final step
+    prev_counts.iter_mut().for_each(|x| {
+        if *x < presence_thresh { *x = 0.0 }
+    });
+
+    // One more M-step to get final counts
+    let mut final_weights: Vec<f64> = Vec::with_capacity(64);
+    for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
+        let ec_count = count as f64;
+        let pos_bins = label.target_pos_bins();
+        let mut denom = 0.0f64;
+        for (i, (tid, cond_prob)) in label.target_labels().iter()
+            .zip(label.target_probs())
+            .enumerate()
+        {
+            let t = *tid as usize;
+            let b = pos_bins.map_or(0, |pb| pb[i] as usize).min(n_pos_bins - 1);
+            let cw = cov_weights[t * n_pos_bins + b];
+            let w = cond_prob * cw * prev_counts[t] * inv_eff_lens[t];
+            final_weights.push(w);
+            denom += w;
+        }
+        if denom > 1e-8 {
+            let count_over_denom = ec_count / denom;
+            for (tid, &w) in label.target_labels().iter().zip(final_weights.iter()) {
+                curr_counts[*tid as usize] += count_over_denom * w;
+            }
+        }
+        final_weights.clear();
+    }
+
+    info!("Coverage-weighted EM: {} iterations", niter);
+    curr_counts
+}
+

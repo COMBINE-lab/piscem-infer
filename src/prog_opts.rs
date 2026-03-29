@@ -111,6 +111,11 @@ pub struct QuantOpts {
     /// disable SQUAREM acceleration for the EM solver
     #[arg(long, help_heading = "EM Algorithm")]
     pub no_squarem: bool,
+    /// number of coverage-smoothing EM rounds (0 = disabled).
+    /// After the initial EM, re-estimates with position-dependent weights
+    /// that encourage uniform transcript coverage.
+    #[arg(long, default_value_t = 0, help_heading = "EM Algorithm")]
+    pub coverage_smooth_rounds: usize,
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use to perform initial coarse-grained
     /// estimation of the fragment length distribution. These fragments will have

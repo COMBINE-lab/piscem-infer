@@ -728,7 +728,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         presence_thresh,
     };
 
-    let em_res = if !quant_opts.no_squarem {
+    let em_res = if quant_opts.coverage_smooth_rounds > 0 && quant_opts.pos_bins > 1 {
+        crate::utils::em::em_with_coverage(
+            &eminfo,
+            None,
+            quant_opts.pos_bins as usize,
+            quant_opts.coverage_smooth_rounds,
+        )
+    } else if !quant_opts.no_squarem {
         if let Some(pool) = em_pool.as_ref() {
             squarem_em_par_with_pool(&eminfo, pool)
         } else {

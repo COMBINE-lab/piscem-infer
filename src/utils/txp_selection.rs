@@ -792,6 +792,190 @@ pub fn unique_ec_peeling_from_index(
     required
 }
 
+/// Run variable selection from a merged TranscriptEqIndex with coverage plausibility
+/// for dominance testing. Uses the per-sample packed maps to look up position bins.
+///
+/// `eqc_counts[i]` is the number of ECs in sample i's packed map.
+/// Global EC `g` maps to sample `s` local EC `g - sum(eqc_counts[0..s])`.
+pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
+    index: &TranscriptEqIndex,
+    num_targets: usize,
+    num_eqcs: usize,
+    stages: &SelectionStages,
+    packed_maps: &[&PackedEqMap<EqLabelT>],
+    eqc_counts: &[usize],
+) -> SelectionResult {
+    use crate::utils::eq_maps::NUM_POS_BINS;
+
+    let n_pos_bins = NUM_POS_BINS.get().copied().unwrap_or(1.0) as usize;
+
+    let groups = signature_collapse(index);
+    let n_no_eqc = (0..num_targets).filter(|&t| index.degree(t) == 0).count();
+    info!(
+        "  Stage 1 (signature collapse): {} transcripts → {} groups ({} with no EQ classes)",
+        num_targets, groups.num_groups(), n_no_eqc
+    );
+
+    let required = if stages.peeling {
+        let req = unique_ec_peeling_from_index(index, &groups, num_eqcs);
+        let n_required = req.iter().filter(|&&r| r).count();
+        info!(
+            "  Stage 2 (unique EC peeling): {} / {} groups are structurally required",
+            n_required, groups.num_groups()
+        );
+        req
+    } else {
+        info!("  Stage 2 (unique EC peeling): skipped");
+        vec![false; groups.num_groups()]
+    };
+
+    let dominated = if stages.dominance {
+        let dom = if n_pos_bins > 1 && !packed_maps.is_empty() {
+            // Build cumulative EC offsets for reverse-mapping global EC → (sample, local_ec).
+            let eqc_offsets: Vec<u32> = {
+                let mut offsets = Vec::with_capacity(eqc_counts.len());
+                let mut acc = 0u32;
+                for &c in eqc_counts {
+                    offsets.push(acc);
+                    acc += c as u32;
+                }
+                offsets
+            };
+
+            // Build lookup: global_eqc → (sample_idx, local_eqc)
+            let resolve_global_eqc = |global: u32| -> (usize, usize) {
+                let mut sample = eqc_offsets.len() - 1;
+                for (s, &off) in eqc_offsets.iter().enumerate().rev() {
+                    if global >= off {
+                        sample = s;
+                        break;
+                    }
+                }
+                (sample, (global - eqc_offsets[sample]) as usize)
+            };
+
+            // Build position bin lookup from per-sample packed maps.
+            let mut eqc_txp_posbin: std::collections::HashMap<(u32, u32), u32> =
+                std::collections::HashMap::new();
+            for (sample_idx, map) in packed_maps.iter().enumerate() {
+                let offset = eqc_offsets[sample_idx];
+                for local_eqc in 0..map.len() {
+                    let label = map.refs_for_eqc(local_eqc);
+                    if let Some(pos_bins) = label.target_pos_bins() {
+                        let global_eqc = offset + local_eqc as u32;
+                        for (tid, &pb) in label.target_labels().iter().zip(pos_bins.iter()) {
+                            eqc_txp_posbin.insert((global_eqc, *tid), pb);
+                        }
+                    }
+                }
+            }
+
+            // Run dominance with coverage plausibility using the global lookup.
+            let num_groups = groups.num_groups();
+            let mut dominated = vec![false; num_groups];
+
+            let mut group_order: Vec<usize> = (0..num_groups).collect();
+            group_order.sort_unstable_by_key(|&gi| {
+                index.degree(groups.representatives[gi] as usize)
+            });
+
+            let max_eqc = index.eqc_ids.iter().copied().max()
+                .map(|m| m as usize + 1).unwrap_or(0);
+            let mut eqc_to_groups: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
+            for gi in 0..num_groups {
+                let rep = groups.representatives[gi] as usize;
+                for &eqc in index.signature(rep) {
+                    eqc_to_groups[eqc as usize].push(gi as u32);
+                }
+            }
+
+            for &gi in &group_order {
+                if dominated[gi] { continue; }
+                let rep_i = groups.representatives[gi] as usize;
+                let sig_i = index.signature(rep_i);
+                if sig_i.is_empty() { continue; }
+                let deg_i = sig_i.len();
+
+                let rarest_eqc = sig_i.iter()
+                    .min_by_key(|&&eqc| eqc_to_groups[eqc as usize].len())
+                    .unwrap();
+
+                for &candidate_gj in &eqc_to_groups[*rarest_eqc as usize] {
+                    let gj = candidate_gj as usize;
+                    if gj == gi || dominated[gj] { continue; }
+                    let rep_j = groups.representatives[gj] as usize;
+                    let sig_j = index.signature(rep_j);
+                    if sig_j.len() <= deg_i { continue; }
+                    if !is_sorted_subset(sig_i, sig_j) { continue; }
+
+                    // Coverage plausibility: check j's position bins from i's ECs.
+                    let tid_j = rep_j as u32;
+                    let mut j_bins_used = [false; 32];
+                    for &eqc in sig_i {
+                        if let Some(&pb) = eqc_txp_posbin.get(&(eqc, tid_j)) {
+                            j_bins_used[(pb as usize).min(31)] = true;
+                        }
+                    }
+                    let n_distinct_bins = j_bins_used.iter().filter(|&&b| b).count();
+
+                    if n_distinct_bins >= 2 {
+                        dominated[gi] = true;
+                        break;
+                    }
+                }
+            }
+
+            let n_saved = {
+                let standard = subset_dominance(index, &groups);
+                let n_standard = standard.iter().filter(|&&d| d).count();
+                let n_coverage = dominated.iter().filter(|&&d| d).count();
+                n_standard - n_coverage
+            };
+            if n_saved > 0 {
+                info!("  Coverage plausibility rescued {} groups from dominance removal", n_saved);
+            }
+
+            dominated
+        } else {
+            subset_dominance(index, &groups)
+        };
+
+        let n_dominated = dom.iter().filter(|&&d| d).count();
+        info!(
+            "  Stage 3 (subset dominance): {} / {} groups are dominated (removable)",
+            n_dominated, groups.num_groups()
+        );
+        dom
+    } else {
+        info!("  Stage 3 (subset dominance): skipped");
+        vec![false; groups.num_groups()]
+    };
+
+    let mut keep_mask = vec![false; num_targets];
+    for (gi, &is_dominated) in dominated.iter().enumerate() {
+        if !is_dominated {
+            for &member in groups.group_members(gi) {
+                keep_mask[member as usize] = true;
+            }
+        }
+    }
+    let num_kept = keep_mask.iter().filter(|&&b| b).count();
+    let num_removed = num_targets - num_kept;
+    info!(
+        "  Variable selection result: {} kept, {} removed ({:.1}% reduction)",
+        num_kept, num_removed, 100.0 * num_removed as f64 / num_targets as f64
+    );
+
+    SelectionResult {
+        keep_mask,
+        groups,
+        required,
+        dominated,
+        num_kept,
+        num_removed,
+    }
+}
+
 /// Run variable selection from a pre-built TranscriptEqIndex (e.g., a merged index).
 ///
 /// This variant doesn't need a PackedEqMap — it derives all structure from the index.

@@ -268,11 +268,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         let total_eqcs: usize = eqc_counts.iter().sum();
         let merged_index =
             txp_selection::merge_transcript_indices(&indices, &eqc_counts, n_targets);
-        let result = txp_selection::run_selection_from_index_with_stages(
+        let packed_maps_ref: Vec<&_> = bundles.iter().map(|b| &b.packed_eq_map).collect();
+        let result = txp_selection::run_selection_from_index_with_coverage(
             &merged_index,
             n_targets,
             total_eqcs,
             &stages,
+            &packed_maps_ref,
+            &eqc_counts,
         );
         info!(
             "Structural selection: {} kept, {} removed (from {} transcripts)",

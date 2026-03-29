@@ -212,11 +212,11 @@ mod tests {
 
     fn build_test_eq_map() -> PackedEqMap<BasicEqLabel> {
         let mut eqm = BasicEqMap::new(OrientationProperty::OrientationAgnostic);
-        for _ in 0..10 { eqm.add(BasicEqLabel::new(&[0, 1], None)); }
-        for _ in 0..15 { eqm.add(BasicEqLabel::new(&[1, 2], None)); }
-        for _ in 0..20 { eqm.add(BasicEqLabel::new(&[0], None)); }
-        for _ in 0..5 { eqm.add(BasicEqLabel::new(&[2, 3, 4], None)); }
-        for _ in 0..8 { eqm.add(BasicEqLabel::new(&[3], None)); }
+        for _ in 0..10 { eqm.add(BasicEqLabel::new(&[0, 1], None, None)); }
+        for _ in 0..15 { eqm.add(BasicEqLabel::new(&[1, 2], None, None)); }
+        for _ in 0..20 { eqm.add(BasicEqLabel::new(&[0], None, None)); }
+        for _ in 0..5 { eqm.add(BasicEqLabel::new(&[2, 3, 4], None, None)); }
+        for _ in 0..8 { eqm.add(BasicEqLabel::new(&[3], None, None)); }
         PackedEqMap::from_eq_map(&eqm)
     }
 

@@ -780,7 +780,7 @@ mod tests {
         let mut eqm = BasicEqMap::new(OrientationProperty::OrientationAgnostic);
         for &(targets, count) in eqcs {
             for _ in 0..count {
-                eqm.add(BasicEqLabel::new(targets, None));
+                eqm.add(BasicEqLabel::new(targets, None, None));
             }
         }
         PackedEqMap::from_eq_map(&eqm)

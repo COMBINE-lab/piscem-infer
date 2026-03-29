@@ -1050,11 +1050,16 @@ fn process_chunk<D: FldPDF, EqLabelT: EqLabel>(
     fld_pdf: &D,
     state: &mut WorkerState<EqLabelT>,
 ) {
+    let num_pos_bins = crate::utils::eq_maps::NUM_POS_BINS
+        .get()
+        .copied()
+        .unwrap_or(1.0) as u32;
     let mut mapped_ori_count = [0u32; 7];
     let mut filtered_ori_count = [0u32; 7];
     let mut label_ints = vec![];
     let mut dir_ints = vec![];
     let mut probs = vec![];
+    let mut pos_bin_ints = vec![];
 
     for mappings in &chunk.reads {
         let ft = rad_types::MappingType::from_u8(mappings.frag_type);
@@ -1068,6 +1073,7 @@ fn process_chunk<D: FldPDF, EqLabelT: EqLabel>(
         label_ints.clear();
         dir_ints.clear();
         probs.clear();
+        pos_bin_ints.clear();
 
         for (((r, pos), o), l) in mappings
             .refs
@@ -1094,14 +1100,25 @@ fn process_chunk<D: FldPDF, EqLabelT: EqLabel>(
                     | MappedFragmentOrientation::ReverseForward => fld_pdf.pdf(*l as usize),
                     _ => 2.0 * f64::MIN_POSITIVE,
                 };
-                probs.push(frag_len_prob)
+                probs.push(frag_len_prob);
+                // Compute positional bin from relative position on transcript.
+                if num_pos_bins > 1 {
+                    let rel_pos = *pos as f64 / ref_lengths[*r as usize] as f64;
+                    let bin = (rel_pos * num_pos_bins as f64) as u32;
+                    pos_bin_ints.push(bin.min(num_pos_bins - 1));
+                }
             } else {
                 filtered_ori_count[y as usize] += 1;
             }
         }
 
         label_ints.append(&mut dir_ints);
-        let eql = EqLabelT::new(&label_ints, Some(&probs));
+        let pos_bins_arg = if num_pos_bins > 1 {
+            Some(pos_bin_ints.as_slice())
+        } else {
+            None
+        };
+        let eql = EqLabelT::new(&label_ints, Some(&probs), pos_bins_arg);
         state.eqmap.add(eql);
 
         if nm == 1 && !ft.is_orphan() {

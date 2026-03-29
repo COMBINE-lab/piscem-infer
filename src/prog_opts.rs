@@ -145,6 +145,11 @@ pub struct QuantOpts {
     /// If this value is set to 1, then basic equivalence classes are used.
     #[arg(long, default_value_t = 64_u32, value_parser=greater_than_0, help_heading = "Advanced")]
     pub factorized_eqc_bins: u32,
+    /// number of positional bins for positional equivalence classes.
+    /// Fragments at different relative positions on the same transcripts
+    /// become different ECs, improving isoform disambiguation. (1 = disabled)
+    #[arg(long, default_value_t = 5_u32, value_parser=greater_than_0, help_heading = "Advanced")]
+    pub pos_bins: u32,
     /// number of threads to use (used during the EM and for bootstrapping)
     #[arg(long, default_value_t = 16, help_heading = "Advanced")]
     pub num_threads: usize,
@@ -234,6 +239,11 @@ pub struct MultiQuantOpts {
     /// number of probability bins for RangeFactorized equivalence classes (1 = basic)
     #[arg(long, default_value_t = 64_u32, value_parser = greater_than_0, help_heading = "Advanced")]
     pub factorized_eqc_bins: u32,
+    /// number of positional bins for positional equivalence classes.
+    /// Fragments at different relative positions on the same transcripts
+    /// become different ECs, improving isoform disambiguation. (1 = disabled)
+    #[arg(long, default_value_t = 5_u32, value_parser = greater_than_0, help_heading = "Advanced")]
+    pub pos_bins: u32,
     /// number of threads to use
     #[arg(long, default_value_t = 16, help_heading = "Advanced")]
     pub num_threads: usize,
@@ -381,6 +391,11 @@ pub struct ConsensusQuantOpts {
     /// number of probability bins for RangeFactorized equivalence classes (1 = basic)
     #[arg(long, default_value_t = 64_u32, value_parser = greater_than_0, help_heading = "Advanced")]
     pub factorized_eqc_bins: u32,
+    /// number of positional bins for positional equivalence classes.
+    /// Fragments at different relative positions on the same transcripts
+    /// become different ECs, improving isoform disambiguation. (1 = disabled)
+    #[arg(long, default_value_t = 5_u32, value_parser = greater_than_0, help_heading = "Advanced")]
+    pub pos_bins: u32,
     /// number of threads to use
     #[arg(long, default_value_t = 16, help_heading = "Advanced")]
     pub num_threads: usize,

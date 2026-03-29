@@ -7,6 +7,20 @@ pub type RangeFactorizedEqMap = EqMap<RangeFactorizedEqLabel>;
 /// the default number of bins to use for range-factorized equivalence classes
 pub static NUM_BINS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
+/// number of positional bins for positional equivalence classes (default 1 = disabled)
+pub static NUM_POS_BINS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Helper: number of segments in a RangeFactorized packed label.
+fn rf_num_segments(has_ori: bool) -> usize {
+    let has_pos = NUM_POS_BINS.get().is_some_and(|&n| n > 1.0);
+    match (has_pos, has_ori) {
+        (false, false) => 2, // targets, prob_bins
+        (false, true) => 3,  // targets, prob_bins, oris
+        (true, false) => 3,  // targets, prob_bins, pos_bins
+        (true, true) => 4,   // targets, prob_bins, pos_bins, oris
+    }
+}
+
 /// whether or not the equivalence classes differentiate between fragments
 /// mapping in different orientations
 pub enum OrientationProperty {
@@ -28,7 +42,7 @@ pub enum EqMapType {
 /// These types must also be hashable and comparable to be used as keys in HashMaps.
 pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq + Sync {
     type LabelRefT<'a>: TargetLabelsRef;
-    fn new(labels: &[u32], probs: Option<&[f64]>) -> Self;
+    fn new(labels: &[u32], probs: Option<&[f64]>, pos_bins: Option<&[u32]>) -> Self;
     fn new_ref(labels: &[u32], has_ori: bool) -> Self::LabelRefT<'_>;
 }
 
@@ -70,9 +84,9 @@ impl EqLabel for BasicEqLabel {
         }
     }
 
-    /// we ignore probabiltiies in the basic equivalence class, and just
-    /// pass along the targets we are given as the labels
-    fn new(targets: &[u32], _probs: Option<&[f64]>) -> Self {
+    /// we ignore probabilities and position bins in the basic equivalence class,
+    /// and just pass along the targets we are given as the labels
+    fn new(targets: &[u32], _probs: Option<&[f64]>, _pos_bins: Option<&[u32]>) -> Self {
         Self {
             targets: targets.into(),
         }
@@ -156,42 +170,42 @@ impl EqLabel for RangeFactorizedEqLabel {
         }
     }
 
-    /// create the range factorized equivalence class the labels and
-    /// the associated probabilities.
-    fn new(labels: &[u32], probs: Option<&[f64]>) -> Self {
-        // the probability vector must not be `None` when creating a
-        // range-factorized equivalence class
+    /// create the range factorized equivalence class from labels,
+    /// associated probabilities, and optional position bins.
+    fn new(labels: &[u32], probs: Option<&[f64]>, pos_bins: Option<&[u32]>) -> Self {
         let probs = probs.expect("probs *must* be present for range factorized equivalence class");
 
-        // compute the total probability so we can normalize later
         let tot_prob: f64 = probs.iter().sum();
-        // get the number of labels (because the labels slice could contain either
-        // just labels or labels and encoded orientations)
         let num_labels = probs.len();
-        // get the number of bins we are using for the range factorized equivalence class
-        // representation
         let num_bins = *NUM_BINS.get().unwrap() as usize;
+        let num_pos_bins = NUM_POS_BINS.get().copied().unwrap_or(1.0) as usize;
 
-        // we will structure the contents of the range factorized equivalence class, that
-        // contains k labels as
-        //
-        // [label_1],[label_2],...,[label_k],[bin_id_1],[bin_id_2],...,[bin_id_k],[ori_1],[ori_2],...,[ori_k]
-        //
-        // where the `ori` components may be optional
+        // Layout: [targets..., prob_bins..., pos_bins..., oris...]
+        // where pos_bins are only present when NUM_POS_BINS > 1
         let (just_labels, oris) = labels.split_at(num_labels);
         let mut targets_and_bins: Vec<u32> = just_labels.into();
-        // map the probabilities to the appropriate bin IDs
+
+        // Probability bins
         targets_and_bins.extend(probs.iter().map(|&prob| {
             let p: f64 = prob / tot_prob;
-            // Handle edge case where p = 1.0 (should go to last bin)
             if p >= 1.0 {
                 (num_bins - 1) as u32
             } else {
-                // Calculate bin index: floor(p * num_bins)
                 (p * num_bins as f64) as u32
             }
         }));
-        // add back the encoding of the orientations if we have them
+
+        // Position bins (only when enabled)
+        if num_pos_bins > 1 {
+            if let Some(pb) = pos_bins {
+                targets_and_bins.extend_from_slice(pb);
+            } else {
+                // Default to bin 0 if not provided
+                targets_and_bins.extend(std::iter::repeat(0u32).take(num_labels));
+            }
+        }
+
+        // Orientations
         targets_and_bins.extend_from_slice(oris);
         Self { targets_and_bins }
     }
@@ -228,21 +242,19 @@ impl<'a> ExactSizeIterator for RangeFactorizedBinIterator<'a> {}
 impl TargetLabels for RangeFactorizedEqLabel {
     #[inline]
     fn target_labels(&self, with_ori: bool) -> &[u32] {
-        // if this is an orientation-aware equivalence class factorization, then
-        // the targets_and_bins vector contains (labels, oris, probs), otherwise
-        // it contains just (labels, probs)
-        let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
+        let nseg = rf_num_segments(with_ori);
+        let l = self.targets_and_bins.len() / nseg;
         &self.targets_and_bins[..l]
     }
 
-    /// This function extracts the entire key that should be used to represent
-    /// this equivalence class label in a packed map. For a range factorized
-    /// equivalence class label such as this, it will be the list of targets
-    /// as well as the list of probability bin ids (but not the encoding of
-    /// the fragment orientations).
+    /// Extract the key for the packed map: targets + prob_bins + pos_bins
+    /// (everything except orientations).
     fn extract_key_for_packed_map(&self, has_ori: bool) -> &[u32] {
-        let l = self.targets_and_bins.len() / if has_ori { 3 } else { 2 };
-        &self.targets_and_bins[..2 * l]
+        let nseg = rf_num_segments(has_ori);
+        let l = self.targets_and_bins.len() / nseg;
+        // Everything except the last segment (oris) if has_ori, else everything
+        let key_segments = if has_ori { nseg - 1 } else { nseg };
+        &self.targets_and_bins[..key_segments * l]
     }
 }
 
@@ -257,17 +269,18 @@ impl<'a> TargetLabelsRef for RangeFactorizedEqLabelRef<'a> {
     /// gets the labels associated with this reference
     #[inline]
     fn target_labels(&self) -> &[u32] {
-        let with_ori = self.contains_ori;
-        let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
+        let nseg = rf_num_segments(self.contains_ori);
+        let l = self.targets_and_bins.len() / nseg;
         &self.targets_and_bins[..l]
     }
 
-    /// returns an iterator over the probabilities assocaited with the
-    /// bins of this reference
+    /// returns an iterator over the conditional probabilities from the
+    /// probability bins of this reference (position weight = 1.0 under
+    /// uniform coverage, folded in for future bias models)
     #[inline]
     fn target_probs(&self) -> impl Iterator<Item = f64> {
-        let with_ori = self.contains_ori;
-        let l = self.targets_and_bins.len() / if with_ori { 3 } else { 2 };
+        let nseg = rf_num_segments(self.contains_ori);
+        let l = self.targets_and_bins.len() / nseg;
         let num_bins = *NUM_BINS.get().unwrap();
         let half_bin_width = 0.5 / num_bins;
         RangeFactorizedBinIterator {

@@ -1119,7 +1119,7 @@ mod tests {
             let n_unique =
                 (total_reads as f64 * theta[t] * unique_frac).round() as usize;
             for _ in 0..n_unique {
-                eqm.add(BasicEqLabel::new(&[t as u32], None));
+                eqm.add(BasicEqLabel::new(&[t as u32], None, None));
             }
         }
 
@@ -1132,7 +1132,7 @@ mod tests {
             let n_ambig_t2 =
                 (total_reads as f64 * theta[t2] * (1.0 - unique_frac)).round() as usize;
             for _ in 0..(n_ambig_t1 + n_ambig_t2) {
-                eqm.add(BasicEqLabel::new(&[t1 as u32, t2 as u32], None));
+                eqm.add(BasicEqLabel::new(&[t1 as u32, t2 as u32], None, None));
             }
         }
 
@@ -1264,6 +1264,7 @@ mod tests {
             fld_mean: None,
             fld_sd: None,
             factorized_eqc_bins: 1,
+            pos_bins: 1,
             num_threads: 1,
             auto_detect_samples: 10_000,
             phase_a_only: false,

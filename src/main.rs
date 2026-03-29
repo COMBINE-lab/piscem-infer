@@ -36,18 +36,27 @@ fn main() -> anyhow::Result<()> {
             crate::utils::eq_maps::NUM_BINS
                 .set(quant_opts.factorized_eqc_bins as f64)
                 .expect("NUM_BINS should not yet have been initalized");
+            crate::utils::eq_maps::NUM_POS_BINS
+                .set(quant_opts.pos_bins as f64)
+                .expect("NUM_POS_BINS should not yet have been initialized");
             process_bulk(quant_opts, eqc_type)?
         }
         Commands::MultiQuant(multi_opts) => {
             crate::utils::eq_maps::NUM_BINS
                 .set(multi_opts.factorized_eqc_bins as f64)
                 .expect("NUM_BINS should not yet have been initalized");
+            crate::utils::eq_maps::NUM_POS_BINS
+                .set(multi_opts.pos_bins as f64)
+                .expect("NUM_POS_BINS should not yet have been initialized");
             multi_sample::run(&multi_opts)?
         }
         Commands::ConsensusQuant(consensus_opts) => {
             crate::utils::eq_maps::NUM_BINS
                 .set(consensus_opts.factorized_eqc_bins as f64)
                 .expect("NUM_BINS should not yet have been initalized");
+            crate::utils::eq_maps::NUM_POS_BINS
+                .set(consensus_opts.pos_bins as f64)
+                .expect("NUM_POS_BINS should not yet have been initialized");
             consensus::run(&consensus_opts)?
         }
     }

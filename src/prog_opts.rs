@@ -388,6 +388,12 @@ pub struct ConsensusQuantOpts {
     /// disable phase-2 warm starts from the phase-1 abundance estimates.
     #[arg(long, help_heading = "Consensus Filter")]
     pub no_phase2_warm_start: bool,
+    /// within-gene isoform fraction filter: after Phase 2 EM, zero out isoforms
+    /// contributing less than this fraction of their gene's total estimated count.
+    /// Removes EM leakage into sibling isoforms. Gene names are parsed from
+    /// pipe-delimited transcript IDs (GENCODE format, field 6). Set to 0 to disable.
+    #[arg(long, default_value_t = 0.01, help_heading = "Consensus Filter")]
+    pub gene_fraction_filter: f64,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation

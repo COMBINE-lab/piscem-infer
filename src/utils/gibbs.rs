@@ -36,7 +36,7 @@ fn do_gibbs_in_pool<EqLabelT: EqLabel>(
     pool: Option<&ThreadPool>,
 ) -> Vec<Vec<f64>> {
     let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
+    let eff_lens = &em_info.eff_lens;
     let num_targets = eff_lens.len();
 
     // Per-nucleotide Dirichlet-like prior: alpha_prior / effLen[i]

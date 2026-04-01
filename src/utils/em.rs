@@ -72,7 +72,7 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
         .iter()
         .map(|rli| {
             let rl = *rli as usize;
-            let adj_len = if rl > cond_means.len() {
+            let adj_len = if rl >= cond_means.len() {
                 (rl as f64) - tmean
             } else {
                 (rl as f64) - cond_means[rl]
@@ -80,6 +80,68 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
             if adj_len >= 1.0 { adj_len } else { rl as f64 }
         })
         .collect::<Vec<f64>>()
+}
+
+/// Compute positional effective lengths for all transcripts.
+///
+/// For transcript of length L with N position bins, bin b spans absolute positions
+/// `[b*L/N, (b+1)*L/N)`. For a fragment of length f, valid start positions in bin b
+/// are `[b*L/N, min((b+1)*L/N, L-f+1))`. The positional effective length integrates
+/// this over the fragment length distribution.
+///
+/// Returns `(pos_eff_lens, totals)`:
+/// - `pos_eff_lens`: flattened `[n_targets * n_pos_bins]` where `[t * n + b]` is the
+///   effective length of transcript t in bin b
+/// - `totals`: per-transcript totals `Σ_b pos_eff_len[t][b]`
+pub fn compute_positional_eff_lens(
+    ref_lens: &[u32],
+    frag_length_counts: &[u32],
+    n_pos_bins: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    // Normalize FLD to probabilities
+    let total_count: f64 = frag_length_counts.iter().map(|&x| x as f64).sum();
+    let fld_probs: Vec<f64> = if total_count > 0.0 {
+        frag_length_counts.iter().map(|&x| x as f64 / total_count).collect()
+    } else {
+        return (vec![0.0; ref_lens.len() * n_pos_bins], vec![0.0; ref_lens.len()]);
+    };
+
+    // Find max fragment length with nonzero probability
+    let max_frag = fld_probs.len();
+
+    let n_targets = ref_lens.len();
+    let mut pos_eff = vec![0.0f64; n_targets * n_pos_bins];
+    let mut totals = vec![0.0f64; n_targets];
+
+    for (t, &ref_len) in ref_lens.iter().enumerate() {
+        let l = ref_len as f64;
+        if l < 1.0 {
+            continue;
+        }
+
+        for b in 0..n_pos_bins {
+            let bin_start = (b as f64) * l / (n_pos_bins as f64);
+            let bin_end = ((b + 1) as f64) * l / (n_pos_bins as f64);
+            let mut pel = 0.0f64;
+
+            for f in 1..max_frag.min(ref_len as usize + 1) {
+                let prob = fld_probs[f];
+                if prob == 0.0 {
+                    continue;
+                }
+                // Valid start positions for fragment of length f: [0, L-f]
+                // Intersection with bin [bin_start, bin_end):
+                let valid_end = (l - f as f64 + 1.0).min(bin_end);
+                let width = (valid_end - bin_start).max(0.0);
+                pel += prob * width;
+            }
+
+            pos_eff[t * n_pos_bins + b] = pel;
+            totals[t] += pel;
+        }
+    }
+
+    (pos_eff, totals)
 }
 
 #[inline]
@@ -125,20 +187,19 @@ fn m_step_par<EqLabelT: EqLabel>(
 
 #[inline]
 fn m_step<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
+    em_info: &EMInfo<EqLabelT>,
     eq_counts: &[usize],
     prev_count: &[f64],
-    inv_eff_lens: &[f64],
     curr_counts: &mut [f64],
 ) {
     let mut weights: Vec<f64> = Vec::with_capacity(64);
 
-    for (k, v) in eq_map.iter_labels().zip(eq_counts.iter()) {
+    for (k, v) in em_info.eq_map.iter_labels().zip(eq_counts.iter()) {
         let count = *v as f64;
 
         let mut denom = 0.0_f64;
         for (e, cond_prob) in k.target_labels().iter().zip(k.target_probs()) {
-            let w = cond_prob * prev_count[*e as usize] * inv_eff_lens[*e as usize];
+            let w = cond_prob * prev_count[*e as usize] * em_info.inv_eff_lens[*e as usize];
             weights.push(w);
             denom += w;
         }
@@ -152,13 +213,47 @@ fn m_step<EqLabelT: EqLabel>(
     }
 }
 
-/// Holds the info relevant for running the EM algorithm
-pub struct EMInfo<'eqm, 'el, EqLabelT> {
+/// Holds the info relevant for running the EM algorithm.
+/// Owns effective lengths and precomputes inverse eff_lens so that
+/// M-step functions don't redundantly recompute them.
+pub struct EMInfo<'eqm, EqLabelT> {
     pub eq_map: &'eqm PackedEqMap<EqLabelT>,
-    pub eff_lens: &'el [f64],
+    pub eff_lens: Vec<f64>,
+    pub inv_eff_lens: Vec<f64>,
     pub max_iter: u32,
     pub convergence_thresh: f64,
     pub presence_thresh: f64,
+}
+
+impl<'eqm, EqLabelT: EqLabel> EMInfo<'eqm, EqLabelT> {
+    /// Create a new EMInfo, precomputing inverse effective lengths.
+    pub fn new(
+        eq_map: &'eqm PackedEqMap<EqLabelT>,
+        eff_lens: Vec<f64>,
+        max_iter: u32,
+        convergence_thresh: f64,
+        presence_thresh: f64,
+    ) -> Self {
+        let inv_eff_lens = compute_inv_eff_lens(&eff_lens);
+        Self {
+            eq_map,
+            eff_lens,
+            inv_eff_lens,
+            max_iter,
+            convergence_thresh,
+            presence_thresh,
+        }
+    }
+
+    /// Zero out effective lengths for masked transcripts.
+    pub fn apply_mask(&mut self, mask: &[bool]) {
+        for (t, &keep) in mask.iter().enumerate() {
+            if !keep {
+                self.eff_lens[t] = 0.0;
+                self.inv_eff_lens[t] = 0.0;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -288,13 +383,12 @@ fn squarem_alpha(x0: &[f64], x1: &[f64], x2: &[f64], opts: SquaremOptions) -> Op
 
 #[inline]
 fn em_step_plain<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
-    inv_eff_lens: &[f64],
+    em_info: &EMInfo<EqLabelT>,
     prev_counts: &[f64],
     out: &mut [f64],
 ) {
     out.fill(0.0);
-    m_step(eq_map, &eq_map.counts, prev_counts, inv_eff_lens, out);
+    m_step(em_info, &em_info.eq_map.counts, prev_counts, out);
 }
 
 #[inline]
@@ -379,14 +473,7 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
     let max_iter = em_info.max_iter;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
+    let eff_lens = &em_info.eff_lens;
     let total_weight = em_info.eq_map.counts.iter().sum::<usize>();
     // init
     let avg = (total_weight as f64) / (eff_lens.len() as f64);
@@ -410,10 +497,9 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
 
                 while niter < max_iter {
                     m_step(
-                        eq_map,
+                        em_info,
                         &base_counts,
                         &prev_counts,
-                        &inv_eff_lens,
                         &mut curr_counts,
                     );
 
@@ -434,10 +520,9 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                     }
                 });
                 m_step(
-                    eq_map,
+                    em_info,
                     &base_counts,
                     &prev_counts,
-                    &inv_eff_lens,
                     &mut curr_counts,
                 );
 
@@ -478,14 +563,8 @@ pub fn em_par_with_pool_init<EqLabelT: EqLabel>(
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
+    let eff_lens = &em_info.eff_lens;
+    let inv_eff_lens = &em_info.inv_eff_lens;
     let max_iter = em_info.max_iter;
     let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
 
@@ -507,7 +586,7 @@ pub fn em_par_with_pool_init<EqLabelT: EqLabel>(
             m_step_par::<EqLabelT>(
                 &eq_iterates,
                 &mut prev_counts,
-                &inv_eff_lens,
+                inv_eff_lens,
                 &mut curr_counts,
             );
 
@@ -536,7 +615,7 @@ pub fn em_par_with_pool_init<EqLabelT: EqLabel>(
         m_step_par::<EqLabelT>(
             &eq_iterates,
             &mut prev_counts,
-            &inv_eff_lens,
+            inv_eff_lens,
             &mut curr_counts,
         );
     });
@@ -562,11 +641,9 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
 ) -> Vec<f64> {
     let opts = SquaremOptions::default();
     let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
+    let eff_lens = &em_info.eff_lens;
     let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+    let total_weight: f64 = em_info.eq_map.counts.iter().sum::<usize>() as f64;
 
     let mut x0 = initial_counts(eff_lens, total_weight, init_counts);
     project_counts(&mut x0, eff_lens, total_weight);
@@ -581,7 +658,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
     let mut accel_accepts = 0_u32;
 
     while em_steps < max_iter {
-        em_step_plain(eq_map, &inv_eff_lens, &x0, &mut x1);
+        em_step_plain(em_info, &x0, &mut x1);
         em_steps += 1;
         let rel1 = compute_rel_diff(&x0, &x1, presence_thresh);
         last_rel_diff = rel1;
@@ -596,7 +673,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
         }
 
         accel_attempts += 1;
-        em_step_plain(eq_map, &inv_eff_lens, &x1, &mut x2);
+        em_step_plain(em_info, &x1, &mut x2);
         em_steps += 1;
 
         let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
@@ -609,7 +686,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
             }
             project_counts(&mut x_sq, eff_lens, total_weight);
             if em_steps < max_iter {
-                em_step_plain(eq_map, &inv_eff_lens, &x_sq, &mut x_next);
+                em_step_plain(em_info, &x_sq, &mut x_next);
                 em_steps += 1;
                 let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
                 if x_next.iter().all(|x| x.is_finite() && *x >= 0.0)
@@ -639,7 +716,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
             *x = 0.0;
         }
     });
-    em_step_plain(eq_map, &inv_eff_lens, &x0, &mut x1);
+    em_step_plain(em_info, &x0, &mut x1);
     info!(
         "SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
         em_steps, accel_attempts, accel_accepts, last_rel_diff
@@ -670,8 +747,8 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
     let opts = SquaremOptions::default();
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
+    let eff_lens = &em_info.eff_lens;
+    let inv_eff_lens = &em_info.inv_eff_lens;
     let max_iter = em_info.max_iter;
     let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
     let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
@@ -691,7 +768,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
     while em_steps < max_iter {
         let x1 = em_step_plain_par_in_pool::<EqLabelT>(
             &eq_iterates,
-            &inv_eff_lens,
+            inv_eff_lens,
             &x0,
             &mut curr_counts,
             pool,
@@ -712,7 +789,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
         accel_attempts += 1;
         let x2 = em_step_plain_par_in_pool::<EqLabelT>(
             &eq_iterates,
-            &inv_eff_lens,
+            inv_eff_lens,
             &x1,
             &mut curr_counts,
             pool,
@@ -732,7 +809,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
             if em_steps < max_iter {
                 let x_next = em_step_plain_par_in_pool::<EqLabelT>(
                     &eq_iterates,
-                    &inv_eff_lens,
+                    inv_eff_lens,
                     &x_sq,
                     &mut curr_counts,
                     pool,
@@ -767,7 +844,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
         }
     });
     let final_counts =
-        em_step_plain_par_in_pool::<EqLabelT>(&eq_iterates, &inv_eff_lens, &x0, &mut curr_counts, pool);
+        em_step_plain_par_in_pool::<EqLabelT>(&eq_iterates, inv_eff_lens, &x0, &mut curr_counts, pool);
     info!(
         "SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
         em_steps, accel_attempts, accel_accepts, last_rel_diff
@@ -788,17 +865,9 @@ pub fn em_penalized<EqLabelT: EqLabel>(
 ) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
+    let eff_lens = &em_info.eff_lens;
     let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+    let total_weight: f64 = em_info.eq_map.counts.iter().sum::<usize>() as f64;
 
     // init
     let avg = total_weight / (eff_lens.len() as f64);
@@ -811,10 +880,9 @@ pub fn em_penalized<EqLabelT: EqLabel>(
 
     while niter < max_iter {
         m_step(
-            eq_map,
-            &eq_map.counts,
+            em_info,
+            &em_info.eq_map.counts,
             &prev_counts,
-            &inv_eff_lens,
             &mut curr_counts,
         );
 
@@ -844,10 +912,9 @@ pub fn em_penalized<EqLabelT: EqLabel>(
         }
     });
     m_step(
-        eq_map,
-        &eq_map.counts,
+        em_info,
+        &em_info.eq_map.counts,
         &prev_counts,
-        &inv_eff_lens,
         &mut curr_counts,
     );
 
@@ -880,14 +947,8 @@ pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
+    let eff_lens = &em_info.eff_lens;
+    let inv_eff_lens = &em_info.inv_eff_lens;
     let max_iter = em_info.max_iter;
     let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
 
@@ -913,7 +974,7 @@ pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
             m_step_par::<EqLabelT>(
                 &eq_iterates,
                 &mut prev_counts,
-                &inv_eff_lens,
+                inv_eff_lens,
                 &mut curr_counts,
             );
 
@@ -946,7 +1007,7 @@ pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
         m_step_par::<EqLabelT>(
             &eq_iterates,
             &mut prev_counts,
-            &inv_eff_lens,
+            inv_eff_lens,
             &mut curr_counts,
         );
 
@@ -972,17 +1033,9 @@ pub fn em_init<EqLabelT: EqLabel>(
 ) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = eff_lens
-        .iter()
-        .map(|x| {
-            let y = 1.0_f64 / *x;
-            if y.is_finite() { y } else { 0_f64 }
-        })
-        .collect::<Vec<f64>>();
+    let eff_lens = &em_info.eff_lens;
     let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+    let total_weight: f64 = em_info.eq_map.counts.iter().sum::<usize>() as f64;
 
     let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
     let mut curr_counts = vec![0.0f64; eff_lens.len()];
@@ -993,10 +1046,9 @@ pub fn em_init<EqLabelT: EqLabel>(
 
     while niter < max_iter {
         m_step(
-            eq_map,
-            &eq_map.counts,
+            em_info,
+            &em_info.eq_map.counts,
             &prev_counts,
-            &inv_eff_lens,
             &mut curr_counts,
         );
 
@@ -1021,10 +1073,9 @@ pub fn em_init<EqLabelT: EqLabel>(
         }
     });
     m_step(
-        eq_map,
-        &eq_map.counts,
+        em_info,
+        &em_info.eq_map.counts,
         &prev_counts,
-        &inv_eff_lens,
         &mut curr_counts,
     );
 
@@ -1039,20 +1090,16 @@ pub fn em_init<EqLabelT: EqLabel>(
 /// Returns a flattened `n_targets × n_pos_bins` array where
 /// `profile[t * n_pos_bins + b]` = assigned reads to transcript t from pos_bin b.
 pub fn compute_coverage_profile<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
+    em_info: &EMInfo<EqLabelT>,
     em_counts: &[f64],
-    eff_lens: &[f64],
     n_targets: usize,
     n_pos_bins: usize,
 ) -> Vec<f64> {
-    let inv_eff_lens: Vec<f64> = eff_lens
-        .iter()
-        .map(|x| { let y = 1.0 / *x; if y.is_finite() { y } else { 0.0 } })
-        .collect();
+    let inv_eff_lens = &em_info.inv_eff_lens;
 
     let mut profile = vec![0.0f64; n_targets * n_pos_bins];
 
-    for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
+    for (label, &count) in em_info.eq_map.iter_labels().zip(em_info.eq_map.counts.iter()) {
         let ec_count = count as f64;
         if ec_count == 0.0 { continue; }
 
@@ -1140,7 +1187,7 @@ pub fn em_with_coverage<EqLabelT: EqLabel>(
     for round in 0..n_coverage_rounds {
         // Compute coverage profile from current estimates
         let profile = compute_coverage_profile(
-            em_info.eq_map, &counts, em_info.eff_lens, n_targets, n_pos_bins,
+            em_info, &counts, n_targets, n_pos_bins,
         );
 
         // Compute coverage weights
@@ -1158,16 +1205,16 @@ pub fn em_with_coverage<EqLabelT: EqLabel>(
 /// One coverage-weighted M-step: redistribute reads using coverage weights.
 #[inline]
 fn m_step_coverage_weighted<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
+    em_info: &EMInfo<EqLabelT>,
     prev_counts: &[f64],
-    inv_eff_lens: &[f64],
     cov_weights: &[f64],
     n_pos_bins: usize,
     out: &mut [f64],
 ) {
     out.fill(0.0);
+    let inv_eff_lens = &em_info.inv_eff_lens;
     let mut weights: Vec<f64> = Vec::with_capacity(64);
-    for (label, &count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
+    for (label, &count) in em_info.eq_map.iter_labels().zip(em_info.eq_map.counts.iter()) {
         let ec_count = count as f64;
         let pos_bins = label.target_pos_bins();
         let mut denom = 0.0f64;
@@ -1201,11 +1248,9 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
 ) -> Vec<f64> {
     let opts = SquaremOptions::default();
     let presence_thresh = em_info.presence_thresh;
-    let eq_map = em_info.eq_map;
-    let eff_lens = em_info.eff_lens;
-    let inv_eff_lens = compute_inv_eff_lens(eff_lens);
+    let eff_lens = &em_info.eff_lens;
     let max_iter = em_info.max_iter;
-    let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
+    let total_weight: f64 = em_info.eq_map.counts.iter().sum::<usize>() as f64;
 
     let mut x0 = initial_counts(eff_lens, total_weight, init_counts);
     project_counts(&mut x0, eff_lens, total_weight);
@@ -1220,7 +1265,7 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
     let mut accel_accepts = 0_u32;
 
     while em_steps < max_iter {
-        m_step_coverage_weighted(eq_map, &x0, &inv_eff_lens, cov_weights, n_pos_bins, &mut x1);
+        m_step_coverage_weighted(em_info, &x0, cov_weights, n_pos_bins, &mut x1);
         em_steps += 1;
         let rel1 = compute_rel_diff(&x0, &x1, presence_thresh);
         last_rel_diff = rel1;
@@ -1235,7 +1280,7 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
         }
 
         accel_attempts += 1;
-        m_step_coverage_weighted(eq_map, &x1, &inv_eff_lens, cov_weights, n_pos_bins, &mut x2);
+        m_step_coverage_weighted(em_info, &x1, cov_weights, n_pos_bins, &mut x2);
         em_steps += 1;
 
         let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
@@ -1247,7 +1292,7 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
             }
             project_counts(&mut x_sq, eff_lens, total_weight);
             if em_steps < max_iter {
-                m_step_coverage_weighted(eq_map, &x_sq, &inv_eff_lens, cov_weights, n_pos_bins, &mut x_next);
+                m_step_coverage_weighted(em_info, &x_sq, cov_weights, n_pos_bins, &mut x_next);
                 em_steps += 1;
                 let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
                 if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel {
@@ -1271,12 +1316,124 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
     }
 
     x0.iter_mut().for_each(|x| { if *x < presence_thresh { *x = 0.0 } });
-    m_step_coverage_weighted(eq_map, &x0, &inv_eff_lens, cov_weights, n_pos_bins, &mut x1);
+    m_step_coverage_weighted(em_info, &x0, cov_weights, n_pos_bins, &mut x1);
 
     info!(
         "Coverage SQUAREM: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
         em_steps, accel_attempts, accel_accepts, last_rel_diff
     );
     x1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_positional_eff_lens_uniform_fld() {
+        // Uniform FLD: all fragments have length 100
+        let mut fld = vec![0u32; 200];
+        fld[100] = 1000;
+
+        // Transcript of length 1000, 5 bins
+        // Bin boundaries: [0,200), [200,400), [400,600), [600,800), [800,1000)
+        // Valid starts for f=100: [0, 901)
+        // Bin 0: [0, 200) → width 200
+        // Bin 1: [200, 400) → width 200
+        // Bin 2: [400, 600) → width 200
+        // Bin 3: [600, 800) → width 200
+        // Bin 4: [800, 1000) but capped at 901 → width 101
+        let ref_lens = vec![1000u32];
+        let (pos_el, totals) = compute_positional_eff_lens(&ref_lens, &fld, 5);
+
+        assert_eq!(pos_el.len(), 5);
+        assert!((pos_el[0] - 200.0).abs() < 1.0);
+        assert!((pos_el[1] - 200.0).abs() < 1.0);
+        assert!((pos_el[2] - 200.0).abs() < 1.0);
+        assert!((pos_el[3] - 200.0).abs() < 1.0);
+        // Last bin should be smaller
+        assert!(pos_el[4] < pos_el[0]);
+        assert!((pos_el[4] - 101.0).abs() < 1.0);
+        // Total should be ~901 (= 1000 - 100 + 1)
+        assert!((totals[0] - 901.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_positional_eff_lens_edge_effect_short_transcript() {
+        // FLD peaked at 300
+        let mut fld = vec![0u32; 500];
+        fld[300] = 1000;
+
+        // Transcript of length 500, 5 bins
+        // Bin boundaries: [0,100), [100,200), [200,300), [300,400), [400,500)
+        // Valid starts for f=300: [0, 201)
+        // Bin 0: [0, 100) → width 100
+        // Bin 1: [100, 200) → width 100
+        // Bin 2: [200, 300) but capped at 201 → width 1
+        // Bin 3: [300, 400) but 201 < 300 → width 0
+        // Bin 4: [400, 500) but 201 < 400 → width 0
+        let ref_lens = vec![500u32];
+        let (pos_el, totals) = compute_positional_eff_lens(&ref_lens, &fld, 5);
+
+        assert!((pos_el[0] - 100.0).abs() < 1.0);
+        assert!((pos_el[1] - 100.0).abs() < 1.0);
+        assert!((pos_el[2] - 1.0).abs() < 1.0);
+        assert!(pos_el[3] < 0.01);
+        assert!(pos_el[4] < 0.01);
+        assert!((totals[0] - 201.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_positional_eff_lens_single_bin() {
+        // With 1 bin, pos_eff_len should equal its total.
+        // For long transcripts, totals approximate standard eff_lens;
+        // for short ones (L ~ max_frag_len), the exact integration diverges
+        // from the conditional-mean approximation.
+        let mut fld = vec![0u32; 500];
+        for f in 200..400 {
+            fld[f] = 10;
+        }
+
+        let ref_lens = vec![1000u32, 500u32, 300u32];
+        let (pos_el, totals) = compute_positional_eff_lens(&ref_lens, &fld, 1);
+        let cond_means = conditional_means(&fld);
+        let standard_el = adjust_ref_lengths(&ref_lens, &cond_means);
+
+        // Each pos_el should be its total (only 1 bin)
+        for t in 0..3 {
+            assert!((pos_el[t] - totals[t]).abs() < 0.01);
+        }
+        // Long transcript (1000bp >> FLD): should be close to standard
+        let rel = (totals[0] - standard_el[0]).abs() / standard_el[0].max(1.0);
+        assert!(rel < 0.05, "long transcript: positional {} vs standard {} (rel {})",
+            totals[0], standard_el[0], rel);
+        // Short transcript (300bp ~ FLD): exact integration < conditional-mean approx
+        assert!(totals[2] < standard_el[2],
+            "short transcript positional total should be less than standard (heavy FLD truncation)");
+    }
+
+    #[test]
+    fn test_positional_eff_lens_totals_match_standard() {
+        // Realistic FLD: truncated normal centered at 250, std 50
+        let mut fld = vec![0u32; 800];
+        for f in 100..500 {
+            let z = (f as f64 - 250.0) / 50.0;
+            fld[f] = (1000.0 * (-0.5 * z * z).exp()) as u32;
+        }
+
+        let ref_lens: Vec<u32> = (200..2000).step_by(100).map(|x| x as u32).collect();
+        let (_, totals) = compute_positional_eff_lens(&ref_lens, &fld, 5);
+        let cond_means = conditional_means(&fld);
+        let standard_el = adjust_ref_lengths(&ref_lens, &cond_means);
+
+        for (t, &rl) in ref_lens.iter().enumerate() {
+            if rl > 500 {
+                // For transcripts much longer than fragment length, should be close
+                let rel = (totals[t] - standard_el[t]).abs() / standard_el[t].max(1.0);
+                assert!(rel < 0.05, "transcript len {}: positional total {:.1} vs standard {:.1} (rel diff {:.4})",
+                    rl, totals[t], standard_el[t], rel);
+            }
+        }
+    }
 }
 

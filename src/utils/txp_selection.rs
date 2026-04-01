@@ -909,7 +909,6 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
             }
 
             // Build reverse map: (eqc, transcript) → position in transcript's signature.
-            // This lets us look up j's pos_bin for a given EC efficiently.
             let mut eqc_txp_sigpos: std::collections::HashMap<(u32, u32), usize> =
                 std::collections::HashMap::new();
             for t in 0..num_targets {

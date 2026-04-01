@@ -468,13 +468,13 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
         for (i, sample) in samples.iter().enumerate() {
             info!("  Sample '{}'", sample.sample_name);
 
-            let em_info = EMInfo {
-                eq_map: &packed_maps[i],
-                eff_lens: &all_meta[i].eff_lengths,
-                max_iter: opts.max_em_iter,
-                convergence_thresh: opts.convergence_thresh,
-                presence_thresh: opts.presence_thresh,
-            };
+            let em_info = EMInfo::new(
+                &packed_maps[i],
+                all_meta[i].eff_lengths.clone(),
+                opts.max_em_iter,
+                opts.convergence_thresh,
+                opts.presence_thresh,
+            );
 
             let counts = if is_init_iter {
                 // Standard EM to establish presence mask and data-driven estimates

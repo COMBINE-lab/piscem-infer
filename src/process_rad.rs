@@ -709,24 +709,16 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         None
     };
 
-    let inference_eff_lens: Vec<f64> = if let Some(ref mask) = transcript_mask {
-        bundle
-            .eff_lengths
-            .iter()
-            .enumerate()
-            .map(|(t, &el)| if mask[t] { el } else { 0.0 })
-            .collect()
-    } else {
-        bundle.eff_lengths.clone()
-    };
-
-    let eminfo = EMInfo {
-        eq_map: &bundle.packed_eq_map,
-        eff_lens: &inference_eff_lens,
+    let mut eminfo = EMInfo::new(
+        &bundle.packed_eq_map,
+        bundle.eff_lengths.clone(),
         max_iter,
         convergence_thresh,
         presence_thresh,
-    };
+    );
+    if let Some(ref mask) = transcript_mask {
+        eminfo.apply_mask(mask);
+    }
 
     let em_res = if quant_opts.coverage_smooth_rounds > 0 && quant_opts.pos_bins > 1 {
         crate::utils::em::em_with_coverage(

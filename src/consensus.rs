@@ -255,19 +255,22 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     let n_targets = bundles[0].ref_names.len();
 
+    // Build merged transcript-EC index (needed for structural selection and
+    // gene-fraction filter EC uniqueness).
+    use crate::utils::txp_selection;
+    let indices: Vec<_> = bundles
+        .iter()
+        .map(|b| txp_selection::TranscriptEqIndex::from_packed_eq_map(&b.packed_eq_map, n_targets))
+        .collect();
+    let eqc_counts: Vec<usize> = bundles.iter().map(|b| b.packed_eq_map.len()).collect();
+    let total_eqcs: usize = eqc_counts.iter().sum();
+    let merged_index =
+        txp_selection::merge_transcript_indices(&indices, &eqc_counts, n_targets);
+
     // ====== Optional: structural transcript variable selection ======
     let selection_stats = if opts.txp_selection {
-        use crate::utils::txp_selection;
         info!("Running structural transcript variable selection on merged EC graph...");
         let stages = opts.selection_stages.clone().unwrap_or_default();
-        let indices: Vec<_> = bundles
-            .iter()
-            .map(|b| txp_selection::TranscriptEqIndex::from_packed_eq_map(&b.packed_eq_map, n_targets))
-            .collect();
-        let eqc_counts: Vec<usize> = bundles.iter().map(|b| b.packed_eq_map.len()).collect();
-        let total_eqcs: usize = eqc_counts.iter().sum();
-        let merged_index =
-            txp_selection::merge_transcript_indices(&indices, &eqc_counts, n_targets);
         let packed_maps_ref: Vec<&_> = bundles.iter().map(|b| &b.packed_eq_map).collect();
         let result = txp_selection::run_selection_from_index_with_coverage(
             &merged_index,
@@ -308,13 +311,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 .enumerate()
                 .map(|(i, bundle)| -> Result<(usize, Vec<f64>)> {
                     info!("  [{}/{}] Phase 1 EM for {}", i + 1, n_samples, samples[i].sample_name);
-                    let eminfo = EMInfo {
-                        eq_map: &bundle.packed_eq_map,
-                        eff_lens: &bundle.eff_lengths,
-                        max_iter: phase1_max_iter(opts),
-                        convergence_thresh: phase1_convergence_thresh(opts),
-                        presence_thresh: opts.presence_thresh,
-                    };
+                    let eminfo = EMInfo::new(
+                        &bundle.packed_eq_map,
+                        bundle.eff_lengths.clone(),
+                        phase1_max_iter(opts),
+                        phase1_convergence_thresh(opts),
+                        opts.presence_thresh,
+                    );
                     let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
                         em_with_coverage(
                             &eminfo, None,
@@ -345,13 +348,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         let mut counts_vec = Vec::with_capacity(n_samples);
         for (i, bundle) in bundles.iter().enumerate() {
             info!("  [{}/{}] Phase 1 EM for {}", i + 1, n_samples, samples[i].sample_name);
-            let eminfo = EMInfo {
-                eq_map: &bundle.packed_eq_map,
-                eff_lens: &bundle.eff_lengths,
-                max_iter: phase1_max_iter(opts),
-                convergence_thresh: phase1_convergence_thresh(opts),
-                presence_thresh: opts.presence_thresh,
-            };
+            let eminfo = EMInfo::new(
+                &bundle.packed_eq_map,
+                bundle.eff_lengths.clone(),
+                phase1_max_iter(opts),
+                phase1_convergence_thresh(opts),
+                opts.presence_thresh,
+            );
             let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
                 em_with_coverage(
                     &eminfo, None,
@@ -612,29 +615,30 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         n_filtered
     );
 
-    // ====== Gene-level rescue ======
-    // For transcripts that fail consensus, check if their gene's total TPM
-    // passes consensus. If so, rescue all transcripts of that gene.
-    // Gene names are parsed from GENCODE-style pipe-delimited transcript names
-    // (field 6, 0-indexed field 5).
-    let consensus_mask = {
-        let mut mask = consensus_mask;
+    // Parse gene names from GENCODE-style pipe-delimited transcript names
+    // (field 6, 0-indexed field 5). Used for gene-level rescue and gene-fraction filtering.
+    let gene_names: Vec<Option<&str>> = bundles[0]
+        .ref_names
+        .iter()
+        .map(|name| name.split('|').nth(5))
+        .collect();
 
-        // Parse gene name from transcript name (field index 5 in pipe-delimited GENCODE IDs).
-        let gene_names: Vec<Option<&str>> = bundles[0]
-            .ref_names
-            .iter()
-            .map(|name| name.split('|').nth(5))
-            .collect();
-
-        // Build gene -> transcript indices mapping.
-        let mut gene_to_txps: std::collections::HashMap<&str, Vec<usize>> =
+    let gene_to_txps: std::collections::HashMap<&str, Vec<usize>> = {
+        let mut map: std::collections::HashMap<&str, Vec<usize>> =
             std::collections::HashMap::new();
         for (t, gene) in gene_names.iter().enumerate() {
             if let Some(g) = gene {
-                gene_to_txps.entry(g).or_default().push(t);
+                map.entry(g).or_default().push(t);
             }
         }
+        map
+    };
+
+    // ====== Gene-level rescue ======
+    // For transcripts that fail consensus, check if their gene's total TPM
+    // passes consensus. If so, rescue all transcripts of that gene.
+    let consensus_mask = {
+        let mut mask = consensus_mask;
 
         // Compute per-gene TPM in each sample from Phase 1 estimates.
         // A gene "passes" in a sample if its total TPM >= 10 (strong signal).
@@ -752,23 +756,18 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         sample.sample_name
                     );
                     // Phase 2 EM uses strict consensus only (no rescued transcripts).
-                    let masked_eff_lens: Vec<f64> = bundles[i]
-                        .eff_lengths
-                        .iter()
-                        .enumerate()
-                        .map(|(t, &el)| if strict_mask[t] { el } else { 0.0 })
-                        .collect();
+                    let mut eminfo = EMInfo::new(
+                        &bundles[i].packed_eq_map,
+                        bundles[i].eff_lengths.clone(),
+                        phase2_max_iter(opts),
+                        phase2_convergence_thresh(opts),
+                        opts.presence_thresh,
+                    );
+                    eminfo.apply_mask(&strict_mask);
                     let init = if opts.no_phase2_warm_start {
                         None
                     } else {
                         Some(phase2_init_counts(&phase1_counts[i], &strict_mask))
-                    };
-                    let eminfo = EMInfo {
-                        eq_map: &bundles[i].packed_eq_map,
-                        eff_lens: &masked_eff_lens,
-                        max_iter: phase2_max_iter(opts),
-                        convergence_thresh: phase2_convergence_thresh(opts),
-                        presence_thresh: opts.presence_thresh,
                     };
                     let em_res = if inner_threads > 1 {
                         em_par_init(&eminfo, init.as_deref(), inner_threads)
@@ -792,23 +791,18 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 n_samples,
                 sample.sample_name
             );
-            let masked_eff_lens: Vec<f64> = bundles[i]
-                .eff_lengths
-                .iter()
-                .enumerate()
-                .map(|(t, &el)| if strict_mask[t] { el } else { 0.0 })
-                .collect();
+            let mut eminfo = EMInfo::new(
+                &bundles[i].packed_eq_map,
+                bundles[i].eff_lengths.clone(),
+                phase2_max_iter(opts),
+                phase2_convergence_thresh(opts),
+                opts.presence_thresh,
+            );
+            eminfo.apply_mask(&strict_mask);
             let init = if opts.no_phase2_warm_start {
                 None
             } else {
                 Some(phase2_init_counts(&phase1_counts[i], &strict_mask))
-            };
-            let eminfo = EMInfo {
-                eq_map: &bundles[i].packed_eq_map,
-                eff_lens: &masked_eff_lens,
-                max_iter: phase2_max_iter(opts),
-                convergence_thresh: phase2_convergence_thresh(opts),
-                presence_thresh: opts.presence_thresh,
             };
             let em_res = if let Some(pool) = serial_inner_pool.as_ref() {
                 em_par_with_pool_init(&eminfo, init.as_deref(), pool)
@@ -822,6 +816,72 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         results
     };
 
+    // ====== Gene-fraction filter ======
+    // Precompute EC uniqueness per transcript within each gene.
+    // A transcript's "unique EC fraction" is the fraction of its ECs that
+    // are not shared with any other transcript in the same gene that passed consensus.
+    let ec_unique_frac: Vec<f64> = if !gene_to_txps.is_empty() {
+        let mut frac = vec![0.0f64; n_targets];
+        for txps in gene_to_txps.values() {
+            // Collect EC signatures for all consensus transcripts in this gene.
+            let active: Vec<usize> = txps.iter()
+                .filter(|&&t| consensus_mask[t])
+                .copied()
+                .collect();
+            if active.len() <= 1 {
+                // Single isoform or none — 100% unique by definition.
+                for &t in &active {
+                    frac[t] = 1.0;
+                }
+                continue;
+            }
+            // For each active transcript, count how many of its ECs are unique
+            // (not present in any other active transcript of this gene).
+            // Use the merged index for EC signatures.
+            for &t in &active {
+                let sig_t = merged_index.signature(t);
+                let n_total = sig_t.len();
+                if n_total == 0 {
+                    continue;
+                }
+                let mut n_unique = 0usize;
+                for &eqc in sig_t {
+                    let is_shared = active.iter().any(|&u| u != t && {
+                        let sig_u = merged_index.signature(u);
+                        sig_u.binary_search(&eqc).is_ok()
+                    });
+                    if !is_shared {
+                        n_unique += 1;
+                    }
+                }
+                frac[t] = n_unique as f64 / n_total as f64;
+            }
+        }
+        frac
+    } else {
+        vec![0.0f64; n_targets]
+    };
+
+    // Log EC uniqueness stats for expressed transcripts.
+    {
+        let active_fracs: Vec<f64> = (0..n_targets)
+            .filter(|&t| consensus_mask[t])
+            .map(|t| ec_unique_frac[t])
+            .collect();
+        if !active_fracs.is_empty() {
+            let n_no_unique = active_fracs.iter().filter(|&&f| f == 0.0).count();
+            let n_some_unique = active_fracs.iter().filter(|&&f| f > 0.0 && f < 1.0).count();
+            let n_all_unique = active_fracs.iter().filter(|&&f| f == 1.0).count();
+            info!(
+                "EC uniqueness: {} consensus transcripts — {} with no unique ECs, {} with some, {} fully unique",
+                active_fracs.len(), n_no_unique, n_some_unique, n_all_unique
+            );
+        }
+    }
+
+    let gene_frac_threshold = opts.gene_fraction_filter;
+    let mut total_gene_frac_removed = 0usize;
+
     for (i, mut em_res) in phase2_results {
         // For rescued transcripts (in consensus_mask but not strict_mask),
         // use Phase 1 estimated counts instead of Phase 2. This avoids
@@ -829,6 +889,28 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         for t in 0..n_targets {
             if consensus_mask[t] && !strict_mask[t] {
                 em_res[t] = phase1_counts[i][t];
+            }
+        }
+
+        // Within-gene isoform fraction filter: zero out isoforms contributing
+        // less than gene_frac_threshold of their gene's total estimated count.
+        if gene_frac_threshold > 0.0 {
+            for txps in gene_to_txps.values() {
+                let gene_total: f64 = txps.iter().map(|&t| em_res[t]).sum();
+                if gene_total <= 0.0 {
+                    continue;
+                }
+                for &t in txps {
+                    if em_res[t] > 0.0 && em_res[t] / gene_total < gene_frac_threshold {
+                        // Also consider EC uniqueness: transcripts with unique ECs
+                        // have structural evidence of independent expression, so
+                        // spare them from fraction-based removal.
+                        if ec_unique_frac[t] == 0.0 {
+                            em_res[t] = 0.0;
+                            if i == 0 { total_gene_frac_removed += 1; }
+                        }
+                    }
+                }
             }
         }
 
@@ -876,6 +958,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             });
         }
         serde_json::to_writer_pretty(ofile, &meta_info)?;
+    }
+
+    if total_gene_frac_removed > 0 {
+        info!(
+            "Gene-fraction filter (>= {:.1}%): zeroed {} isoforms in sample 1 (no unique ECs, below gene fraction)",
+            gene_frac_threshold * 100.0, total_gene_frac_removed
+        );
     }
 
     info!("Done. Wrote output for {} samples.", n_samples);

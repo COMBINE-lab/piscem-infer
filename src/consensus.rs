@@ -817,44 +817,89 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     };
 
     // ====== Gene-fraction filter ======
-    // Precompute EC uniqueness per transcript within each gene.
-    // A transcript's "unique EC fraction" is the fraction of its ECs that
-    // are not shared with any other transcript in the same gene that passed consensus.
+    // Precompute robust EC uniqueness per transcript within each gene.
+    // A transcript's unique ECs are those not shared with any other
+    // consensus transcript of the same gene. We weight uniqueness by
+    // cross-sample consistency: unique ECs appearing in more samples
+    // are stronger evidence of independent expression.
+    //
+    // The merged index's EC IDs encode sample origin via offset ranges.
+    // ECs from sample s have IDs in [eqc_offsets[s], eqc_offsets[s+1]).
+    let eqc_offset_boundaries: Vec<u32> = {
+        let mut bounds = Vec::with_capacity(eqc_counts.len() + 1);
+        let mut cum = 0u32;
+        bounds.push(cum);
+        for &c in &eqc_counts {
+            cum += c as u32;
+            bounds.push(cum);
+        }
+        bounds
+    };
+    let n_samples_total = eqc_counts.len();
+
+    // Determine which sample an EC ID belongs to.
+    let ec_to_sample = |eqc_id: u32| -> usize {
+        eqc_offset_boundaries.partition_point(|&b| b <= eqc_id).saturating_sub(1)
+    };
+
     let ec_unique_frac: Vec<f64> = if !gene_to_txps.is_empty() {
         let mut frac = vec![0.0f64; n_targets];
         for txps in gene_to_txps.values() {
-            // Collect EC signatures for all consensus transcripts in this gene.
             let active: Vec<usize> = txps.iter()
                 .filter(|&&t| consensus_mask[t])
                 .copied()
                 .collect();
             if active.len() <= 1 {
-                // Single isoform or none — 100% unique by definition.
                 for &t in &active {
                     frac[t] = 1.0;
                 }
                 continue;
             }
-            // For each active transcript, count how many of its ECs are unique
-            // (not present in any other active transcript of this gene).
-            // Use the merged index for EC signatures.
             for &t in &active {
                 let sig_t = merged_index.signature(t);
                 let n_total = sig_t.len();
                 if n_total == 0 {
                     continue;
                 }
-                let mut n_unique = 0usize;
+                // Count unique ECs weighted by cross-sample robustness.
+                // A unique EC counts as 1.0 only if it appears in multiple
+                // samples. If it appears in only 1 sample, it counts as
+                // 1/n_samples (fragile evidence).
+                let mut unique_weight = 0.0f64;
+                let mut total_weight = n_total as f64;
+                let mut prev_eqc = u32::MAX;
+                let mut prev_sample = usize::MAX;
+                let mut unique_samples: Vec<usize> = Vec::new();
+
                 for &eqc in sig_t {
                     let is_shared = active.iter().any(|&u| u != t && {
                         let sig_u = merged_index.signature(u);
                         sig_u.binary_search(&eqc).is_ok()
                     });
                     if !is_shared {
-                        n_unique += 1;
+                        let sample = ec_to_sample(eqc);
+                        unique_samples.push(sample);
                     }
                 }
-                frac[t] = n_unique as f64 / n_total as f64;
+
+                if !unique_samples.is_empty() {
+                    // Count distinct samples contributing unique ECs.
+                    unique_samples.sort_unstable();
+                    unique_samples.dedup();
+                    let n_unique_samples = unique_samples.len();
+
+                    // Robust uniqueness: require unique ECs in >= 2 samples
+                    // (or >= 50% of samples for small N) to count as full
+                    // evidence. Single-sample unique ECs get partial credit.
+                    let min_robust = 2.min(n_samples_total);
+                    if n_unique_samples >= min_robust {
+                        frac[t] = 1.0; // robust unique evidence
+                    } else {
+                        // Fragile: unique ECs in only 1 sample
+                        frac[t] = 0.5 / n_samples_total as f64;
+                    }
+                }
+                // else: frac[t] remains 0.0 (no unique ECs)
             }
         }
         frac
@@ -877,6 +922,70 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 active_fracs.len(), n_no_unique, n_some_unique, n_all_unique
             );
         }
+    }
+
+    // Compute per-transcript position bin profile from the merged index.
+    // For each transcript, count fragments in each position bin (count-weighted).
+    let n_pos_bins = crate::utils::eq_maps::NUM_POS_BINS.get()
+        .copied().unwrap_or(1.0) as usize;
+    let pos_bin_profiles: Vec<Vec<u64>> = if n_pos_bins > 1 && merged_index.has_pos_bins() && merged_index.has_counts() {
+        let mut profiles = vec![vec![0u64; n_pos_bins]; n_targets];
+        for t in 0..n_targets {
+            if !consensus_mask[t] { continue; }
+            let sig = merged_index.signature(t);
+            let base = merged_index.offsets[t] as usize;
+            for (j, _) in sig.iter().enumerate() {
+                let pb = merged_index.pos_bins[base + j] as usize;
+                let cnt = merged_index.ec_counts[base + j] as u64;
+                if pb < n_pos_bins {
+                    profiles[t][pb] += cnt;
+                }
+            }
+        }
+        profiles
+    } else {
+        Vec::new()
+    };
+
+    // Compute position bin CV for each consensus transcript.
+    // High CV → non-uniform coverage → possible leakage signal.
+    let pos_cv: Vec<f64> = if !pos_bin_profiles.is_empty() && n_pos_bins > 1 {
+        let mut cv = vec![0.0f64; n_targets];
+        for t in 0..n_targets {
+            if !consensus_mask[t] { continue; }
+            let total: f64 = pos_bin_profiles[t].iter().map(|&c| c as f64).sum();
+            if total < 1.0 { continue; }
+            let mean = total / n_pos_bins as f64;
+            let var: f64 = pos_bin_profiles[t].iter()
+                .map(|&c| { let d = c as f64 - mean; d * d })
+                .sum::<f64>() / n_pos_bins as f64;
+            cv[t] = var.sqrt() / (mean + 1e-10);
+        }
+        cv
+    } else {
+        vec![0.0f64; n_targets]
+    };
+
+    // Log position bin coverage stats if available.
+    if !pos_bin_profiles.is_empty() && n_pos_bins > 1 {
+        let mut n_full_coverage = 0usize;
+        let mut n_partial = 0usize;
+        let mut n_single = 0usize;
+        for t in 0..n_targets {
+            if !consensus_mask[t] { continue; }
+            let occupied = pos_bin_profiles[t].iter().filter(|&&c| c > 0).count();
+            match occupied {
+                0 => {},
+                1 => n_single += 1,
+                2..=4 => n_partial += 1,
+                _ => n_full_coverage += 1,
+            }
+        }
+        info!(
+            "Position coverage: {} full (all {} bins), {} partial, {} single-bin",
+            n_full_coverage, n_pos_bins, n_partial, n_single
+        );
+
     }
 
     let gene_frac_threshold = opts.gene_fraction_filter;
@@ -902,10 +1011,15 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 }
                 for &t in txps {
                     if em_res[t] > 0.0 && em_res[t] / gene_total < gene_frac_threshold {
-                        // Also consider EC uniqueness: transcripts with unique ECs
-                        // have structural evidence of independent expression, so
-                        // spare them from fraction-based removal.
-                        if ec_unique_frac[t] == 0.0 {
+                        // Remove if: no robust unique ECs, OR position
+                        // coverage is non-uniform (high CV → likely leakage
+                        // even if some unique ECs exist).
+                        let pos_uneven = if !pos_bin_profiles.is_empty() && n_pos_bins > 1 {
+                            pos_cv[t] > 0.5
+                        } else {
+                            false
+                        };
+                        if ec_unique_frac[t] < 1.0 || pos_uneven {
                             em_res[t] = 0.0;
                             if i == 0 { total_gene_frac_removed += 1; }
                         }

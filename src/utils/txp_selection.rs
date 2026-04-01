@@ -89,6 +89,8 @@ pub struct TranscriptEqIndex {
     pub offsets: Vec<u32>,
     /// Per-edge position bins, parallel to eqc_ids. Empty if pos bins disabled.
     pub pos_bins: Vec<u32>,
+    /// Per-edge fragment counts, parallel to eqc_ids. Empty if not populated.
+    pub ec_counts: Vec<u32>,
 }
 
 impl TranscriptEqIndex {
@@ -120,17 +122,20 @@ impl TranscriptEqIndex {
         let has_pos = packed_map.len() > 0
             && packed_map.refs_for_eqc(0).target_pos_bins().is_some();
 
-        // Second pass: fill in EQ class IDs (and pos bins) using write cursors.
+        // Second pass: fill in EQ class IDs (and pos bins, counts) using write cursors.
         let mut eqc_ids = vec![0u32; total_edges];
         let mut pos_bins_vec = if has_pos { vec![0u32; total_edges] } else { Vec::new() };
+        let mut ec_counts_vec = vec![0u32; total_edges];
         let mut cursors = vec![0u32; num_targets];
         for eqc_idx in 0..packed_map.len() {
             let label = packed_map.refs_for_eqc(eqc_idx);
             let label_pos_bins = label.target_pos_bins();
+            let count = packed_map.counts[eqc_idx] as u32;
             for (i, &tid) in label.target_labels().iter().enumerate() {
                 let t = tid as usize;
                 let slot = (offsets[t] + cursors[t]) as usize;
                 eqc_ids[slot] = eqc_idx as u32;
+                ec_counts_vec[slot] = count;
                 if has_pos {
                     pos_bins_vec[slot] = label_pos_bins.map_or(0, |pb| pb[i]);
                 }
@@ -138,27 +143,38 @@ impl TranscriptEqIndex {
             }
         }
 
-        // Sort each transcript's edges by EQ class ID, keeping pos_bins in sync.
+        // Sort each transcript's edges by EQ class ID, keeping pos_bins and counts in sync.
         for t in 0..num_targets {
             let s = offsets[t] as usize;
             let e = offsets[t + 1] as usize;
             if has_pos {
-                // Sort (eqc_id, pos_bin) pairs together by eqc_id.
-                let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e].iter()
+                // Sort (eqc_id, pos_bin, count) triples together by eqc_id.
+                let mut triples: Vec<(u32, u32, u32)> = eqc_ids[s..e].iter()
                     .zip(pos_bins_vec[s..e].iter())
+                    .zip(ec_counts_vec[s..e].iter())
+                    .map(|((&a, &b), &c)| (a, b, c))
+                    .collect();
+                triples.sort_unstable_by_key(|&(eqc, _, _)| eqc);
+                for (j, &(eqc, pb, cnt)) in triples.iter().enumerate() {
+                    eqc_ids[s + j] = eqc;
+                    pos_bins_vec[s + j] = pb;
+                    ec_counts_vec[s + j] = cnt;
+                }
+            } else {
+                // Sort (eqc_id, count) pairs together.
+                let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e].iter()
+                    .zip(ec_counts_vec[s..e].iter())
                     .map(|(&a, &b)| (a, b))
                     .collect();
                 pairs.sort_unstable_by_key(|&(eqc, _)| eqc);
-                for (j, &(eqc, pb)) in pairs.iter().enumerate() {
+                for (j, &(eqc, cnt)) in pairs.iter().enumerate() {
                     eqc_ids[s + j] = eqc;
-                    pos_bins_vec[s + j] = pb;
+                    ec_counts_vec[s + j] = cnt;
                 }
-            } else {
-                eqc_ids[s..e].sort_unstable();
             }
         }
 
-        Self { eqc_ids, offsets, pos_bins: pos_bins_vec }
+        Self { eqc_ids, offsets, pos_bins: pos_bins_vec, ec_counts: ec_counts_vec }
     }
 
     /// Returns the number of transcripts in this index.
@@ -190,6 +206,29 @@ impl TranscriptEqIndex {
     /// Returns true if this index carries position bin information.
     pub fn has_pos_bins(&self) -> bool {
         !self.pos_bins.is_empty()
+    }
+
+    /// Returns true if this index carries EC fragment counts.
+    pub fn has_counts(&self) -> bool {
+        !self.ec_counts.is_empty()
+    }
+
+    /// Fragment counts for transcript t's edges (parallel to signature).
+    pub fn counts_for(&self, t: usize) -> Option<&[u32]> {
+        if self.ec_counts.is_empty() {
+            None
+        } else {
+            let s = self.offsets[t] as usize;
+            let e = self.offsets[t + 1] as usize;
+            Some(&self.ec_counts[s..e])
+        }
+    }
+
+    /// Total fragment count across all ECs for transcript t.
+    pub fn total_count(&self, t: usize) -> u64 {
+        self.counts_for(t)
+            .map(|c| c.iter().map(|&x| x as u64).sum())
+            .unwrap_or(0)
     }
 
     /// Returns the number of EQ classes containing transcript `t`.
@@ -739,9 +778,13 @@ pub fn merge_transcript_indices(
     // Check if any index has pos bins.
     let has_pos = indices.iter().any(|idx| !idx.pos_bins.is_empty());
 
-    // Second pass: fill in remapped EQ class IDs (and pos bins).
+    // Check if any index has counts.
+    let has_counts = indices.iter().any(|idx| !idx.ec_counts.is_empty());
+
+    // Second pass: fill in remapped EQ class IDs (and pos bins, counts).
     let mut eqc_ids = vec![0u32; total_edges];
     let mut pos_bins_vec = if has_pos { vec![0u32; total_edges] } else { Vec::new() };
+    let mut ec_counts_vec = if has_counts { vec![0u32; total_edges] } else { Vec::new() };
     let mut cursors = vec![0u32; num_targets];
     for (sample_idx, index) in indices.iter().enumerate() {
         let offset = eqc_offsets[sample_idx];
@@ -754,31 +797,37 @@ pub fn merge_transcript_indices(
                 if has_pos && !index.pos_bins.is_empty() {
                     pos_bins_vec[slot] = index.pos_bins[sig_start + j];
                 }
+                if has_counts && !index.ec_counts.is_empty() {
+                    ec_counts_vec[slot] = index.ec_counts[sig_start + j];
+                }
                 cursors[t] += 1;
             }
         }
     }
 
-    // Sort each transcript's merged signature, keeping pos_bins in sync.
+    // Sort each transcript's merged signature, keeping pos_bins and counts in sync.
     for t in 0..num_targets {
         let s = offsets[t] as usize;
         let e = offsets[t + 1] as usize;
-        if has_pos {
-            let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e].iter()
-                .zip(pos_bins_vec[s..e].iter())
-                .map(|(&a, &b)| (a, b))
-                .collect();
-            pairs.sort_unstable_by_key(|&(eqc, _)| eqc);
-            for (j, &(eqc, pb)) in pairs.iter().enumerate() {
+        if has_pos || has_counts {
+            // Build sortable tuples: (eqc_id, pos_bin, count)
+            let mut triples: Vec<(u32, u32, u32)> = (s..e).map(|k| {
+                let pb = if has_pos { pos_bins_vec[k] } else { 0 };
+                let cnt = if has_counts { ec_counts_vec[k] } else { 0 };
+                (eqc_ids[k], pb, cnt)
+            }).collect();
+            triples.sort_unstable_by_key(|&(eqc, _, _)| eqc);
+            for (j, &(eqc, pb, cnt)) in triples.iter().enumerate() {
                 eqc_ids[s + j] = eqc;
-                pos_bins_vec[s + j] = pb;
+                if has_pos { pos_bins_vec[s + j] = pb; }
+                if has_counts { ec_counts_vec[s + j] = cnt; }
             }
         } else {
             eqc_ids[s..e].sort_unstable();
         }
     }
 
-    TranscriptEqIndex { eqc_ids, offsets, pos_bins: pos_bins_vec }
+    TranscriptEqIndex { eqc_ids, offsets, pos_bins: pos_bins_vec, ec_counts: ec_counts_vec }
 }
 
 /// Peeling algorithm that works from TranscriptEqIndex + SignatureGroups,
@@ -948,10 +997,12 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                     }
                     let n_distinct_bins = j_bins_used.iter().filter(|&&b| b).count();
 
-                    if n_distinct_bins >= 2 {
-                        dominated[gi] = true;
-                        break;
+                    if n_distinct_bins < 2 {
+                        continue; // implausible single-bin coverage → don't dominate
                     }
+
+                    dominated[gi] = true;
+                    break;
                 }
             }
 

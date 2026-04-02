@@ -986,6 +986,24 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             n_full_coverage, n_pos_bins, n_partial, n_single
         );
 
+        // Dump per-transcript diagnostic if enabled via environment variable.
+        if std::env::var("PISCEM_POS_DIAG").is_ok() {
+            if let Ok(mut f) = std::fs::File::create("pos_diagnostic.tsv") {
+                use std::io::Write;
+                writeln!(f, "target_name\tec_unique_frac\tpos_cv\t{}\ttotal_count",
+                    (0..n_pos_bins).map(|b| format!("bin_{}", b)).collect::<Vec<_>>().join("\t")).ok();
+                for t in 0..n_targets {
+                    if !consensus_mask[t] { continue; }
+                    let bins_str = pos_bin_profiles[t].iter()
+                        .map(|c| c.to_string()).collect::<Vec<_>>().join("\t");
+                    let total: u64 = pos_bin_profiles[t].iter().sum();
+                    writeln!(f, "{}\t{:.4}\t{:.4}\t{}\t{}",
+                        bundles[0].ref_names[t], ec_unique_frac[t],
+                        pos_cv[t], bins_str, total).ok();
+                }
+                info!("Wrote position diagnostic to pos_diagnostic.tsv");
+            }
+        }
     }
 
     let gene_frac_threshold = opts.gene_fraction_filter;
@@ -1001,19 +1019,34 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             }
         }
 
-        // Within-gene isoform fraction filter: zero out isoforms contributing
-        // less than gene_frac_threshold of their gene's total estimated count.
-        if gene_frac_threshold > 0.0 {
+        // Within-gene isoform filtering:
+        // 1. Gene-fraction filter: remove isoforms below threshold of gene TPM
+        // 2. Profile-correlation filter: remove isoforms whose position bin
+        //    profile is near-identical to the dominant sibling (leakage signature)
+        if gene_frac_threshold > 0.0 || (!pos_bin_profiles.is_empty() && n_pos_bins > 1) {
             for txps in gene_to_txps.values() {
                 let gene_total: f64 = txps.iter().map(|&t| em_res[t]).sum();
                 if gene_total <= 0.0 {
                     continue;
                 }
+
+                // Find dominant isoform (highest count) for profile correlation.
+                let dominant = txps.iter()
+                    .filter(|&&t| em_res[t] > 0.0)
+                    .max_by(|&&a, &&b| em_res[a].partial_cmp(&em_res[b]).unwrap());
+                let dom_t = match dominant {
+                    Some(&t) => t,
+                    None => continue,
+                };
+
                 for &t in txps {
-                    if em_res[t] > 0.0 && em_res[t] / gene_total < gene_frac_threshold {
-                        // Remove if: no robust unique ECs, OR position
-                        // coverage is non-uniform (high CV → likely leakage
-                        // even if some unique ECs exist).
+                    if t == dom_t || em_res[t] <= 0.0 {
+                        continue;
+                    }
+                    let gene_frac = em_res[t] / gene_total;
+
+                    // Gene-fraction filter (existing logic)
+                    if gene_frac_threshold > 0.0 && gene_frac < gene_frac_threshold {
                         let pos_uneven = if !pos_bin_profiles.is_empty() && n_pos_bins > 1 {
                             pos_cv[t] > 0.5
                         } else {
@@ -1022,6 +1055,45 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         if ec_unique_frac[t] < 1.0 || pos_uneven {
                             em_res[t] = 0.0;
                             if i == 0 { total_gene_frac_removed += 1; }
+                            continue;
+                        }
+                    }
+
+                    // Profile-correlation filter: if this isoform's position
+                    // profile is near-identical to the dominant sibling AND
+                    // it contributes a small fraction of the gene, it's likely
+                    // EM leakage. Real minor isoforms have different exon
+                    // structures that create divergent position patterns.
+                    if !pos_bin_profiles.is_empty() && n_pos_bins > 1 && gene_frac < 0.05 {
+                        let prof_t = &pos_bin_profiles[t];
+                        let prof_dom = &pos_bin_profiles[dom_t];
+                        let total_t: f64 = prof_t.iter().map(|&c| c as f64).sum();
+                        let total_dom: f64 = prof_dom.iter().map(|&c| c as f64).sum();
+
+                        if total_t > 10.0 && total_dom > 10.0 {
+                            // Compute Pearson correlation of bin fractions
+                            let fracs_t: Vec<f64> = prof_t.iter().map(|&c| c as f64 / total_t).collect();
+                            let fracs_dom: Vec<f64> = prof_dom.iter().map(|&c| c as f64 / total_dom).collect();
+                            let mean_t: f64 = fracs_t.iter().sum::<f64>() / n_pos_bins as f64;
+                            let mean_dom: f64 = fracs_dom.iter().sum::<f64>() / n_pos_bins as f64;
+
+                            let mut cov = 0.0f64;
+                            let mut var_t = 0.0f64;
+                            let mut var_dom = 0.0f64;
+                            for b in 0..n_pos_bins {
+                                let dt = fracs_t[b] - mean_t;
+                                let dd = fracs_dom[b] - mean_dom;
+                                cov += dt * dd;
+                                var_t += dt * dt;
+                                var_dom += dd * dd;
+                            }
+                            let denom = (var_t * var_dom).sqrt();
+                            let corr = if denom > 1e-12 { cov / denom } else { 0.0 };
+
+                            if corr > 0.9 {
+                                em_res[t] = 0.0;
+                                if i == 0 { total_gene_frac_removed += 1; }
+                            }
                         }
                     }
                 }

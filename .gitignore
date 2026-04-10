@@ -27,3 +27,4 @@ airway_benchmark/mapped/
 airway_benchmark/manifest_*.csv
 
 .claude/settings.local.json
+*.typ

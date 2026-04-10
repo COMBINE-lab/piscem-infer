@@ -362,8 +362,13 @@ pub struct ConsensusQuantOpts {
     /// use strict global consensus, then rescue transcripts that fail globally
     /// but pass within at least one condition. Combines high precision of
     /// global filtering with preservation of condition-specific expression.
+    /// Enabled automatically when the manifest has multiple conditions.
+    /// Use --no-condition-rescue to disable.
     #[arg(long, conflicts_with = "condition_aware_consensus", help_heading = "Consensus Filter")]
     pub condition_rescue: bool,
+    /// disable automatic condition rescue when multiple conditions are present.
+    #[arg(long, conflicts_with_all = ["condition_rescue", "condition_aware_consensus"], help_heading = "Consensus Filter")]
+    pub no_condition_rescue: bool,
     /// TPM threshold above which a transcript is considered expressed
     /// in a given sample. Only used with --filter-mode tpm. (default: 0.0)
     #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]

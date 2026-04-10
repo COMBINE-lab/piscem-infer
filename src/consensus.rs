@@ -713,9 +713,22 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     });
     let min_k = ((min_fraction * n_samples as f64).ceil() as u32).max(1);
 
-    // Compute per-condition evidence counts (needed for condition_aware and condition_rescue).
+    // Auto-enable condition rescue when multiple conditions are present,
+    // unless explicitly disabled or condition-aware mode is selected.
     let has_conditions = samples.iter().any(|s| s.condition != samples[0].condition);
-    let condition_data = if has_conditions && (opts.condition_aware_consensus || opts.condition_rescue) {
+    let use_condition_rescue = if opts.condition_aware_consensus || opts.no_condition_rescue {
+        false
+    } else if opts.condition_rescue {
+        true
+    } else {
+        // Auto-enable when multiple conditions exist
+        has_conditions
+    };
+    if use_condition_rescue && !opts.condition_rescue {
+        info!("Auto-enabling condition rescue (multiple conditions detected; use --no-condition-rescue to disable)");
+    }
+
+    let condition_data = if has_conditions && (opts.condition_aware_consensus || use_condition_rescue) {
         let mut condition_names: Vec<String> = samples.iter().map(|s| s.condition.clone()).collect();
         condition_names.sort();
         condition_names.dedup();
@@ -794,7 +807,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             condition_names.len()
         );
         mask
-    } else if opts.condition_rescue {
+    } else if use_condition_rescue {
         // Strict global consensus + condition-specific rescue.
         let (condition_names, cond_counts, cond_k) =
             condition_data.as_ref().expect("condition data required for condition-rescue");
@@ -834,7 +847,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     info!(
         "Consensus filter ({}{}): K={} (min_fraction={:.2}), {} transcripts pass, {} filtered out",
         filter_label,
-        if opts.condition_aware_consensus { ", condition-aware" } else if opts.condition_rescue { ", condition-rescue" } else { "" },
+        if opts.condition_aware_consensus { ", condition-aware" } else if use_condition_rescue { ", condition-rescue" } else { "" },
         min_k,
         min_fraction,
         n_consensus,

@@ -394,6 +394,11 @@ pub struct ConsensusQuantOpts {
     /// pipe-delimited transcript IDs (GENCODE format, field 6). Set to 0 to disable.
     #[arg(long, default_value_t = 0.01, help_heading = "Consensus Filter")]
     pub gene_fraction_filter: f64,
+    /// disable gene name parsing from transcript IDs, forcing the annotation-free
+    /// EC-graph-based leakage filter for all transcripts. Useful when transcript
+    /// names don't follow GENCODE pipe-delimited format.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub no_gene_annotation: bool,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation

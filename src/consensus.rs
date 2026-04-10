@@ -843,11 +843,16 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     // Parse gene names from GENCODE-style pipe-delimited transcript names
     // (field 6, 0-indexed field 5). Used for gene-level rescue and gene-fraction filtering.
-    let gene_names: Vec<Option<&str>> = bundles[0]
-        .ref_names
-        .iter()
-        .map(|name| name.split('|').nth(5))
-        .collect();
+    // Disabled by --no-gene-annotation, which forces the EC-graph-based filter.
+    let gene_names: Vec<Option<&str>> = if opts.no_gene_annotation {
+        vec![None; n_targets]
+    } else {
+        bundles[0]
+            .ref_names
+            .iter()
+            .map(|name| name.split('|').nth(5))
+            .collect()
+    };
 
     let gene_to_txps: std::collections::HashMap<&str, Vec<usize>> = {
         let mut map: std::collections::HashMap<&str, Vec<usize>> =

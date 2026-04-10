@@ -136,6 +136,146 @@ fn compute_tpm(e_counts: &[f64], eff_lengths: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Check if transcript t's position profile is near-identical to transcript dom's,
+/// suggesting EM leakage. Returns true if correlation > 0.9.
+fn profile_corr_is_leakage(
+    pos_bin_profiles: &[Vec<u64>],
+    t: usize,
+    dom: usize,
+    n_pos_bins: usize,
+) -> bool {
+    let prof_t = &pos_bin_profiles[t];
+    let prof_dom = &pos_bin_profiles[dom];
+    let total_t: f64 = prof_t.iter().map(|&c| c as f64).sum();
+    let total_dom: f64 = prof_dom.iter().map(|&c| c as f64).sum();
+
+    if total_t <= 10.0 || total_dom <= 10.0 {
+        return false;
+    }
+
+    let mean_t = 1.0 / n_pos_bins as f64; // fracs sum to 1, mean = 1/n
+    let mean_dom = mean_t;
+
+    let mut cov = 0.0f64;
+    let mut var_t = 0.0f64;
+    let mut var_dom = 0.0f64;
+    for b in 0..n_pos_bins {
+        let ft = prof_t[b] as f64 / total_t - mean_t;
+        let fd = prof_dom[b] as f64 / total_dom - mean_dom;
+        cov += ft * fd;
+        var_t += ft * ft;
+        var_dom += fd * fd;
+    }
+    let denom = (var_t * var_dom).sqrt();
+    let corr = if denom > 1e-12 { cov / denom } else { 0.0 };
+    corr > 0.9
+}
+
+/// Compute per-transcript EC-neighborhood leakage scores.
+///
+/// For each transcript t, computes the total posterior-weighted count attributed
+/// to all other transcripts from t's shared ECs. Returns:
+/// - `nbr_frac[t]`: t's abundance as a fraction of (t + all competitors)
+/// - `dominant[t]`: index of t's single most abundant competitor
+///
+/// This generalizes the gene-fraction filter to work without gene annotations:
+/// the "gene" is replaced by the EC-neighborhood structure.
+fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
+    packed_map: &PackedEqMap<EqLabelT>,
+    em_counts: &[f64],
+    eff_lens: &[f64],
+) -> (Vec<f64>, Vec<usize>) {
+    let n_targets = em_counts.len();
+    let mut nbr_frac = vec![1.0f64; n_targets];
+    let mut dominant = (0..n_targets).collect::<Vec<usize>>();
+
+    let inv_eff_lens: Vec<f64> = eff_lens.iter()
+        .map(|&l| { let inv = 1.0 / l; if inv.is_finite() { inv } else { 0.0 } })
+        .collect();
+
+    // For each transcript t, accumulate per-competitor posterior counts
+    // across all shared ECs, then compute the neighborhood fraction as
+    // t's count relative to the top-K competitors that collectively account
+    // for most of the competition.
+    let mut competitor_acc: Vec<Option<ahash::AHashMap<u32, f64>>> =
+        (0..n_targets).map(|_| None).collect();
+
+    let mut weights: Vec<f64> = Vec::with_capacity(64);
+
+    for (label, &count) in packed_map.iter_labels().zip(packed_map.counts.iter()) {
+        let ec_count = count as f64;
+        if ec_count == 0.0 { continue; }
+
+        weights.clear();
+        let mut denom = 0.0f64;
+        for (tid, cond_prob) in label.target_labels().iter().zip(label.target_probs()) {
+            let w = cond_prob * em_counts[*tid as usize] * inv_eff_lens[*tid as usize];
+            weights.push(w);
+            denom += w;
+        }
+        if denom <= 1e-8 { continue; }
+
+        let targets = label.target_labels();
+        let n = targets.len();
+        if n < 2 { continue; }
+
+        for i in 0..n {
+            let t = targets[i] as usize;
+            if weights[i] < 1e-10 { continue; }
+
+            let acc = competitor_acc[t].get_or_insert_with(ahash::AHashMap::new);
+            for j in 0..n {
+                if i == j { continue; }
+                let u = targets[j] as u32;
+                let u_share = ec_count * weights[j] / denom;
+                if u_share > 0.01 {
+                    *acc.entry(u).or_insert(0.0) += u_share;
+                }
+            }
+        }
+    }
+
+    // For each transcript, find the dominant competitor and compute
+    // neighborhood fraction. Use the top competitors that collectively
+    // account for >= 90% of the competition (like a gene's top isoforms).
+    for t in 0..n_targets {
+        if em_counts[t] <= 0.0 { continue; }
+
+        let acc = match &competitor_acc[t] {
+            Some(a) if !a.is_empty() => a,
+            _ => continue,
+        };
+
+        // Sort competitors by accumulated count (descending)
+        let mut sorted: Vec<(u32, f64)> = acc.iter().map(|(&u, &c)| (u, c)).collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Top competitor is the dominant
+        dominant[t] = sorted[0].0 as usize;
+
+        // Sum top competitors until we cover 90% of total competition
+        let total_competition: f64 = sorted.iter().map(|(_, c)| c).sum();
+        if total_competition <= 0.0 { continue; }
+
+        let mut cumulative = 0.0f64;
+        let mut cluster_count = 0.0f64;
+        for &(_, c) in &sorted {
+            cluster_count += c;
+            cumulative += c;
+            if cumulative >= 0.9 * total_competition {
+                break;
+            }
+        }
+
+        let total = em_counts[t] + cluster_count;
+        if total > 0.0 {
+            nbr_frac[t] = em_counts[t] / total;
+        }
+    }
+
+    (nbr_frac, dominant)
+}
+
 fn phase1_max_iter(opts: &ConsensusQuantOpts) -> u32 {
     opts.phase1_max_iter.unwrap_or(opts.max_iter)
 }
@@ -1007,7 +1147,10 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     }
 
     let gene_frac_threshold = opts.gene_fraction_filter;
+    let has_gene_annot = !gene_to_txps.is_empty();
+    let has_pos = !pos_bin_profiles.is_empty() && n_pos_bins > 1;
     let mut total_gene_frac_removed = 0usize;
+    let mut total_nbr_removed = 0usize;
 
     for (i, mut em_res) in phase2_results {
         // For rescued transcripts (in consensus_mask but not strict_mask),
@@ -1019,18 +1162,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             }
         }
 
-        // Within-gene isoform filtering:
-        // 1. Gene-fraction filter: remove isoforms below threshold of gene TPM
-        // 2. Profile-correlation filter: remove isoforms whose position bin
-        //    profile is near-identical to the dominant sibling (leakage signature)
-        if gene_frac_threshold > 0.0 || (!pos_bin_profiles.is_empty() && n_pos_bins > 1) {
+        // ---- Gene-annotated filtering (when gene names are available) ----
+        if has_gene_annot && (gene_frac_threshold > 0.0 || has_pos) {
             for txps in gene_to_txps.values() {
                 let gene_total: f64 = txps.iter().map(|&t| em_res[t]).sum();
                 if gene_total <= 0.0 {
                     continue;
                 }
 
-                // Find dominant isoform (highest count) for profile correlation.
                 let dominant = txps.iter()
                     .filter(|&&t| em_res[t] > 0.0)
                     .max_by(|&&a, &&b| em_res[a].partial_cmp(&em_res[b]).unwrap());
@@ -1045,13 +1184,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     }
                     let gene_frac = em_res[t] / gene_total;
 
-                    // Gene-fraction filter (existing logic)
+                    // Gene-fraction filter
                     if gene_frac_threshold > 0.0 && gene_frac < gene_frac_threshold {
-                        let pos_uneven = if !pos_bin_profiles.is_empty() && n_pos_bins > 1 {
-                            pos_cv[t] > 0.5
-                        } else {
-                            false
-                        };
+                        let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
                         if ec_unique_frac[t] < 1.0 || pos_uneven {
                             em_res[t] = 0.0;
                             if i == 0 { total_gene_frac_removed += 1; }
@@ -1059,44 +1194,113 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         }
                     }
 
-                    // Profile-correlation filter: if this isoform's position
-                    // profile is near-identical to the dominant sibling AND
-                    // it contributes a small fraction of the gene, it's likely
-                    // EM leakage. Real minor isoforms have different exon
-                    // structures that create divergent position patterns.
-                    if !pos_bin_profiles.is_empty() && n_pos_bins > 1 && gene_frac < 0.05 {
-                        let prof_t = &pos_bin_profiles[t];
-                        let prof_dom = &pos_bin_profiles[dom_t];
-                        let total_t: f64 = prof_t.iter().map(|&c| c as f64).sum();
-                        let total_dom: f64 = prof_dom.iter().map(|&c| c as f64).sum();
-
-                        if total_t > 10.0 && total_dom > 10.0 {
-                            // Compute Pearson correlation of bin fractions
-                            let fracs_t: Vec<f64> = prof_t.iter().map(|&c| c as f64 / total_t).collect();
-                            let fracs_dom: Vec<f64> = prof_dom.iter().map(|&c| c as f64 / total_dom).collect();
-                            let mean_t: f64 = fracs_t.iter().sum::<f64>() / n_pos_bins as f64;
-                            let mean_dom: f64 = fracs_dom.iter().sum::<f64>() / n_pos_bins as f64;
-
-                            let mut cov = 0.0f64;
-                            let mut var_t = 0.0f64;
-                            let mut var_dom = 0.0f64;
-                            for b in 0..n_pos_bins {
-                                let dt = fracs_t[b] - mean_t;
-                                let dd = fracs_dom[b] - mean_dom;
-                                cov += dt * dd;
-                                var_t += dt * dt;
-                                var_dom += dd * dd;
-                            }
-                            let denom = (var_t * var_dom).sqrt();
-                            let corr = if denom > 1e-12 { cov / denom } else { 0.0 };
-
-                            if corr > 0.9 {
-                                em_res[t] = 0.0;
-                                if i == 0 { total_gene_frac_removed += 1; }
-                            }
+                    // Profile-correlation filter (gene-annotated version)
+                    if has_pos && gene_frac < 0.05 {
+                        if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
+                            em_res[t] = 0.0;
+                            if i == 0 { total_gene_frac_removed += 1; }
                         }
                     }
                 }
+            }
+        }
+
+        // ---- EC-neighborhood filtering (annotation-free) ----
+        // Uses the EC graph structure to find dominant competitors and detect
+        // leakage. Applied to transcripts without gene annotation, or to ALL
+        // transcripts when gene annotation is unavailable.
+        {
+            let (nbr_frac, nbr_dominant) = compute_neighborhood_leakage(
+                &bundles[i].packed_eq_map, &em_res, &bundles[i].eff_lengths,
+            );
+
+            for t in 0..n_targets {
+                if em_res[t] <= 0.0 { continue; }
+
+                // Skip transcripts already handled by gene-annotated filtering
+                if has_gene_annot && gene_names[t].is_some() { continue; }
+
+                let dom = nbr_dominant[t];
+                if dom == t { continue; }
+
+                // Pairwise fraction: t's count vs dominant competitor's count
+                let dom_count = em_res[dom];
+                let pairwise_frac = if dom_count > 0.0 {
+                    em_res[t] / (em_res[t] + dom_count)
+                } else {
+                    1.0
+                };
+
+                // Neighborhood fraction filter: use pairwise fraction
+                // since the cluster fraction is diluted by cross-group competitors.
+                // A transcript with < 1% of its dominant competitor's count
+                // is almost certainly leakage.
+                if pairwise_frac < gene_frac_threshold.max(0.01) {
+                    let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
+                    if ec_unique_frac[t] < 1.0 || pos_uneven {
+                        em_res[t] = 0.0;
+                        if i == 0 { total_nbr_removed += 1; }
+                        continue;
+                    }
+                }
+
+                // Profile-correlation filter (neighborhood version)
+                if has_pos && pairwise_frac < 0.05 {
+                    if profile_corr_is_leakage(&pos_bin_profiles, t, dom, n_pos_bins) {
+                        em_res[t] = 0.0;
+                        if i == 0 { total_nbr_removed += 1; }
+                    }
+                }
+            }
+
+            // Diagnostic: compare what neighborhood filter would catch vs gene filter.
+            // Run neighborhood filter logic on ALL expressed transcripts (including
+            // gene-annotated ones) to see overlap.
+            if i == 0 && has_gene_annot {
+                let mut nbr_would_remove = 0usize;
+                let mut gene_did_remove = 0usize;
+                let mut both_remove = 0usize;
+                let mut nbr_only = 0usize;
+                let mut gene_only = 0usize;
+
+                // Use phase1 counts to evaluate what was expressed BEFORE filtering
+                let p1 = &phase1_counts[0];
+                for t in 0..n_targets {
+                    if p1[t] <= 0.0 || !consensus_mask[t] { continue; }
+
+                    let gene_removed = em_res[t] == 0.0;
+
+                    // Would neighborhood filter remove this?
+                    let dom = nbr_dominant[t];
+                    let mut nbr_remove = false;
+                    if dom != t {
+                        let dom_count = p1[dom]; // use Phase 1 counts for comparison
+                        let pf = if dom_count > 0.0 { p1[t] / (p1[t] + dom_count) } else { 1.0 };
+                        // Fraction filter
+                        if pf < gene_frac_threshold.max(0.01) {
+                            let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
+                            if ec_unique_frac[t] < 1.0 || pos_uneven {
+                                nbr_remove = true;
+                            }
+                        }
+                        // Profile correlation filter
+                        if !nbr_remove && has_pos && pf < 0.05 {
+                            if profile_corr_is_leakage(&pos_bin_profiles, t, dom, n_pos_bins) {
+                                nbr_remove = true;
+                            }
+                        }
+                    }
+
+                    if gene_removed { gene_did_remove += 1; }
+                    if nbr_remove { nbr_would_remove += 1; }
+                    if gene_removed && nbr_remove { both_remove += 1; }
+                    if !gene_removed && nbr_remove { nbr_only += 1; }
+                    if gene_removed && !nbr_remove { gene_only += 1; }
+                }
+                info!(
+                    "Neighborhood vs gene filter comparison: gene={}, nbr={}, both={}, gene_only={}, nbr_only={}",
+                    gene_did_remove, nbr_would_remove, both_remove, gene_only, nbr_only
+                );
             }
         }
 
@@ -1146,10 +1350,10 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         serde_json::to_writer_pretty(ofile, &meta_info)?;
     }
 
-    if total_gene_frac_removed > 0 {
+    if total_gene_frac_removed > 0 || total_nbr_removed > 0 {
         info!(
-            "Gene-fraction filter (>= {:.1}%): zeroed {} isoforms in sample 1 (no unique ECs, below gene fraction)",
-            gene_frac_threshold * 100.0, total_gene_frac_removed
+            "Leakage filter: zeroed {} (gene-annotated) + {} (EC-neighborhood) isoforms in sample 1",
+            total_gene_frac_removed, total_nbr_removed
         );
     }
 

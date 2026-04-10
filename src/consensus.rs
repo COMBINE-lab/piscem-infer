@@ -136,6 +136,92 @@ fn compute_tpm(e_counts: &[f64], eff_lengths: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Build gene-like groups from EC graph structure (annotation-free).
+///
+/// Uses Jaccard similarity of EC signatures to identify transcripts that likely
+/// belong to the same gene. Two transcripts are grouped if they share >= 10% of
+/// their combined EC signatures (Jaccard >= 0.10). Connected components of this
+/// graph form the groups.
+///
+/// Returns a mapping from transcript index to group ID. Transcripts with no
+/// EC-sharing neighbors get their own singleton group.
+fn build_ec_graph_groups(
+    index: &crate::utils::txp_selection::TranscriptEqIndex,
+    consensus_mask: &[bool],
+    n_targets: usize,
+) -> Vec<u32> {
+    let jaccard_threshold = 0.10;
+
+    // Build inverted index: EC → list of consensus transcripts
+    let max_eqc = index.eqc_ids.iter().copied().max()
+        .map(|m| m as usize + 1).unwrap_or(0);
+    let mut eqc_to_txps: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
+    for t in 0..n_targets {
+        if !consensus_mask[t] { continue; }
+        for &eqc in index.signature(t) {
+            eqc_to_txps[eqc as usize].push(t as u32);
+        }
+    }
+
+    // For each transcript, find neighbors with Jaccard >= threshold.
+    // Use union-find for efficient connected components.
+    let mut parent: Vec<u32> = (0..n_targets as u32).collect();
+    let mut rank = vec![0u32; n_targets];
+
+    fn find(parent: &mut [u32], x: u32) -> u32 {
+        let mut r = x;
+        while parent[r as usize] != r { r = parent[r as usize]; }
+        // Path compression
+        let mut c = x;
+        while c != r { let next = parent[c as usize]; parent[c as usize] = r; c = next; }
+        r
+    }
+    fn union(parent: &mut [u32], rank: &mut [u32], a: u32, b: u32) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra == rb { return; }
+        if rank[ra as usize] < rank[rb as usize] { parent[ra as usize] = rb; }
+        else if rank[ra as usize] > rank[rb as usize] { parent[rb as usize] = ra; }
+        else { parent[rb as usize] = ra; rank[ra as usize] += 1; }
+    }
+
+    // For each consensus transcript, compute pairwise Jaccard with EC-sharing neighbors
+    for t in 0..n_targets {
+        if !consensus_mask[t] { continue; }
+        let sig_t = index.signature(t);
+        if sig_t.is_empty() { continue; }
+        let deg_t = sig_t.len() as u32;
+
+        // Count shared ECs with each neighbor
+        let mut neighbor_shared: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
+        for &eqc in sig_t {
+            for &u in &eqc_to_txps[eqc as usize] {
+                if u as usize != t {
+                    *neighbor_shared.entry(u).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Check Jaccard threshold and union
+        for (&u, &shared) in &neighbor_shared {
+            let deg_u = index.degree(u as usize) as u32;
+            let union_size = deg_t + deg_u - shared;
+            if union_size > 0 {
+                let jaccard = shared as f64 / union_size as f64;
+                if jaccard >= jaccard_threshold {
+                    union(&mut parent, &mut rank, t as u32, u);
+                }
+            }
+        }
+    }
+
+    // Flatten to group IDs
+    for t in 0..n_targets {
+        find(&mut parent, t as u32);
+    }
+    parent
+}
+
 /// Check if transcript t's position profile is near-identical to transcript dom's,
 /// suggesting EM leakage. Returns true if correlation > 0.9.
 fn profile_corr_is_leakage(
@@ -1064,6 +1150,101 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         }
     }
 
+    // Diagnostic: dump pairwise EC graph metrics for expressed transcript pairs.
+    if std::env::var("PISCEM_EC_GRAPH_DIAG").is_ok() {
+        info!("Computing pairwise EC graph metrics (this may take a while)...");
+        // Build inverted index: EC → list of consensus transcripts containing it
+        let max_eqc = merged_index.eqc_ids.iter().copied().max()
+            .map(|m| m as usize + 1).unwrap_or(0);
+        let mut eqc_to_txps: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
+        for t in 0..n_targets {
+            if !consensus_mask[t] { continue; }
+            for &eqc in merged_index.signature(t) {
+                eqc_to_txps[eqc as usize].push(t as u32);
+            }
+        }
+
+        // For each pair of consensus transcripts sharing >= 1 EC, compute:
+        // - Jaccard similarity of EC signatures
+        // - Fraction of t's ECs shared with u (asymmetric containment)
+        // - Mean EC size of shared ECs
+        // - Whether they're in the same gene
+        let mut pair_metrics: ahash::AHashMap<(u32, u32), (u32, u32, u32, f64)> = ahash::AHashMap::new();
+        // (shared_count, sig_t_size, sig_u_size, sum_shared_ec_sizes)
+
+        for t in 0..n_targets {
+            if !consensus_mask[t] { continue; }
+            let sig_t = merged_index.signature(t);
+            if sig_t.is_empty() { continue; }
+
+            // Find all transcripts sharing at least one EC with t
+            let mut neighbor_shared: ahash::AHashMap<u32, (u32, f64)> = ahash::AHashMap::new();
+            for &eqc in sig_t {
+                let ec_size = eqc_to_txps[eqc as usize].len() as f64;
+                for &u in &eqc_to_txps[eqc as usize] {
+                    if u as usize == t { continue; }
+                    let entry = neighbor_shared.entry(u).or_insert((0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += ec_size;
+                }
+            }
+
+            for (&u, &(shared, sum_ec_size)) in &neighbor_shared {
+                let key = if (t as u32) < u { (t as u32, u) } else { (u, t as u32) };
+                let sig_u_len = merged_index.degree(u as usize) as u32;
+                pair_metrics.entry(key).or_insert((
+                    shared,
+                    sig_t.len() as u32,
+                    sig_u_len,
+                    sum_ec_size / shared as f64, // mean shared EC size
+                ));
+            }
+        }
+
+        // Dump to file
+        if let Ok(mut f) = std::fs::File::create("ec_graph_pairs.tsv") {
+            use std::io::Write;
+            writeln!(f, "txp_t\ttxp_u\tgene_t\tgene_u\tsame_gene\tshared_ecs\tsig_t_size\tsig_u_size\tjaccard\tcontain_t\tcontain_u\tmean_shared_ec_size").ok();
+            for (&(t, u), &(shared, sig_t, sig_u, mean_ec_sz)) in &pair_metrics {
+                let gene_t = gene_names.get(t as usize).and_then(|g| *g).unwrap_or("NA");
+                let gene_u = gene_names.get(u as usize).and_then(|g| *g).unwrap_or("NA");
+                let same = if gene_t != "NA" && gene_t == gene_u { 1 } else { 0 };
+                let union = sig_t + sig_u - shared;
+                let jaccard = if union > 0 { shared as f64 / union as f64 } else { 0.0 };
+                let contain_t = if sig_t > 0 { shared as f64 / sig_t as f64 } else { 0.0 };
+                let contain_u = if sig_u > 0 { shared as f64 / sig_u as f64 } else { 0.0 };
+                writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.1}",
+                    t, u, gene_t, gene_u, same, shared, sig_t, sig_u,
+                    jaccard, contain_t, contain_u, mean_ec_sz).ok();
+            }
+            info!("Wrote {} pairwise EC metrics to ec_graph_pairs.tsv", pair_metrics.len());
+        }
+    }
+
+    // Build EC-graph-based groups for annotation-free leakage filtering.
+    // Groups transcripts with Jaccard(EC signatures) >= 0.10 into connected components.
+    let ec_graph_groups = build_ec_graph_groups(&merged_index, &consensus_mask, n_targets);
+
+    // Build group → members mapping
+    let ec_graph_group_members: std::collections::HashMap<u32, Vec<usize>> = {
+        let mut map: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+        for t in 0..n_targets {
+            if !consensus_mask[t] { continue; }
+            map.entry(ec_graph_groups[t]).or_default().push(t);
+        }
+        map
+    };
+
+    {
+        let n_groups = ec_graph_group_members.len();
+        let n_multi = ec_graph_group_members.values().filter(|v| v.len() > 1).count();
+        let max_size = ec_graph_group_members.values().map(|v| v.len()).max().unwrap_or(0);
+        info!(
+            "EC-graph groups: {} total ({} multi-member, max size {})",
+            n_groups, n_multi, max_size
+        );
+    }
+
     // Compute per-transcript position bin profile from the merged index.
     // For each transcript, count fragments in each position bin (count-weighted).
     let n_pos_bins = crate::utils::eq_maps::NUM_POS_BINS.get()
@@ -1205,103 +1386,104 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             }
         }
 
-        // ---- EC-neighborhood filtering (annotation-free) ----
-        // Uses the EC graph structure to find dominant competitors and detect
-        // leakage. Applied to transcripts without gene annotation, or to ALL
-        // transcripts when gene annotation is unavailable.
+        // ---- EC-graph-group filtering (annotation-free) ----
+        // For transcripts without gene annotation, reconstruct gene-like groups
+        // from EC graph structure (Jaccard similarity >= 0.10) and apply the
+        // same fraction + profile correlation filters within each group.
         {
-            let (nbr_frac, nbr_dominant) = compute_neighborhood_leakage(
-                &bundles[i].packed_eq_map, &em_res, &bundles[i].eff_lengths,
-            );
+            for (&group_root, members) in &ec_graph_group_members {
+                let active: Vec<usize> = members.iter()
+                    .filter(|&&t| em_res[t] > 0.0)
+                    .copied()
+                    .collect();
+                if active.len() <= 1 { continue; }
 
-            for t in 0..n_targets {
-                if em_res[t] <= 0.0 { continue; }
-
-                // Skip transcripts already handled by gene-annotated filtering
-                if has_gene_annot && gene_names[t].is_some() { continue; }
-
-                let dom = nbr_dominant[t];
-                if dom == t { continue; }
-
-                // Pairwise fraction: t's count vs dominant competitor's count
-                let dom_count = em_res[dom];
-                let pairwise_frac = if dom_count > 0.0 {
-                    em_res[t] / (em_res[t] + dom_count)
-                } else {
-                    1.0
-                };
-
-                // Neighborhood fraction filter: use pairwise fraction
-                // since the cluster fraction is diluted by cross-group competitors.
-                // A transcript with < 1% of its dominant competitor's count
-                // is almost certainly leakage.
-                if pairwise_frac < gene_frac_threshold.max(0.01) {
-                    let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
-                    if ec_unique_frac[t] < 1.0 || pos_uneven {
-                        em_res[t] = 0.0;
-                        if i == 0 { total_nbr_removed += 1; }
-                        continue;
-                    }
+                // Skip groups where all members have gene annotation
+                // (already handled by gene-annotated filtering)
+                if has_gene_annot && active.iter().all(|&t| gene_names[t].is_some()) {
+                    continue;
                 }
 
-                // Profile-correlation filter (neighborhood version)
-                if has_pos && pairwise_frac < 0.05 {
-                    if profile_corr_is_leakage(&pos_bin_profiles, t, dom, n_pos_bins) {
-                        em_res[t] = 0.0;
-                        if i == 0 { total_nbr_removed += 1; }
+                let group_total: f64 = active.iter().map(|&t| em_res[t]).sum();
+                if group_total <= 0.0 { continue; }
+
+                let dom_t = *active.iter()
+                    .max_by(|&&a, &&b| em_res[a].partial_cmp(&em_res[b]).unwrap())
+                    .unwrap();
+
+                for &t in &active {
+                    if t == dom_t { continue; }
+                    // Skip if this transcript was handled by gene-annotated filter
+                    if has_gene_annot && gene_names[t].is_some() { continue; }
+
+                    let group_frac = em_res[t] / group_total;
+
+                    // Group-fraction filter (same logic as gene-fraction)
+                    if group_frac < gene_frac_threshold.max(0.01) {
+                        let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
+                        if ec_unique_frac[t] < 1.0 || pos_uneven {
+                            em_res[t] = 0.0;
+                            if i == 0 { total_nbr_removed += 1; }
+                            continue;
+                        }
+                    }
+
+                    // Profile-correlation filter (group version)
+                    if has_pos && group_frac < 0.05 {
+                        if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
+                            em_res[t] = 0.0;
+                            if i == 0 { total_nbr_removed += 1; }
+                        }
                     }
                 }
             }
+        }
 
-            // Diagnostic: compare what neighborhood filter would catch vs gene filter.
-            // Run neighborhood filter logic on ALL expressed transcripts (including
-            // gene-annotated ones) to see overlap.
-            if i == 0 && has_gene_annot {
-                let mut nbr_would_remove = 0usize;
-                let mut gene_did_remove = 0usize;
-                let mut both_remove = 0usize;
-                let mut nbr_only = 0usize;
-                let mut gene_only = 0usize;
+        // Diagnostic: on sample 0, compare EC-graph groups vs gene annotation
+        if i == 0 && has_gene_annot {
+            // Run EC-graph group filter on ALL transcripts (pretend no annotation)
+            let p1 = &phase1_counts[0];
+            let mut ecg_would_remove = 0usize;
+            let mut gene_did_remove = 0usize;
+            let mut both = 0usize;
 
-                // Use phase1 counts to evaluate what was expressed BEFORE filtering
-                let p1 = &phase1_counts[0];
-                for t in 0..n_targets {
-                    if p1[t] <= 0.0 || !consensus_mask[t] { continue; }
+            for (&_group_root, members) in &ec_graph_group_members {
+                let active: Vec<usize> = members.iter()
+                    .filter(|&&t| p1[t] > 0.0 && consensus_mask[t])
+                    .copied()
+                    .collect();
+                if active.len() <= 1 { continue; }
+                let group_total: f64 = active.iter().map(|&t| p1[t]).sum();
+                if group_total <= 0.0 { continue; }
+                let dom_t = *active.iter().max_by(|&&a, &&b| p1[a].partial_cmp(&p1[b]).unwrap()).unwrap();
 
+                for &t in &active {
+                    if t == dom_t { continue; }
+                    let gf = p1[t] / group_total;
                     let gene_removed = em_res[t] == 0.0;
+                    let mut ecg_remove = false;
 
-                    // Would neighborhood filter remove this?
-                    let dom = nbr_dominant[t];
-                    let mut nbr_remove = false;
-                    if dom != t {
-                        let dom_count = p1[dom]; // use Phase 1 counts for comparison
-                        let pf = if dom_count > 0.0 { p1[t] / (p1[t] + dom_count) } else { 1.0 };
-                        // Fraction filter
-                        if pf < gene_frac_threshold.max(0.01) {
-                            let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
-                            if ec_unique_frac[t] < 1.0 || pos_uneven {
-                                nbr_remove = true;
-                            }
-                        }
-                        // Profile correlation filter
-                        if !nbr_remove && has_pos && pf < 0.05 {
-                            if profile_corr_is_leakage(&pos_bin_profiles, t, dom, n_pos_bins) {
-                                nbr_remove = true;
-                            }
+                    if gf < gene_frac_threshold.max(0.01) {
+                        let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
+                        if ec_unique_frac[t] < 1.0 || pos_uneven { ecg_remove = true; }
+                    }
+                    if !ecg_remove && has_pos && gf < 0.05 {
+                        if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
+                            ecg_remove = true;
                         }
                     }
 
                     if gene_removed { gene_did_remove += 1; }
-                    if nbr_remove { nbr_would_remove += 1; }
-                    if gene_removed && nbr_remove { both_remove += 1; }
-                    if !gene_removed && nbr_remove { nbr_only += 1; }
-                    if gene_removed && !nbr_remove { gene_only += 1; }
+                    if ecg_remove { ecg_would_remove += 1; }
+                    if gene_removed && ecg_remove { both += 1; }
                 }
-                info!(
-                    "Neighborhood vs gene filter comparison: gene={}, nbr={}, both={}, gene_only={}, nbr_only={}",
-                    gene_did_remove, nbr_would_remove, both_remove, gene_only, nbr_only
-                );
             }
+            info!(
+                "EC-graph vs gene filter: gene={}, ecg={}, overlap={}, ecg_only={}, gene_only={}",
+                gene_did_remove, ecg_would_remove, both,
+                ecg_would_remove.saturating_sub(both),
+                gene_did_remove.saturating_sub(both)
+            );
         }
 
         let sample = &samples[i];

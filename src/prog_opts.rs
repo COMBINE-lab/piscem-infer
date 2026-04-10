@@ -390,15 +390,17 @@ pub struct ConsensusQuantOpts {
     pub no_phase2_warm_start: bool,
     /// within-gene isoform fraction filter: after Phase 2 EM, zero out isoforms
     /// contributing less than this fraction of their gene's total estimated count.
-    /// Removes EM leakage into sibling isoforms. Gene names are parsed from
-    /// pipe-delimited transcript IDs (GENCODE format, field 6). Set to 0 to disable.
+    /// Removes EM leakage into sibling isoforms. Applied within EC-graph-derived
+    /// groups (default) or within annotated genes (with --use-gene-annotation).
+    /// Set to 0 to disable.
     #[arg(long, default_value_t = 0.01, help_heading = "Consensus Filter")]
     pub gene_fraction_filter: f64,
-    /// disable gene name parsing from transcript IDs, forcing the annotation-free
-    /// EC-graph-based leakage filter for all transcripts. Useful when transcript
-    /// names don't follow GENCODE pipe-delimited format.
+    /// use gene names parsed from pipe-delimited transcript IDs (GENCODE format,
+    /// field 6) for within-gene leakage filtering instead of the default
+    /// EC-graph-based grouping. The EC-graph filter is generally more accurate
+    /// as it also captures cross-gene leakage.
     #[arg(long, help_heading = "Consensus Filter")]
-    pub no_gene_annotation: bool,
+    pub use_gene_annotation: bool,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation

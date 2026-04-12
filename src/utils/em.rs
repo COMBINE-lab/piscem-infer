@@ -311,6 +311,8 @@ fn compute_inv_eff_lens(eff_lens: &[f64]) -> Vec<f64> {
         .collect::<Vec<f64>>()
 }
 
+/// Kallisto-style convergence: returns true if NO transcript with
+/// alpha > `alpha_limit` has relative change > `change_limit`.
 #[inline]
 fn compute_rel_diff(prev_counts: &[f64], curr_counts: &[f64], presence_thresh: f64) -> f64 {
     let mut sum_abs_rel = 0.0_f64;
@@ -593,12 +595,14 @@ pub fn em_par_with_pool_init<EqLabelT: EqLabel>(
             rel_diff = compute_rel_diff_atomic(&prev_counts, &curr_counts, presence_thresh);
             last_rel_diff = rel_diff;
 
+            let converged = rel_diff < converge_thresh;
+
             std::mem::swap(&mut prev_counts, &mut curr_counts);
             curr_counts
                 .par_iter()
                 .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
 
-            if rel_diff < converge_thresh {
+            if converged {
                 break;
             }
             niter += 1;

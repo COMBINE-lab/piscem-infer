@@ -20,6 +20,8 @@ pub enum FilterMode {
     Ues,
     /// Effective EC support count: number of ECs contributing non-trivially
     Support,
+    /// Hybrid evidence rule: EC support or ambiguity-adjusted UES dominance
+    Hybrid,
 }
 
 impl FromStr for FilterMode {
@@ -29,7 +31,11 @@ impl FromStr for FilterMode {
             "tpm" => Ok(Self::Tpm),
             "ues" => Ok(Self::Ues),
             "support" => Ok(Self::Support),
-            other => bail!("unknown filter mode '{}'; expected tpm, ues, or support", other),
+            "hybrid" => Ok(Self::Hybrid),
+            other => bail!(
+                "unknown filter mode '{}'; expected tpm, ues, support, or hybrid",
+                other
+            ),
         }
     }
 }
@@ -40,6 +46,7 @@ impl Serialize for FilterMode {
             Self::Tpm => serializer.serialize_str("tpm"),
             Self::Ues => serializer.serialize_str("ues"),
             Self::Support => serializer.serialize_str("support"),
+            Self::Hybrid => serializer.serialize_str("hybrid"),
         }
     }
 }
@@ -124,25 +131,47 @@ pub struct QuantOpts {
     /// number of (unique) mappings to use to perform initial coarse-grained
     /// estimation of the fragment length distribution. These fragments will have
     /// to be read from the file and interrogated twice.
-    #[arg(long, default_value_t = 500_000_isize, help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        default_value_t = 500_000_isize,
+        help_heading = "Fragment Length Distribution"
+    )]
     pub param_est_frags: isize,
     /// mean of fragment length distribution mean
     /// (required, and used, only in the case of unpaired fragments).
-    #[arg(long, requires = "fld_sd", help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        requires = "fld_sd",
+        help_heading = "Fragment Length Distribution"
+    )]
     pub fld_mean: Option<f64>,
     /// mean of fragment length distribution standard deviation
     /// (required, and used, only in the case of unpaired fragments).
-    #[arg(long, requires = "fld_mean", help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        requires = "fld_mean",
+        help_heading = "Fragment Length Distribution"
+    )]
     pub fld_sd: Option<f64>,
 
     // --- Inferential Replicates ---
     /// number of bootstrap replicates to perform.
     /// Mutually exclusive with --num-gibbs-samples.
-    #[arg(long, default_value_t = 0, conflicts_with = "num_gibbs_samples", help_heading = "Inferential Replicates")]
+    #[arg(
+        long,
+        default_value_t = 0,
+        conflicts_with = "num_gibbs_samples",
+        help_heading = "Inferential Replicates"
+    )]
     pub num_bootstraps: usize,
     /// number of Gibbs samples to draw for posterior uncertainty estimation.
     /// Mutually exclusive with --num-bootstraps.
-    #[arg(long, default_value_t = 0, conflicts_with = "num_bootstraps", help_heading = "Inferential Replicates")]
+    #[arg(
+        long,
+        default_value_t = 0,
+        conflicts_with = "num_bootstraps",
+        help_heading = "Inferential Replicates"
+    )]
     pub num_gibbs_samples: usize,
     /// number of internal Gibbs iterations between collected samples (thinning).
     /// Only used when --num-gibbs-samples > 0.
@@ -233,15 +262,27 @@ pub struct MultiQuantOpts {
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation
-    #[arg(long, default_value_t = 500_000_isize, help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        default_value_t = 500_000_isize,
+        help_heading = "Fragment Length Distribution"
+    )]
     pub param_est_frags: isize,
     /// mean of fragment length distribution
     /// (required, and used, only for unpaired fragments)
-    #[arg(long, requires = "fld_sd", help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        requires = "fld_sd",
+        help_heading = "Fragment Length Distribution"
+    )]
     pub fld_mean: Option<f64>,
     /// standard deviation of fragment length distribution
     /// (required, and used, only for unpaired fragments)
-    #[arg(long, requires = "fld_mean", help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        requires = "fld_mean",
+        help_heading = "Fragment Length Distribution"
+    )]
     pub fld_sd: Option<f64>,
 
     // --- Advanced ---
@@ -279,10 +320,20 @@ pub struct MultiQuantOpts {
     #[arg(long, requires = "group_lasso", help_heading = "Group LASSO")]
     pub gl_lambda: Option<f64>,
     /// max iterations for FISTA proximal gradient descent
-    #[arg(long, default_value_t = 500, requires = "group_lasso", help_heading = "Group LASSO")]
+    #[arg(
+        long,
+        default_value_t = 500,
+        requires = "group_lasso",
+        help_heading = "Group LASSO"
+    )]
     pub gl_max_iter: u32,
     /// convergence threshold for FISTA (relative objective change)
-    #[arg(long, default_value_t = 1e-6, requires = "group_lasso", help_heading = "Group LASSO")]
+    #[arg(
+        long,
+        default_value_t = 1e-6,
+        requires = "group_lasso",
+        help_heading = "Group LASSO"
+    )]
     pub gl_convergence_thresh: f64,
     /// apply group sparsity per-condition instead of across all samples.
     /// Allows condition-specific transcript expression patterns.
@@ -347,7 +398,8 @@ pub struct ConsensusQuantOpts {
     // --- Consensus Filter ---
     /// filter mode: how to decide if a transcript is "expressed" in a sample.
     /// tpm = simple TPM threshold; ues = unique evidence score;
-    /// support = effective EC support count
+    /// support = effective EC support count;
+    /// hybrid = support or ambiguity-adjusted UES dominance
     #[arg(long, default_value = "tpm", value_parser = clap::value_parser!(FilterMode), help_heading = "Consensus Filter")]
     pub filter_mode: FilterMode,
     /// minimum fraction of samples in which a transcript must be expressed
@@ -364,7 +416,11 @@ pub struct ConsensusQuantOpts {
     /// global filtering with preservation of condition-specific expression.
     /// Enabled automatically when the manifest has multiple conditions.
     /// Use --no-condition-rescue to disable.
-    #[arg(long, conflicts_with = "condition_aware_consensus", help_heading = "Consensus Filter")]
+    #[arg(
+        long,
+        conflicts_with = "condition_aware_consensus",
+        help_heading = "Consensus Filter"
+    )]
     pub condition_rescue: bool,
     /// disable automatic condition rescue when multiple conditions are present.
     #[arg(long, conflicts_with_all = ["condition_rescue", "condition_aware_consensus"], help_heading = "Consensus Filter")]
@@ -393,6 +449,12 @@ pub struct ConsensusQuantOpts {
     /// disable phase-2 warm starts from the phase-1 abundance estimates.
     #[arg(long, help_heading = "Consensus Filter")]
     pub no_phase2_warm_start: bool,
+    /// add a condition-specific hierarchical Dirichlet prior during phase 2,
+    /// with pseudo-count strength equal to this fraction of the average sample
+    /// read count. 0 disables the prior and preserves the current phase-2
+    /// behavior.
+    #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]
+    pub condition_specific_prior_weight: f64,
     /// within-gene isoform fraction filter: after Phase 2 EM, zero out isoforms
     /// contributing less than this fraction of their gene's total estimated count.
     /// Removes EM leakage into sibling isoforms. Applied within EC-graph-derived
@@ -409,15 +471,27 @@ pub struct ConsensusQuantOpts {
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation
-    #[arg(long, default_value_t = 500_000_isize, help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        default_value_t = 500_000_isize,
+        help_heading = "Fragment Length Distribution"
+    )]
     pub param_est_frags: isize,
     /// mean of fragment length distribution
     /// (required, and used, only for unpaired fragments)
-    #[arg(long, requires = "fld_sd", help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        requires = "fld_sd",
+        help_heading = "Fragment Length Distribution"
+    )]
     pub fld_mean: Option<f64>,
     /// standard deviation of fragment length distribution
     /// (required, and used, only for unpaired fragments)
-    #[arg(long, requires = "fld_mean", help_heading = "Fragment Length Distribution")]
+    #[arg(
+        long,
+        requires = "fld_mean",
+        help_heading = "Fragment Length Distribution"
+    )]
     pub fld_sd: Option<f64>,
 
     // --- Advanced ---

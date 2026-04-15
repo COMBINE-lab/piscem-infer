@@ -17,9 +17,11 @@ use crate::process_rad::{EqMapBundle, RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::{ConsensusQuantOpts, FilterMode};
 use crate::utils::em::{
     EMInfo, em, em_init, em_par, em_par_init, em_par_with_pool, em_par_with_pool_init,
-    em_with_coverage, squarem_em, squarem_em_par, squarem_em_par_with_pool,
+    em_penalized_init, em_penalized_par_init, em_penalized_par_with_pool_init, em_with_coverage,
+    squarem_em, squarem_em_par, squarem_em_par_with_pool,
 };
 use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap, TargetLabelsRef};
+use crate::utils::hierarchical;
 use crate::utils::io;
 
 /// Per-transcript EC-based evidence metrics computed after EM convergence.
@@ -113,7 +115,11 @@ fn compute_evidence_metrics<EqLabelT: EqLabel>(
         .map(|(&s, &w)| if w > 0.0 { s / w } else { 0.0 })
         .collect();
 
-    EvidenceMetrics { ues, support, mean_ec_size }
+    EvidenceMetrics {
+        ues,
+        support,
+        mean_ec_size,
+    }
 }
 
 /// Compute TPM from estimated counts and effective lengths.
@@ -136,6 +142,124 @@ fn compute_tpm(e_counts: &[f64], eff_lengths: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+#[inline]
+fn support_threshold_for_transcript(
+    base_min_ecs: u32,
+    adaptive_thresh: Option<&[u32]>,
+    t: usize,
+) -> u32 {
+    adaptive_thresh.map_or(base_min_ecs, |v| v[t])
+}
+
+#[inline]
+fn ambiguity_adjusted_ues_margin(ues: f64, mean_ec_size: f64) -> f64 {
+    let ambiguity_baseline = if mean_ec_size > 1.0 {
+        1.0 / mean_ec_size
+    } else {
+        0.0
+    };
+    (ues - ambiguity_baseline).max(0.0)
+}
+
+fn sample_expression_mask<EqLabelT: EqLabel>(
+    packed_eq_map: &PackedEqMap<EqLabelT>,
+    counts: &[f64],
+    eff_lengths: &[f64],
+    filter_mode: &FilterMode,
+    opts: &ConsensusQuantOpts,
+    base_min_ecs: u32,
+    adaptive_thresh: Option<&[u32]>,
+) -> Vec<bool> {
+    match filter_mode {
+        FilterMode::Tpm => compute_tpm(counts, eff_lengths)
+            .into_iter()
+            .map(|tpm| tpm > opts.tpm_threshold)
+            .collect(),
+        FilterMode::Ues => {
+            let metrics = compute_evidence_metrics(
+                packed_eq_map,
+                counts,
+                eff_lengths,
+                opts.min_support_count,
+            );
+            metrics
+                .ues
+                .into_iter()
+                .map(|ues| ues > opts.ues_threshold)
+                .collect()
+        }
+        FilterMode::Support => {
+            let metrics = compute_evidence_metrics(
+                packed_eq_map,
+                counts,
+                eff_lengths,
+                opts.min_support_count,
+            );
+            metrics
+                .support
+                .into_iter()
+                .enumerate()
+                .map(|(t, sup)| {
+                    sup >= support_threshold_for_transcript(base_min_ecs, adaptive_thresh, t)
+                })
+                .collect()
+        }
+        FilterMode::Hybrid => {
+            let metrics = compute_evidence_metrics(
+                packed_eq_map,
+                counts,
+                eff_lengths,
+                opts.min_support_count,
+            );
+            (0..counts.len())
+                .map(|t| {
+                    let support_thresh =
+                        support_threshold_for_transcript(base_min_ecs, adaptive_thresh, t);
+                    let relaxed_support = support_thresh.saturating_sub(1).max(1);
+                    let dominance_margin =
+                        ambiguity_adjusted_ues_margin(metrics.ues[t], metrics.mean_ec_size[t]);
+                    metrics.support[t] >= support_thresh
+                        || (metrics.support[t] >= relaxed_support
+                            && dominance_margin > opts.ues_threshold)
+                })
+                .collect()
+        }
+    }
+}
+
+fn sample_specific_phase2_masks(
+    samples: &[SampleEntry],
+    strict_global_mask: &[bool],
+    pre_gene_consensus_mask: &[bool],
+    condition_names: Option<&[String]>,
+    condition_support_masks: Option<&[Vec<bool>]>,
+    condition_aware_consensus: bool,
+    use_condition_rescue: bool,
+) -> Vec<Vec<bool>> {
+    if !(condition_aware_consensus || use_condition_rescue) {
+        return vec![pre_gene_consensus_mask.to_vec(); samples.len()];
+    }
+
+    let condition_names =
+        condition_names.expect("condition names required for condition-aware phase-2 masks");
+    let condition_support_masks = condition_support_masks
+        .expect("condition support masks required for condition-aware phase-2 masks");
+
+    samples
+        .iter()
+        .map(|sample| {
+            let ci = condition_names
+                .iter()
+                .position(|c| c == &sample.condition)
+                .expect("sample condition should exist in condition_names");
+            let cond_mask = &condition_support_masks[ci];
+            (0..pre_gene_consensus_mask.len())
+                .map(|t| cond_mask[t] || (!condition_aware_consensus && strict_global_mask[t]))
+                .collect()
+        })
+        .collect()
+}
+
 /// Build gene-like groups from EC graph structure (annotation-free).
 ///
 /// Uses Jaccard similarity of EC signatures to identify transcripts that likely
@@ -153,11 +277,18 @@ fn build_ec_graph_groups(
     let jaccard_threshold = 0.10;
 
     // Build inverted index: EC → list of consensus transcripts
-    let max_eqc = index.eqc_ids.iter().copied().max()
-        .map(|m| m as usize + 1).unwrap_or(0);
+    let max_eqc = index
+        .eqc_ids
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0);
     let mut eqc_to_txps: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
     for t in 0..n_targets {
-        if !consensus_mask[t] { continue; }
+        if !consensus_mask[t] {
+            continue;
+        }
         for &eqc in index.signature(t) {
             eqc_to_txps[eqc as usize].push(t as u32);
         }
@@ -170,26 +301,43 @@ fn build_ec_graph_groups(
 
     fn find(parent: &mut [u32], x: u32) -> u32 {
         let mut r = x;
-        while parent[r as usize] != r { r = parent[r as usize]; }
+        while parent[r as usize] != r {
+            r = parent[r as usize];
+        }
         // Path compression
         let mut c = x;
-        while c != r { let next = parent[c as usize]; parent[c as usize] = r; c = next; }
+        while c != r {
+            let next = parent[c as usize];
+            parent[c as usize] = r;
+            c = next;
+        }
         r
     }
     fn union(parent: &mut [u32], rank: &mut [u32], a: u32, b: u32) {
         let ra = find(parent, a);
         let rb = find(parent, b);
-        if ra == rb { return; }
-        if rank[ra as usize] < rank[rb as usize] { parent[ra as usize] = rb; }
-        else if rank[ra as usize] > rank[rb as usize] { parent[rb as usize] = ra; }
-        else { parent[rb as usize] = ra; rank[ra as usize] += 1; }
+        if ra == rb {
+            return;
+        }
+        if rank[ra as usize] < rank[rb as usize] {
+            parent[ra as usize] = rb;
+        } else if rank[ra as usize] > rank[rb as usize] {
+            parent[rb as usize] = ra;
+        } else {
+            parent[rb as usize] = ra;
+            rank[ra as usize] += 1;
+        }
     }
 
     // For each consensus transcript, compute pairwise Jaccard with EC-sharing neighbors
     for t in 0..n_targets {
-        if !consensus_mask[t] { continue; }
+        if !consensus_mask[t] {
+            continue;
+        }
         let sig_t = index.signature(t);
-        if sig_t.is_empty() { continue; }
+        if sig_t.is_empty() {
+            continue;
+        }
         let deg_t = sig_t.len() as u32;
 
         // Count shared ECs with each neighbor
@@ -239,22 +387,38 @@ fn profile_corr_is_leakage(
         return false;
     }
 
+    let dom_bin_t = prof_t
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &count)| count)
+        .map(|(idx, _)| idx);
+    let dom_bin_dom = prof_dom
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &count)| count)
+        .map(|(idx, _)| idx);
+    if dom_bin_t != dom_bin_dom {
+        return false;
+    }
+
     let mean_t = 1.0 / n_pos_bins as f64; // fracs sum to 1, mean = 1/n
     let mean_dom = mean_t;
 
     let mut cov = 0.0f64;
     let mut var_t = 0.0f64;
     let mut var_dom = 0.0f64;
+    let mut l1 = 0.0f64;
     for b in 0..n_pos_bins {
         let ft = prof_t[b] as f64 / total_t - mean_t;
         let fd = prof_dom[b] as f64 / total_dom - mean_dom;
         cov += ft * fd;
         var_t += ft * ft;
         var_dom += fd * fd;
+        l1 += ((prof_t[b] as f64 / total_t) - (prof_dom[b] as f64 / total_dom)).abs();
     }
     let denom = (var_t * var_dom).sqrt();
     let corr = if denom > 1e-12 { cov / denom } else { 0.0 };
-    corr > 0.9
+    corr > 0.9 && l1 < 0.35
 }
 
 /// Compute per-transcript EC-neighborhood leakage scores.
@@ -275,8 +439,12 @@ fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
     let mut nbr_frac = vec![1.0f64; n_targets];
     let mut dominant = (0..n_targets).collect::<Vec<usize>>();
 
-    let inv_eff_lens: Vec<f64> = eff_lens.iter()
-        .map(|&l| { let inv = 1.0 / l; if inv.is_finite() { inv } else { 0.0 } })
+    let inv_eff_lens: Vec<f64> = eff_lens
+        .iter()
+        .map(|&l| {
+            let inv = 1.0 / l;
+            if inv.is_finite() { inv } else { 0.0 }
+        })
         .collect();
 
     // For each transcript t, accumulate per-competitor posterior counts
@@ -290,7 +458,9 @@ fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
 
     for (label, &count) in packed_map.iter_labels().zip(packed_map.counts.iter()) {
         let ec_count = count as f64;
-        if ec_count == 0.0 { continue; }
+        if ec_count == 0.0 {
+            continue;
+        }
 
         weights.clear();
         let mut denom = 0.0f64;
@@ -299,19 +469,27 @@ fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
             weights.push(w);
             denom += w;
         }
-        if denom <= 1e-8 { continue; }
+        if denom <= 1e-8 {
+            continue;
+        }
 
         let targets = label.target_labels();
         let n = targets.len();
-        if n < 2 { continue; }
+        if n < 2 {
+            continue;
+        }
 
         for i in 0..n {
             let t = targets[i] as usize;
-            if weights[i] < 1e-10 { continue; }
+            if weights[i] < 1e-10 {
+                continue;
+            }
 
             let acc = competitor_acc[t].get_or_insert_with(ahash::AHashMap::new);
             for j in 0..n {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let u = targets[j] as u32;
                 let u_share = ec_count * weights[j] / denom;
                 if u_share > 0.01 {
@@ -325,7 +503,9 @@ fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
     // neighborhood fraction. Use the top competitors that collectively
     // account for >= 90% of the competition (like a gene's top isoforms).
     for t in 0..n_targets {
-        if em_counts[t] <= 0.0 { continue; }
+        if em_counts[t] <= 0.0 {
+            continue;
+        }
 
         let acc = match &competitor_acc[t] {
             Some(a) if !a.is_empty() => a,
@@ -341,7 +521,9 @@ fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
 
         // Sum top competitors until we cover 90% of total competition
         let total_competition: f64 = sorted.iter().map(|(_, c)| c).sum();
-        if total_competition <= 0.0 { continue; }
+        if total_competition <= 0.0 {
+            continue;
+        }
 
         let mut cumulative = 0.0f64;
         let mut cluster_count = 0.0f64;
@@ -398,7 +580,32 @@ fn phase2_init_counts(init_counts: &[f64], active_mask: &[bool]) -> Vec<f64> {
     init_counts
         .iter()
         .zip(active_mask.iter())
-        .map(|(&c, &keep)| if keep && c.is_finite() && c > 0.0 { c } else { 0.0 })
+        .map(|(&c, &keep)| {
+            if keep && c.is_finite() && c > 0.0 {
+                c
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+fn sorted_condition_names(samples: &[SampleEntry]) -> Vec<String> {
+    let mut condition_names: Vec<String> = samples.iter().map(|s| s.condition.clone()).collect();
+    condition_names.sort();
+    condition_names.dedup();
+    condition_names
+}
+
+fn sample_condition_indices(samples: &[SampleEntry], condition_names: &[String]) -> Vec<usize> {
+    samples
+        .iter()
+        .map(|sample| {
+            condition_names
+                .iter()
+                .position(|c| c == &sample.condition)
+                .expect("sample condition should exist in condition_names")
+        })
         .collect()
 }
 
@@ -435,7 +642,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 .par_iter()
                 .enumerate()
                 .map(|(i, sample)| -> Result<(usize, EqMapBundle<EqLabelT>)> {
-                    info!("  [{}/{}] Building EQ map for {}", i + 1, n_samples, sample.sample_name);
+                    info!(
+                        "  [{}/{}] Building EQ map for {}",
+                        i + 1,
+                        n_samples,
+                        sample.sample_name
+                    );
                     let rad_opts = RadProcessingOpts {
                         input: sample.rad_path.clone(),
                         lib_type: opts.lib_type.clone(),
@@ -460,7 +672,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     } else {
         let mut bs = Vec::with_capacity(n_samples);
         for (i, sample) in samples.iter().enumerate() {
-            info!("  [{}/{}] Building EQ map for {}", i + 1, n_samples, sample.sample_name);
+            info!(
+                "  [{}/{}] Building EQ map for {}",
+                i + 1,
+                n_samples,
+                sample.sample_name
+            );
             let rad_opts = RadProcessingOpts {
                 input: sample.rad_path.clone(),
                 lib_type: opts.lib_type.clone(),
@@ -490,8 +707,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         .collect();
     let eqc_counts: Vec<usize> = bundles.iter().map(|b| b.packed_eq_map.len()).collect();
     let total_eqcs: usize = eqc_counts.iter().sum();
-    let merged_index =
-        txp_selection::merge_transcript_indices(&indices, &eqc_counts, n_targets);
+    let merged_index = txp_selection::merge_transcript_indices(&indices, &eqc_counts, n_targets);
 
     // ====== Optional: structural transcript variable selection ======
     let selection_stats = if opts.txp_selection {
@@ -536,7 +752,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 .par_iter()
                 .enumerate()
                 .map(|(i, bundle)| -> Result<(usize, Vec<f64>)> {
-                    info!("  [{}/{}] Phase 1 EM for {}", i + 1, n_samples, samples[i].sample_name);
+                    info!(
+                        "  [{}/{}] Phase 1 EM for {}",
+                        i + 1,
+                        n_samples,
+                        samples[i].sample_name
+                    );
                     let eminfo = EMInfo::new(
                         &bundle.packed_eq_map,
                         bundle.eff_lengths.clone(),
@@ -546,7 +767,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     );
                     let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
                         em_with_coverage(
-                            &eminfo, None,
+                            &eminfo,
+                            None,
                             opts.pos_bins as usize,
                             opts.coverage_smooth_rounds,
                             opts.coverage_epsilon,
@@ -573,7 +795,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     } else {
         let mut counts_vec = Vec::with_capacity(n_samples);
         for (i, bundle) in bundles.iter().enumerate() {
-            info!("  [{}/{}] Phase 1 EM for {}", i + 1, n_samples, samples[i].sample_name);
+            info!(
+                "  [{}/{}] Phase 1 EM for {}",
+                i + 1,
+                n_samples,
+                samples[i].sample_name
+            );
             let eminfo = EMInfo::new(
                 &bundle.packed_eq_map,
                 bundle.eff_lengths.clone(),
@@ -583,7 +810,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             );
             let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
                 em_with_coverage(
-                    &eminfo, None,
+                    &eminfo,
+                    None,
                     opts.pos_bins as usize,
                     opts.coverage_smooth_rounds,
                     opts.coverage_epsilon,
@@ -614,7 +842,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     // Compute per-transcript adaptive EC support threshold if requested.
     let adaptive_thresh: Option<Vec<u32>> = if opts.adaptive_ec_support
-        && matches!(filter_mode, FilterMode::Support)
+        && matches!(filter_mode, FilterMode::Support | FilterMode::Hybrid)
     {
         let mut max_ec_size = vec![0.0f64; n_targets];
         for (i, counts) in phase1_counts.iter().enumerate() {
@@ -650,60 +878,55 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         None
     };
 
-    // Compute per-sample evidence and count how many samples pass for each transcript
+    // Compute per-sample evidence once and reuse it for global consensus,
+    // condition rescue, and gene-level rescue masks.
+    let sample_pass_masks: Vec<Vec<bool>> = phase1_counts
+        .iter()
+        .enumerate()
+        .map(|(i, counts)| {
+            sample_expression_mask(
+                &bundles[i].packed_eq_map,
+                counts,
+                &bundles[i].eff_lengths,
+                filter_mode,
+                opts,
+                base_min_ecs,
+                adaptive_thresh.as_deref(),
+            )
+        })
+        .collect();
+
     let mut express_count = vec![0u32; n_targets];
+    for sample_pass in &sample_pass_masks {
+        for (t, &pass) in sample_pass.iter().enumerate() {
+            if pass {
+                express_count[t] += 1;
+            }
+        }
+    }
 
     let filter_label = match filter_mode {
-        FilterMode::Tpm => {
-            let tpm_threshold = opts.tpm_threshold;
-            for (i, counts) in phase1_counts.iter().enumerate() {
-                let tpms = compute_tpm(counts, &bundles[i].eff_lengths);
-                for (t, &tpm) in tpms.iter().enumerate() {
-                    if tpm > tpm_threshold {
-                        express_count[t] += 1;
-                    }
-                }
+        FilterMode::Tpm => format!("TPM > {}", opts.tpm_threshold),
+        FilterMode::Ues => format!("UES > {}", opts.ues_threshold),
+        FilterMode::Support => format!(
+            "EC support >= {}{}",
+            base_min_ecs,
+            if opts.adaptive_ec_support {
+                " (adaptive)"
+            } else {
+                ""
             }
-            format!("TPM > {}", tpm_threshold)
-        }
-        FilterMode::Ues => {
-            let ues_threshold = opts.ues_threshold;
-            for (i, counts) in phase1_counts.iter().enumerate() {
-                let metrics = compute_evidence_metrics(
-                    &bundles[i].packed_eq_map,
-                    counts,
-                    &bundles[i].eff_lengths,
-                    opts.min_support_count,
-                );
-                for (t, &ues) in metrics.ues.iter().enumerate() {
-                    if ues > ues_threshold {
-                        express_count[t] += 1;
-                    }
-                }
+        ),
+        FilterMode::Hybrid => format!(
+            "hybrid support/UES (base_support={}, ues_margin>{}{})",
+            base_min_ecs,
+            opts.ues_threshold,
+            if opts.adaptive_ec_support {
+                ", adaptive"
+            } else {
+                ""
             }
-            format!("UES > {}", ues_threshold)
-        }
-        FilterMode::Support => {
-            for (i, counts) in phase1_counts.iter().enumerate() {
-                let metrics = compute_evidence_metrics(
-                    &bundles[i].packed_eq_map,
-                    counts,
-                    &bundles[i].eff_lengths,
-                    opts.min_support_count,
-                );
-                for (t, &sup) in metrics.support.iter().enumerate() {
-                    let thresh = adaptive_thresh.as_ref().map_or(base_min_ecs, |v| v[t]);
-                    if sup >= thresh {
-                        express_count[t] += 1;
-                    }
-                }
-            }
-            format!(
-                "EC support >= {}{}",
-                base_min_ecs,
-                if opts.adaptive_ec_support { " (adaptive)" } else { "" }
-            )
-        }
+        ),
     };
 
     // Determine K threshold
@@ -725,79 +948,59 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         has_conditions
     };
     if use_condition_rescue && !opts.condition_rescue {
-        info!("Auto-enabling condition rescue (multiple conditions detected; use --no-condition-rescue to disable)");
+        info!(
+            "Auto-enabling condition rescue (multiple conditions detected; use --no-condition-rescue to disable)"
+        );
     }
 
-    let condition_data = if has_conditions && (opts.condition_aware_consensus || use_condition_rescue) {
-        let mut condition_names: Vec<String> = samples.iter().map(|s| s.condition.clone()).collect();
-        condition_names.sort();
-        condition_names.dedup();
-        let condition_index = |condition: &str| -> usize {
-            condition_names
+    let condition_data =
+        if has_conditions && (opts.condition_aware_consensus || use_condition_rescue) {
+            let mut condition_names: Vec<String> =
+                samples.iter().map(|s| s.condition.clone()).collect();
+            condition_names.sort();
+            condition_names.dedup();
+            let condition_index = |condition: &str| -> usize {
+                condition_names
+                    .iter()
+                    .position(|c| c == condition)
+                    .expect("condition should exist")
+            };
+
+            let mut cond_counts = vec![vec![0u32; n_targets]; condition_names.len()];
+            let mut cond_reps = vec![0u32; condition_names.len()];
+            for (sample_idx, sample) in samples.iter().enumerate() {
+                let ci = condition_index(&sample.condition);
+                cond_reps[ci] += 1;
+
+                for (t, &pass) in sample_pass_masks[sample_idx].iter().enumerate() {
+                    if pass {
+                        cond_counts[ci][t] += 1;
+                    }
+                }
+            }
+
+            let cond_k: Vec<u32> = cond_reps
                 .iter()
-                .position(|c| c == condition)
-                .expect("condition should exist")
+                .map(|&nrep| ((min_fraction * nrep as f64).ceil() as u32).max(1))
+                .collect();
+
+            let cond_support_masks: Vec<Vec<bool>> = cond_counts
+                .iter()
+                .enumerate()
+                .map(|(ci, counts)| counts.iter().map(|&c| c >= cond_k[ci]).collect())
+                .collect();
+
+            Some((condition_names, cond_counts, cond_k, cond_support_masks))
+        } else {
+            None
         };
 
-        let mut cond_counts = vec![vec![0u32; n_targets]; condition_names.len()];
-        let mut cond_reps = vec![0u32; condition_names.len()];
-        for (sample_idx, sample) in samples.iter().enumerate() {
-            let ci = condition_index(&sample.condition);
-            cond_reps[ci] += 1;
+    let strict_global_mask: Vec<bool> = express_count.iter().map(|&c| c >= min_k).collect();
 
-            let mut sample_pass = vec![false; n_targets];
-            match filter_mode {
-                FilterMode::Tpm => {
-                    let tpms = compute_tpm(&phase1_counts[sample_idx], &bundles[sample_idx].eff_lengths);
-                    for (t, &tpm) in tpms.iter().enumerate() {
-                        sample_pass[t] = tpm > opts.tpm_threshold;
-                    }
-                }
-                FilterMode::Ues => {
-                    let metrics = compute_evidence_metrics(
-                        &bundles[sample_idx].packed_eq_map,
-                        &phase1_counts[sample_idx],
-                        &bundles[sample_idx].eff_lengths,
-                        opts.min_support_count,
-                    );
-                    for (t, &ues) in metrics.ues.iter().enumerate() {
-                        sample_pass[t] = ues > opts.ues_threshold;
-                    }
-                }
-                FilterMode::Support => {
-                    let metrics = compute_evidence_metrics(
-                        &bundles[sample_idx].packed_eq_map,
-                        &phase1_counts[sample_idx],
-                        &bundles[sample_idx].eff_lengths,
-                        opts.min_support_count,
-                    );
-                    for (t, &sup) in metrics.support.iter().enumerate() {
-                        let thresh = adaptive_thresh.as_ref().map_or(base_min_ecs, |v| v[t]);
-                        sample_pass[t] = sup >= thresh;
-                    }
-                }
-            }
-
-            for (t, pass) in sample_pass.into_iter().enumerate() {
-                if pass {
-                    cond_counts[ci][t] += 1;
-                }
-            }
-        }
-
-        let cond_k: Vec<u32> = cond_reps
-            .iter()
-            .map(|&nrep| ((min_fraction * nrep as f64).ceil() as u32).max(1))
-            .collect();
-
-        Some((condition_names, cond_counts, cond_k))
-    } else {
-        None
-    };
-
-    let consensus_mask: Vec<bool> = if opts.condition_aware_consensus {
-        let (condition_names, cond_counts, cond_k) =
-            condition_data.as_ref().expect("condition data required for condition-aware consensus");
+    let pre_gene_consensus_mask: Vec<bool> = if opts.condition_aware_consensus {
+        let (condition_names, cond_counts, cond_k, _) = condition_data
+            .as_ref()
+            .expect("condition data required for condition-aware consensus");
         let mut mask = vec![false; n_targets];
         for t in 0..n_targets {
             mask[t] = (0..condition_names.len()).any(|ci| cond_counts[ci][t] >= cond_k[ci]);
@@ -809,14 +1012,15 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         mask
     } else if use_condition_rescue {
         // Strict global consensus + condition-specific rescue.
-        let (condition_names, cond_counts, cond_k) =
-            condition_data.as_ref().expect("condition data required for condition-rescue");
+        let (condition_names, cond_counts, cond_k, _) = condition_data
+            .as_ref()
+            .expect("condition data required for condition-rescue");
 
         let mut mask = vec![false; n_targets];
         let mut n_global = 0usize;
         let mut n_rescued = 0usize;
         for t in 0..n_targets {
-            if express_count[t] >= min_k {
+            if strict_global_mask[t] {
                 // Passes strict global consensus.
                 mask[t] = true;
                 n_global += 1;
@@ -828,26 +1032,28 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         }
         info!(
             "Condition rescue: {} pass global, {} rescued from within-condition consensus ({} conditions)",
-            n_global, n_rescued, condition_names.len()
+            n_global,
+            n_rescued,
+            condition_names.len()
         );
         mask
     } else {
-        express_count
-            .iter()
-            .map(|&c| c >= min_k)
-            .collect()
+        strict_global_mask.clone()
     };
 
-    // Save the strict (pre-rescue) mask for Phase 2 EM — rescued transcripts
-    // will use Phase 1 estimates instead of Phase 2 re-estimation.
-    let strict_mask = consensus_mask.clone();
-    let n_consensus = consensus_mask.iter().filter(|&&b| b).count();
+    let n_consensus = pre_gene_consensus_mask.iter().filter(|&&b| b).count();
     let n_filtered = n_targets - n_consensus;
 
     info!(
         "Consensus filter ({}{}): K={} (min_fraction={:.2}), {} transcripts pass, {} filtered out",
         filter_label,
-        if opts.condition_aware_consensus { ", condition-aware" } else if use_condition_rescue { ", condition-rescue" } else { "" },
+        if opts.condition_aware_consensus {
+            ", condition-aware"
+        } else if use_condition_rescue {
+            ", condition-rescue"
+        } else {
+            ""
+        },
         min_k,
         min_fraction,
         n_consensus,
@@ -868,8 +1074,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     };
 
     let gene_to_txps: std::collections::HashMap<&str, Vec<usize>> = {
-        let mut map: std::collections::HashMap<&str, Vec<usize>> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
         for (t, gene) in gene_names.iter().enumerate() {
             if let Some(g) = gene {
                 map.entry(g).or_default().push(t);
@@ -882,7 +1087,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     // For transcripts that fail consensus, check if their gene's total TPM
     // passes consensus. If so, rescue all transcripts of that gene.
     let consensus_mask = {
-        let mut mask = consensus_mask;
+        let mut mask = pre_gene_consensus_mask.clone();
 
         // Compute per-gene TPM in each sample from Phase 1 estimates.
         // A gene "passes" in a sample if its total TPM >= 10 (strong signal).
@@ -980,6 +1185,65 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         mask
     };
 
+    let final_n_consensus = consensus_mask.iter().filter(|&&b| b).count();
+    let phase2_sample_masks = sample_specific_phase2_masks(
+        samples,
+        &strict_global_mask,
+        &pre_gene_consensus_mask,
+        condition_data.as_ref().map(|(names, _, _, _)| names.as_slice()),
+        condition_data
+            .as_ref()
+            .map(|(_, _, _, support_masks)| support_masks.as_slice()),
+        opts.condition_aware_consensus,
+        use_condition_rescue,
+    );
+    let phase2_prior_alpha: Option<Vec<Vec<f64>>> =
+        if opts.condition_specific_prior_weight > 0.0 {
+        let avg_total_reads: f64 = bundles
+            .iter()
+            .map(|b| b.packed_eq_map.total_weight() as f64)
+            .sum::<f64>()
+            / n_samples as f64;
+        let alpha_0 = opts.condition_specific_prior_weight * avg_total_reads;
+        let condition_names = sorted_condition_names(samples);
+        let condition_indices = sample_condition_indices(samples, &condition_names);
+        let mut hyperparams =
+            hierarchical::init_hyperparams(n_targets, condition_names, alpha_0);
+        let phase1_results: Vec<hierarchical::SampleResult> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, sample)| hierarchical::SampleResult {
+                counts: phase1_counts[i].clone(),
+                present: phase1_counts[i]
+                    .iter()
+                    .zip(phase2_sample_masks[i].iter())
+                    .map(|(&count, &keep)| keep && count > opts.presence_thresh)
+                    .collect(),
+                sample_name: sample.sample_name.clone(),
+                condition_idx: condition_indices[i],
+            })
+            .collect();
+        hierarchical::update_condition_means(&phase1_results, &mut hyperparams);
+        let alphas: Vec<Vec<f64>> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                hierarchical::compute_pseudo_counts(
+                    &hyperparams,
+                    condition_indices[i],
+                    &phase2_sample_masks[i],
+                )
+            })
+            .collect();
+        info!(
+            "Phase 2 condition-specific hierarchical prior enabled: prior_weight={:.3}, alpha_0={:.1}",
+            opts.condition_specific_prior_weight, alpha_0
+        );
+        Some(alphas)
+    } else {
+        None
+    };
+
     // ====== Phase 2: Re-run EM with consensus-masked effective lengths ======
     info!("Phase 2: re-running EM with consensus-filtered transcript set");
 
@@ -999,7 +1263,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         n_samples,
                         sample.sample_name
                     );
-                    // Phase 2 EM uses strict consensus only (no rescued transcripts).
+                    let phase2_mask = &phase2_sample_masks[i];
                     let mut eminfo = EMInfo::new(
                         &bundles[i].packed_eq_map,
                         bundles[i].eff_lengths.clone(),
@@ -1007,13 +1271,19 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         phase2_convergence_thresh(opts),
                         opts.presence_thresh,
                     );
-                    eminfo.apply_mask(&strict_mask);
+                    eminfo.apply_mask(phase2_mask);
                     let init = if opts.no_phase2_warm_start {
                         None
                     } else {
-                        Some(phase2_init_counts(&phase1_counts[i], &strict_mask))
+                        Some(phase2_init_counts(&phase1_counts[i], phase2_mask))
                     };
-                    let em_res = if inner_threads > 1 {
+                    let em_res = if let Some(alpha) = phase2_prior_alpha.as_ref() {
+                        if inner_threads > 1 {
+                            em_penalized_par_init(&eminfo, &alpha[i], init.as_deref(), inner_threads)
+                        } else {
+                            em_penalized_init(&eminfo, &alpha[i], init.as_deref())
+                        }
+                    } else if inner_threads > 1 {
                         em_par_init(&eminfo, init.as_deref(), inner_threads)
                     } else {
                         em_init(&eminfo, init.as_deref())
@@ -1035,6 +1305,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 n_samples,
                 sample.sample_name
             );
+            let phase2_mask = &phase2_sample_masks[i];
             let mut eminfo = EMInfo::new(
                 &bundles[i].packed_eq_map,
                 bundles[i].eff_lengths.clone(),
@@ -1042,13 +1313,21 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 phase2_convergence_thresh(opts),
                 opts.presence_thresh,
             );
-            eminfo.apply_mask(&strict_mask);
+            eminfo.apply_mask(phase2_mask);
             let init = if opts.no_phase2_warm_start {
                 None
             } else {
-                Some(phase2_init_counts(&phase1_counts[i], &strict_mask))
+                Some(phase2_init_counts(&phase1_counts[i], phase2_mask))
             };
-            let em_res = if let Some(pool) = serial_inner_pool.as_ref() {
+            let em_res = if let Some(alpha) = phase2_prior_alpha.as_ref() {
+                if let Some(pool) = serial_inner_pool.as_ref() {
+                    em_penalized_par_with_pool_init(&eminfo, &alpha[i], init.as_deref(), pool)
+                } else if inner_threads > 1 {
+                    em_penalized_par_init(&eminfo, &alpha[i], init.as_deref(), inner_threads)
+                } else {
+                    em_penalized_init(&eminfo, &alpha[i], init.as_deref())
+                }
+            } else if let Some(pool) = serial_inner_pool.as_ref() {
                 em_par_with_pool_init(&eminfo, init.as_deref(), pool)
             } else if inner_threads > 1 {
                 em_par_init(&eminfo, init.as_deref(), inner_threads)
@@ -1083,13 +1362,16 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     // Determine which sample an EC ID belongs to.
     let ec_to_sample = |eqc_id: u32| -> usize {
-        eqc_offset_boundaries.partition_point(|&b| b <= eqc_id).saturating_sub(1)
+        eqc_offset_boundaries
+            .partition_point(|&b| b <= eqc_id)
+            .saturating_sub(1)
     };
 
     let ec_unique_frac: Vec<f64> = if !gene_to_txps.is_empty() {
         let mut frac = vec![0.0f64; n_targets];
         for txps in gene_to_txps.values() {
-            let active: Vec<usize> = txps.iter()
+            let active: Vec<usize> = txps
+                .iter()
                 .filter(|&&t| consensus_mask[t])
                 .copied()
                 .collect();
@@ -1116,9 +1398,11 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 let mut unique_samples: Vec<usize> = Vec::new();
 
                 for &eqc in sig_t {
-                    let is_shared = active.iter().any(|&u| u != t && {
-                        let sig_u = merged_index.signature(u);
-                        sig_u.binary_search(&eqc).is_ok()
+                    let is_shared = active.iter().any(|&u| {
+                        u != t && {
+                            let sig_u = merged_index.signature(u);
+                            sig_u.binary_search(&eqc).is_ok()
+                        }
                     });
                     if !is_shared {
                         let sample = ec_to_sample(eqc);
@@ -1163,7 +1447,10 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             let n_all_unique = active_fracs.iter().filter(|&&f| f == 1.0).count();
             info!(
                 "EC uniqueness: {} consensus transcripts — {} with no unique ECs, {} with some, {} fully unique",
-                active_fracs.len(), n_no_unique, n_some_unique, n_all_unique
+                active_fracs.len(),
+                n_no_unique,
+                n_some_unique,
+                n_all_unique
             );
         }
     }
@@ -1172,11 +1459,18 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     if std::env::var("PISCEM_EC_GRAPH_DIAG").is_ok() {
         info!("Computing pairwise EC graph metrics (this may take a while)...");
         // Build inverted index: EC → list of consensus transcripts containing it
-        let max_eqc = merged_index.eqc_ids.iter().copied().max()
-            .map(|m| m as usize + 1).unwrap_or(0);
+        let max_eqc = merged_index
+            .eqc_ids
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m as usize + 1)
+            .unwrap_or(0);
         let mut eqc_to_txps: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
         for t in 0..n_targets {
-            if !consensus_mask[t] { continue; }
+            if !consensus_mask[t] {
+                continue;
+            }
             for &eqc in merged_index.signature(t) {
                 eqc_to_txps[eqc as usize].push(t as u32);
             }
@@ -1187,20 +1481,27 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         // - Fraction of t's ECs shared with u (asymmetric containment)
         // - Mean EC size of shared ECs
         // - Whether they're in the same gene
-        let mut pair_metrics: ahash::AHashMap<(u32, u32), (u32, u32, u32, f64)> = ahash::AHashMap::new();
+        let mut pair_metrics: ahash::AHashMap<(u32, u32), (u32, u32, u32, f64)> =
+            ahash::AHashMap::new();
         // (shared_count, sig_t_size, sig_u_size, sum_shared_ec_sizes)
 
         for t in 0..n_targets {
-            if !consensus_mask[t] { continue; }
+            if !consensus_mask[t] {
+                continue;
+            }
             let sig_t = merged_index.signature(t);
-            if sig_t.is_empty() { continue; }
+            if sig_t.is_empty() {
+                continue;
+            }
 
             // Find all transcripts sharing at least one EC with t
             let mut neighbor_shared: ahash::AHashMap<u32, (u32, f64)> = ahash::AHashMap::new();
             for &eqc in sig_t {
                 let ec_size = eqc_to_txps[eqc as usize].len() as f64;
                 for &u in &eqc_to_txps[eqc as usize] {
-                    if u as usize == t { continue; }
+                    if u as usize == t {
+                        continue;
+                    }
                     let entry = neighbor_shared.entry(u).or_insert((0, 0.0));
                     entry.0 += 1;
                     entry.1 += ec_size;
@@ -1208,7 +1509,11 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             }
 
             for (&u, &(shared, sum_ec_size)) in &neighbor_shared {
-                let key = if (t as u32) < u { (t as u32, u) } else { (u, t as u32) };
+                let key = if (t as u32) < u {
+                    (t as u32, u)
+                } else {
+                    (u, t as u32)
+                };
                 let sig_u_len = merged_index.degree(u as usize) as u32;
                 pair_metrics.entry(key).or_insert((
                     shared,
@@ -1226,16 +1531,49 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             for (&(t, u), &(shared, sig_t, sig_u, mean_ec_sz)) in &pair_metrics {
                 let gene_t = gene_names.get(t as usize).and_then(|g| *g).unwrap_or("NA");
                 let gene_u = gene_names.get(u as usize).and_then(|g| *g).unwrap_or("NA");
-                let same = if gene_t != "NA" && gene_t == gene_u { 1 } else { 0 };
+                let same = if gene_t != "NA" && gene_t == gene_u {
+                    1
+                } else {
+                    0
+                };
                 let union = sig_t + sig_u - shared;
-                let jaccard = if union > 0 { shared as f64 / union as f64 } else { 0.0 };
-                let contain_t = if sig_t > 0 { shared as f64 / sig_t as f64 } else { 0.0 };
-                let contain_u = if sig_u > 0 { shared as f64 / sig_u as f64 } else { 0.0 };
-                writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.1}",
-                    t, u, gene_t, gene_u, same, shared, sig_t, sig_u,
-                    jaccard, contain_t, contain_u, mean_ec_sz).ok();
+                let jaccard = if union > 0 {
+                    shared as f64 / union as f64
+                } else {
+                    0.0
+                };
+                let contain_t = if sig_t > 0 {
+                    shared as f64 / sig_t as f64
+                } else {
+                    0.0
+                };
+                let contain_u = if sig_u > 0 {
+                    shared as f64 / sig_u as f64
+                } else {
+                    0.0
+                };
+                writeln!(
+                    f,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.1}",
+                    t,
+                    u,
+                    gene_t,
+                    gene_u,
+                    same,
+                    shared,
+                    sig_t,
+                    sig_u,
+                    jaccard,
+                    contain_t,
+                    contain_u,
+                    mean_ec_sz
+                )
+                .ok();
             }
-            info!("Wrote {} pairwise EC metrics to ec_graph_pairs.tsv", pair_metrics.len());
+            info!(
+                "Wrote {} pairwise EC metrics to ec_graph_pairs.tsv",
+                pair_metrics.len()
+            );
         }
     }
 
@@ -1247,7 +1585,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     let ec_graph_group_members: std::collections::HashMap<u32, Vec<usize>> = {
         let mut map: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
         for t in 0..n_targets {
-            if !consensus_mask[t] { continue; }
+            if !consensus_mask[t] {
+                continue;
+            }
             map.entry(ec_graph_groups[t]).or_default().push(t);
         }
         map
@@ -1255,8 +1595,15 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     {
         let n_groups = ec_graph_group_members.len();
-        let n_multi = ec_graph_group_members.values().filter(|v| v.len() > 1).count();
-        let max_size = ec_graph_group_members.values().map(|v| v.len()).max().unwrap_or(0);
+        let n_multi = ec_graph_group_members
+            .values()
+            .filter(|v| v.len() > 1)
+            .count();
+        let max_size = ec_graph_group_members
+            .values()
+            .map(|v| v.len())
+            .max()
+            .unwrap_or(0);
         info!(
             "EC-graph groups: {} total ({} multi-member, max size {})",
             n_groups, n_multi, max_size
@@ -1265,39 +1612,53 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 
     // Compute per-transcript position bin profile from the merged index.
     // For each transcript, count fragments in each position bin (count-weighted).
-    let n_pos_bins = crate::utils::eq_maps::NUM_POS_BINS.get()
-        .copied().unwrap_or(1.0) as usize;
-    let pos_bin_profiles: Vec<Vec<u64>> = if n_pos_bins > 1 && merged_index.has_pos_bins() && merged_index.has_counts() {
-        let mut profiles = vec![vec![0u64; n_pos_bins]; n_targets];
-        for t in 0..n_targets {
-            if !consensus_mask[t] { continue; }
-            let sig = merged_index.signature(t);
-            let base = merged_index.offsets[t] as usize;
-            for (j, _) in sig.iter().enumerate() {
-                let pb = merged_index.pos_bins[base + j] as usize;
-                let cnt = merged_index.ec_counts[base + j] as u64;
-                if pb < n_pos_bins {
-                    profiles[t][pb] += cnt;
+    let n_pos_bins = crate::utils::eq_maps::NUM_POS_BINS
+        .get()
+        .copied()
+        .unwrap_or(1.0) as usize;
+    let pos_bin_profiles: Vec<Vec<u64>> =
+        if n_pos_bins > 1 && merged_index.has_pos_bins() && merged_index.has_counts() {
+            let mut profiles = vec![vec![0u64; n_pos_bins]; n_targets];
+            for t in 0..n_targets {
+                if !consensus_mask[t] {
+                    continue;
+                }
+                let sig = merged_index.signature(t);
+                let base = merged_index.offsets[t] as usize;
+                for (j, _) in sig.iter().enumerate() {
+                    let pb = merged_index.pos_bins[base + j] as usize;
+                    let cnt = merged_index.ec_counts[base + j] as u64;
+                    if pb < n_pos_bins {
+                        profiles[t][pb] += cnt;
+                    }
                 }
             }
-        }
-        profiles
-    } else {
-        Vec::new()
-    };
+            profiles
+        } else {
+            Vec::new()
+        };
 
     // Compute position bin CV for each consensus transcript.
-    // High CV → non-uniform coverage → possible leakage signal.
+    // High CV -> non-uniform coverage -> possible leakage signal.
     let pos_cv: Vec<f64> = if !pos_bin_profiles.is_empty() && n_pos_bins > 1 {
         let mut cv = vec![0.0f64; n_targets];
         for t in 0..n_targets {
-            if !consensus_mask[t] { continue; }
+            if !consensus_mask[t] {
+                continue;
+            }
             let total: f64 = pos_bin_profiles[t].iter().map(|&c| c as f64).sum();
-            if total < 1.0 { continue; }
+            if total < 1.0 {
+                continue;
+            }
             let mean = total / n_pos_bins as f64;
-            let var: f64 = pos_bin_profiles[t].iter()
-                .map(|&c| { let d = c as f64 - mean; d * d })
-                .sum::<f64>() / n_pos_bins as f64;
+            let var: f64 = pos_bin_profiles[t]
+                .iter()
+                .map(|&c| {
+                    let d = c as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n_pos_bins as f64;
             cv[t] = var.sqrt() / (mean + 1e-10);
         }
         cv
@@ -1311,10 +1672,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         let mut n_partial = 0usize;
         let mut n_single = 0usize;
         for t in 0..n_targets {
-            if !consensus_mask[t] { continue; }
+            if !consensus_mask[t] {
+                continue;
+            }
             let occupied = pos_bin_profiles[t].iter().filter(|&&c| c > 0).count();
             match occupied {
-                0 => {},
+                0 => {}
                 1 => n_single += 1,
                 2..=4 => n_partial += 1,
                 _ => n_full_coverage += 1,
@@ -1329,16 +1692,31 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         if std::env::var("PISCEM_POS_DIAG").is_ok() {
             if let Ok(mut f) = std::fs::File::create("pos_diagnostic.tsv") {
                 use std::io::Write;
-                writeln!(f, "target_name\tec_unique_frac\tpos_cv\t{}\ttotal_count",
-                    (0..n_pos_bins).map(|b| format!("bin_{}", b)).collect::<Vec<_>>().join("\t")).ok();
+                writeln!(
+                    f,
+                    "target_name\tec_unique_frac\tpos_cv\t{}\ttotal_count",
+                    (0..n_pos_bins)
+                        .map(|b| format!("bin_{}", b))
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                )
+                .ok();
                 for t in 0..n_targets {
-                    if !consensus_mask[t] { continue; }
-                    let bins_str = pos_bin_profiles[t].iter()
-                        .map(|c| c.to_string()).collect::<Vec<_>>().join("\t");
+                    if !consensus_mask[t] {
+                        continue;
+                    }
+                    let bins_str = pos_bin_profiles[t]
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\t");
                     let total: u64 = pos_bin_profiles[t].iter().sum();
-                    writeln!(f, "{}\t{:.4}\t{:.4}\t{}\t{}",
-                        bundles[0].ref_names[t], ec_unique_frac[t],
-                        pos_cv[t], bins_str, total).ok();
+                    writeln!(
+                        f,
+                        "{}\t{:.4}\t{:.4}\t{}\t{}",
+                        bundles[0].ref_names[t], ec_unique_frac[t], pos_cv[t], bins_str, total
+                    )
+                    .ok();
                 }
                 info!("Wrote position diagnostic to pos_diagnostic.tsv");
             }
@@ -1350,13 +1728,16 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     let has_pos = !pos_bin_profiles.is_empty() && n_pos_bins > 1;
     let mut total_gene_frac_removed = 0usize;
     let mut total_nbr_removed = 0usize;
+    let gene_rescue_only: Vec<bool> = consensus_mask
+        .iter()
+        .zip(pre_gene_consensus_mask.iter())
+        .map(|(&final_keep, &pre_gene_keep)| final_keep && !pre_gene_keep)
+        .collect();
 
     for (i, mut em_res) in phase2_results {
-        // For rescued transcripts (in consensus_mask but not strict_mask),
-        // use Phase 1 estimated counts instead of Phase 2. This avoids
-        // FC distortion from read redistribution among rescued transcripts.
+        // Gene-level rescue remains a post-Phase-2 patch for now.
         for t in 0..n_targets {
-            if consensus_mask[t] && !strict_mask[t] {
+            if gene_rescue_only[t] {
                 em_res[t] = phase1_counts[i][t];
             }
         }
@@ -1369,7 +1750,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     continue;
                 }
 
-                let dominant = txps.iter()
+                let dominant = txps
+                    .iter()
                     .filter(|&&t| em_res[t] > 0.0)
                     .max_by(|&&a, &&b| em_res[a].partial_cmp(&em_res[b]).unwrap());
                 let dom_t = match dominant {
@@ -1388,7 +1770,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
                         if ec_unique_frac[t] < 1.0 || pos_uneven {
                             em_res[t] = 0.0;
-                            if i == 0 { total_gene_frac_removed += 1; }
+                            if i == 0 {
+                                total_gene_frac_removed += 1;
+                            }
                             continue;
                         }
                     }
@@ -1397,7 +1781,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     if has_pos && gene_frac < 0.05 {
                         if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
                             em_res[t] = 0.0;
-                            if i == 0 { total_gene_frac_removed += 1; }
+                            if i == 0 {
+                                total_gene_frac_removed += 1;
+                            }
                         }
                     }
                 }
@@ -1410,11 +1796,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         // same fraction + profile correlation filters within each group.
         {
             for (&group_root, members) in &ec_graph_group_members {
-                let active: Vec<usize> = members.iter()
+                let active: Vec<usize> = members
+                    .iter()
                     .filter(|&&t| em_res[t] > 0.0)
                     .copied()
                     .collect();
-                if active.len() <= 1 { continue; }
+                if active.len() <= 1 {
+                    continue;
+                }
 
                 // Skip groups where all members have gene annotation
                 // (already handled by gene-annotated filtering)
@@ -1423,16 +1812,23 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 }
 
                 let group_total: f64 = active.iter().map(|&t| em_res[t]).sum();
-                if group_total <= 0.0 { continue; }
+                if group_total <= 0.0 {
+                    continue;
+                }
 
-                let dom_t = *active.iter()
+                let dom_t = *active
+                    .iter()
                     .max_by(|&&a, &&b| em_res[a].partial_cmp(&em_res[b]).unwrap())
                     .unwrap();
 
                 for &t in &active {
-                    if t == dom_t { continue; }
+                    if t == dom_t {
+                        continue;
+                    }
                     // Skip if this transcript was handled by gene-annotated filter
-                    if has_gene_annot && gene_names[t].is_some() { continue; }
+                    if has_gene_annot && gene_names[t].is_some() {
+                        continue;
+                    }
 
                     let group_frac = em_res[t] / group_total;
 
@@ -1441,7 +1837,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
                         if ec_unique_frac[t] < 1.0 || pos_uneven {
                             em_res[t] = 0.0;
-                            if i == 0 { total_nbr_removed += 1; }
+                            if i == 0 {
+                                total_nbr_removed += 1;
+                            }
                             continue;
                         }
                     }
@@ -1450,7 +1848,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     if has_pos && group_frac < 0.05 {
                         if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
                             em_res[t] = 0.0;
-                            if i == 0 { total_nbr_removed += 1; }
+                            if i == 0 {
+                                total_nbr_removed += 1;
+                            }
                         }
                     }
                 }
@@ -1466,24 +1866,36 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             let mut both = 0usize;
 
             for (&_group_root, members) in &ec_graph_group_members {
-                let active: Vec<usize> = members.iter()
+                let active: Vec<usize> = members
+                    .iter()
                     .filter(|&&t| p1[t] > 0.0 && consensus_mask[t])
                     .copied()
                     .collect();
-                if active.len() <= 1 { continue; }
+                if active.len() <= 1 {
+                    continue;
+                }
                 let group_total: f64 = active.iter().map(|&t| p1[t]).sum();
-                if group_total <= 0.0 { continue; }
-                let dom_t = *active.iter().max_by(|&&a, &&b| p1[a].partial_cmp(&p1[b]).unwrap()).unwrap();
+                if group_total <= 0.0 {
+                    continue;
+                }
+                let dom_t = *active
+                    .iter()
+                    .max_by(|&&a, &&b| p1[a].partial_cmp(&p1[b]).unwrap())
+                    .unwrap();
 
                 for &t in &active {
-                    if t == dom_t { continue; }
+                    if t == dom_t {
+                        continue;
+                    }
                     let gf = p1[t] / group_total;
                     let gene_removed = em_res[t] == 0.0;
                     let mut ecg_remove = false;
 
                     if gf < gene_frac_threshold.max(0.01) {
                         let pos_uneven = if has_pos { pos_cv[t] > 0.5 } else { false };
-                        if ec_unique_frac[t] < 1.0 || pos_uneven { ecg_remove = true; }
+                        if ec_unique_frac[t] < 1.0 || pos_uneven {
+                            ecg_remove = true;
+                        }
                     }
                     if !ecg_remove && has_pos && gf < 0.05 {
                         if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
@@ -1491,14 +1903,22 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         }
                     }
 
-                    if gene_removed { gene_did_remove += 1; }
-                    if ecg_remove { ecg_would_remove += 1; }
-                    if gene_removed && ecg_remove { both += 1; }
+                    if gene_removed {
+                        gene_did_remove += 1;
+                    }
+                    if ecg_remove {
+                        ecg_would_remove += 1;
+                    }
+                    if gene_removed && ecg_remove {
+                        both += 1;
+                    }
                 }
             }
             info!(
                 "EC-graph vs gene filter: gene={}, ecg={}, overlap={}, ecg_only={}, gene_only={}",
-                gene_did_remove, ecg_would_remove, both,
+                gene_did_remove,
+                ecg_would_remove,
+                both,
                 ecg_would_remove.saturating_sub(both),
                 gene_did_remove.saturating_sub(both)
             );
@@ -1516,12 +1936,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             &bundles[i].ref_lengths,
             &bundles[i].eff_lengths, // original eff_lens for reporting
         )
-        .with_context(|| {
-            format!(
-                "failed to write quant output for {}",
-                sample.sample_name
-            )
-        })?;
+        .with_context(|| format!("failed to write quant output for {}", sample.sample_name))?;
 
         // Write per-sample meta_info
         let meta_info_output = output_stem.with_additional_extension(".meta_info.json");
@@ -1534,10 +1949,11 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 "tot_mappings": bundles[i].frag_stats.tot_mappings,
             },
             "num_targets": n_targets,
-            "num_consensus_targets": n_consensus,
+            "num_consensus_targets": final_n_consensus,
             "consensus_min_k": min_k,
             "consensus_min_fraction": min_fraction,
             "filter_mode": format!("{}", filter_label),
+            "condition_specific_prior_weight": opts.condition_specific_prior_weight,
             "piscem_infer_version": env!("CARGO_PKG_VERSION"),
         });
         if let Some((kept, removed)) = selection_stats {
@@ -1564,10 +1980,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
 /// Entry point for consensus-quant subcommand.
 pub fn run(opts: &ConsensusQuantOpts) -> Result<()> {
     let samples = parse_manifest(&opts.manifest)?;
-    info!(
-        "Parsed manifest with {} samples",
-        samples.len()
-    );
+    info!("Parsed manifest with {} samples", samples.len());
 
     if samples.is_empty() {
         anyhow::bail!("Consensus filtering requires at least 1 sample");
@@ -1578,5 +1991,74 @@ pub fn run(opts: &ConsensusQuantOpts) -> Result<()> {
         run_dispatch::<crate::utils::eq_maps::RangeFactorizedEqLabel>(opts, &samples)
     } else {
         run_dispatch::<crate::utils::eq_maps::BasicEqLabel>(opts, &samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{profile_corr_is_leakage, sample_specific_phase2_masks};
+    use crate::multi_sample::SampleEntry;
+    use std::path::PathBuf;
+
+    fn sample(sample_name: &str, condition: &str) -> SampleEntry {
+        SampleEntry {
+            sample_name: sample_name.to_string(),
+            condition: condition.to_string(),
+            rad_path: PathBuf::from("dummy.rad"),
+            output_dir: PathBuf::from("dummy_out"),
+        }
+    }
+
+    #[test]
+    fn phase2_masks_use_condition_specific_rescue() {
+        let samples = vec![sample("s1", "A"), sample("s2", "B")];
+        let strict_global_mask = vec![true, false, false];
+        let pre_gene_consensus_mask = vec![true, true, false];
+        let condition_names = vec!["A".to_string(), "B".to_string()];
+        let condition_support_masks = vec![vec![true, true, false], vec![true, false, false]];
+
+        let masks = sample_specific_phase2_masks(
+            &samples,
+            &strict_global_mask,
+            &pre_gene_consensus_mask,
+            Some(&condition_names),
+            Some(&condition_support_masks),
+            false,
+            true,
+        );
+
+        assert_eq!(masks[0], vec![true, true, false]);
+        assert_eq!(masks[1], vec![true, false, false]);
+    }
+
+    #[test]
+    fn phase2_masks_fall_back_to_pre_gene_consensus_without_condition_logic() {
+        let samples = vec![sample("s1", "A"), sample("s2", "B")];
+        let strict_global_mask = vec![true, false];
+        let pre_gene_consensus_mask = vec![true, true];
+
+        let masks = sample_specific_phase2_masks(
+            &samples,
+            &strict_global_mask,
+            &pre_gene_consensus_mask,
+            None,
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(masks, vec![vec![true, true], vec![true, true]]);
+    }
+
+    #[test]
+    fn profile_corr_requires_peak_alignment() {
+        let profiles = vec![vec![2, 12, 6, 0, 0], vec![0, 2, 12, 6, 0]];
+        assert!(!profile_corr_is_leakage(&profiles, 0, 1, 5));
+    }
+
+    #[test]
+    fn profile_corr_accepts_nearly_identical_profiles() {
+        let profiles = vec![vec![1, 4, 12, 5, 1], vec![1, 5, 11, 6, 1]];
+        assert!(profile_corr_is_leakage(&profiles, 0, 1, 5));
     }
 }

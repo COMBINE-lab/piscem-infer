@@ -867,6 +867,14 @@ pub fn em_penalized<EqLabelT: EqLabel>(
     em_info: &EMInfo<EqLabelT>,
     alpha: &[f64],
 ) -> Vec<f64> {
+    em_penalized_init(em_info, alpha, None)
+}
+
+pub fn em_penalized_init<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    alpha: &[f64],
+    init_counts: Option<&[f64]>,
+) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
     let presence_thresh = em_info.presence_thresh;
     let eff_lens = &em_info.eff_lens;
@@ -874,8 +882,7 @@ pub fn em_penalized<EqLabelT: EqLabel>(
     let total_weight: f64 = em_info.eq_map.counts.iter().sum::<usize>() as f64;
 
     // init
-    let avg = total_weight / (eff_lens.len() as f64);
-    let mut prev_counts = vec![avg; eff_lens.len()];
+    let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
     let mut curr_counts = vec![0.0f64; eff_lens.len()];
 
     let mut rel_diff = 0.0_f64;
@@ -936,16 +943,34 @@ pub fn em_penalized_par<EqLabelT: EqLabel>(
     alpha: &[f64],
     nthreads: usize,
 ) -> Vec<f64> {
+    em_penalized_par_init(em_info, alpha, None, nthreads)
+}
+
+pub fn em_penalized_par_init<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    alpha: &[f64],
+    init_counts: Option<&[f64]>,
+    nthreads: usize,
+) -> Vec<f64> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(nthreads)
         .build()
         .unwrap();
-    em_penalized_par_with_pool(em_info, alpha, &pool)
+    em_penalized_par_with_pool_init(em_info, alpha, init_counts, &pool)
 }
 
 pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
     em_info: &EMInfo<EqLabelT>,
     alpha: &[f64],
+    pool: &ThreadPool,
+) -> Vec<f64> {
+    em_penalized_par_with_pool_init(em_info, alpha, None, pool)
+}
+
+pub fn em_penalized_par_with_pool_init<EqLabelT: EqLabel>(
+    em_info: &EMInfo<EqLabelT>,
+    alpha: &[f64],
+    init_counts: Option<&[f64]>,
     pool: &ThreadPool,
 ) -> Vec<f64> {
     let converge_thresh = em_info.convergence_thresh;
@@ -957,8 +982,8 @@ pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
     let total_weight: f64 = eq_map.counts.iter().sum::<usize>() as f64;
 
     // init
-    let avg = total_weight / (eff_lens.len() as f64);
-    let mut prev_counts: Vec<AtomicF64> = vec![avg; eff_lens.len()]
+    let init = initial_counts(eff_lens, total_weight, init_counts);
+    let mut prev_counts: Vec<AtomicF64> = init
         .iter()
         .map(|x| AtomicF64::new(*x))
         .collect();
@@ -1440,4 +1465,3 @@ mod tests {
         }
     }
 }
-

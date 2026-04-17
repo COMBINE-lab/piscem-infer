@@ -71,10 +71,10 @@ Annotation-free grouping of transcripts into gene-like clusters, followed by wit
 
 When multiple experimental conditions are present (detected automatically from the sample manifest), condition rescue augments the global consensus filter:
 
-- **Global consensus:** Transcript expressed in ≥K samples overall
-- **Condition rescue:** Also keep transcripts expressed in ≥K_condition samples within any single condition
+- **Global consensus:** Transcript passes the primary cross-sample filter globally, typically support-based with adaptive EC support
+- **Condition rescue:** Also keep transcripts that fail the global filter but are repeatedly present by phase-1 TPM within any single condition
 
-This recovers condition-specific transcripts that may not meet the global threshold but have consistent within-condition evidence. Auto-enabled when multiple conditions are detected; disable with `--no-condition-rescue`.
+This recovers condition-specific transcripts that may not meet the global threshold but have consistent within-condition abundance evidence. Rescue-only transcripts keep their phase-1 estimates after phase 2, which avoids re-suppressing rescued signal during re-estimation. Auto-enabled when multiple conditions are detected; disable with `--no-condition-rescue`.
 
 ### 7. Fragment Length Distribution Estimation
 

@@ -412,10 +412,10 @@ pub struct ConsensusQuantOpts {
     #[arg(long, help_heading = "Consensus Filter")]
     pub condition_aware_consensus: bool,
     /// use strict global consensus, then rescue transcripts that fail globally
-    /// but pass within at least one condition. Combines high precision of
-    /// global filtering with preservation of condition-specific expression.
-    /// Enabled automatically when the manifest has multiple conditions.
-    /// Use --no-condition-rescue to disable.
+    /// but have reproducible phase-1 TPM evidence within at least one
+    /// condition. Rescue-only transcripts retain their phase-1 estimates after
+    /// phase 2. Enabled automatically when the manifest has multiple
+    /// conditions. Use --no-condition-rescue to disable.
     #[arg(
         long,
         conflicts_with = "condition_aware_consensus",

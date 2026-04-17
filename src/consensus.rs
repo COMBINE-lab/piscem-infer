@@ -227,6 +227,10 @@ fn sample_expression_mask<EqLabelT: EqLabel>(
     }
 }
 
+fn sample_tpm_rescue_mask(tpms: &[f64], tpm_threshold: f64) -> Vec<bool> {
+    tpms.iter().map(|&tpm| tpm > tpm_threshold).collect()
+}
+
 fn sample_specific_phase2_masks(
     samples: &[SampleEntry],
     strict_global_mask: &[bool],
@@ -836,6 +840,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         counts_vec
     };
 
+    let phase1_tpms: Vec<Vec<f64>> = phase1_counts
+        .iter()
+        .enumerate()
+        .map(|(i, counts)| compute_tpm(counts, &bundles[i].eff_lengths))
+        .collect();
+
     // ====== Consensus filter ======
     let filter_mode = &opts.filter_mode;
     let base_min_ecs = opts.min_ec_support;
@@ -894,6 +904,11 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 adaptive_thresh.as_deref(),
             )
         })
+        .collect();
+
+    let rescue_sample_pass_masks: Vec<Vec<bool>> = phase1_tpms
+        .iter()
+        .map(|tpms| sample_tpm_rescue_mask(tpms, opts.tpm_threshold))
         .collect();
 
     let mut express_count = vec![0u32; n_targets];
@@ -972,7 +987,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 let ci = condition_index(&sample.condition);
                 cond_reps[ci] += 1;
 
-                for (t, &pass) in sample_pass_masks[sample_idx].iter().enumerate() {
+                let condition_pass_mask = if opts.condition_aware_consensus {
+                    &sample_pass_masks[sample_idx]
+                } else {
+                    &rescue_sample_pass_masks[sample_idx]
+                };
+
+                for (t, &pass) in condition_pass_mask.iter().enumerate() {
                     if pass {
                         cond_counts[ci][t] += 1;
                     }
@@ -1031,10 +1052,11 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             }
         }
         info!(
-            "Condition rescue: {} pass global, {} rescued from within-condition consensus ({} conditions)",
+            "Condition rescue: {} pass global, {} rescued from within-condition TPM consensus ({} conditions, threshold={})",
             n_global,
             n_rescued,
-            condition_names.len()
+            condition_names.len(),
+            opts.tpm_threshold
         );
         mask
     } else {
@@ -1733,11 +1755,15 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         .zip(pre_gene_consensus_mask.iter())
         .map(|(&final_keep, &pre_gene_keep)| final_keep && !pre_gene_keep)
         .collect();
-
+    let condition_rescue_only: Vec<bool> = pre_gene_consensus_mask
+        .iter()
+        .zip(strict_global_mask.iter())
+        .map(|(&pre_gene_keep, &strict_keep)| pre_gene_keep && !strict_keep)
+        .collect();
     for (i, mut em_res) in phase2_results {
-        // Gene-level rescue remains a post-Phase-2 patch for now.
+        // Rescue-only transcripts retain their phase-1 estimates after phase 2.
         for t in 0..n_targets {
-            if gene_rescue_only[t] {
+            if gene_rescue_only[t] || condition_rescue_only[t] {
                 em_res[t] = phase1_counts[i][t];
             }
         }

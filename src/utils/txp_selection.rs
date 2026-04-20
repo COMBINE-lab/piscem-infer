@@ -523,7 +523,7 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
     index: &TranscriptEqIndex,
     groups: &SignatureGroups,
     packed_map: &PackedEqMap<EqLabelT>,
-    num_targets: usize,
+    _num_targets: usize,
 ) -> Vec<bool> {
     use crate::utils::eq_maps::NUM_POS_BINS;
 

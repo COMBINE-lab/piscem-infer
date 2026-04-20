@@ -292,8 +292,8 @@ fn build_ec_graph_groups(
         .map(|m| m as usize + 1)
         .unwrap_or(0);
     let mut eqc_to_txps: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
-    for t in 0..n_targets {
-        if !consensus_mask[t] {
+    for (t, &active) in consensus_mask.iter().enumerate().take(n_targets) {
+        if !active {
             continue;
         }
         for &eqc in index.signature(t) {
@@ -337,8 +337,8 @@ fn build_ec_graph_groups(
     }
 
     // For each consensus transcript, compute pairwise Jaccard with EC-sharing neighbors
-    for t in 0..n_targets {
-        if !consensus_mask[t] {
+    for (t, &active) in consensus_mask.iter().enumerate().take(n_targets) {
+        if !active {
             continue;
         }
         let sig_t = index.signature(t);
@@ -437,6 +437,7 @@ fn profile_corr_is_leakage(
 ///
 /// This generalizes the gene-fraction filter to work without gene annotations:
 /// the "gene" is replaced by the EC-neighborhood structure.
+#[allow(dead_code)]
 fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
     packed_map: &PackedEqMap<EqLabelT>,
     em_counts: &[f64],
@@ -497,7 +498,7 @@ fn compute_neighborhood_leakage<EqLabelT: EqLabel>(
                 if i == j {
                     continue;
                 }
-                let u = targets[j] as u32;
+                let u = targets[j];
                 let u_share = ec_count * weights[j] / denom;
                 if u_share > 0.01 {
                     *acc.entry(u).or_insert(0.0) += u_share;
@@ -1521,10 +1522,6 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 // A unique EC counts as 1.0 only if it appears in multiple
                 // samples. If it appears in only 1 sample, it counts as
                 // 1/n_samples (fragile evidence).
-                let mut unique_weight = 0.0f64;
-                let mut total_weight = n_total as f64;
-                let mut prev_eqc = u32::MAX;
-                let mut prev_sample = usize::MAX;
                 let mut unique_samples: Vec<usize> = Vec::new();
 
                 for &eqc in sig_t {
@@ -1597,8 +1594,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             .map(|m| m as usize + 1)
             .unwrap_or(0);
         let mut eqc_to_txps: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
-        for t in 0..n_targets {
-            if !consensus_mask[t] {
+        for (t, &active) in consensus_mask.iter().enumerate().take(n_targets) {
+            if !active {
                 continue;
             }
             for &eqc in merged_index.signature(t) {
@@ -1615,8 +1612,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             ahash::AHashMap::new();
         // (shared_count, sig_t_size, sig_u_size, sum_shared_ec_sizes)
 
-        for t in 0..n_targets {
-            if !consensus_mask[t] {
+        for (t, &active) in consensus_mask.iter().enumerate().take(n_targets) {
+            if !active {
                 continue;
             }
             let sig_t = merged_index.signature(t);
@@ -1819,37 +1816,37 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         );
 
         // Dump per-transcript diagnostic if enabled via environment variable.
-        if std::env::var("PISCEM_POS_DIAG").is_ok() {
-            if let Ok(mut f) = std::fs::File::create("pos_diagnostic.tsv") {
-                use std::io::Write;
+        if std::env::var("PISCEM_POS_DIAG").is_ok()
+            && let Ok(mut f) = std::fs::File::create("pos_diagnostic.tsv")
+        {
+            use std::io::Write;
+            writeln!(
+                f,
+                "target_name\tec_unique_frac\tpos_cv\t{}\ttotal_count",
+                (0..n_pos_bins)
+                    .map(|b| format!("bin_{}", b))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            )
+            .ok();
+            for (t, &active) in consensus_mask.iter().enumerate().take(n_targets) {
+                if !active {
+                    continue;
+                }
+                let bins_str = pos_bin_profiles[t]
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                let total: u64 = pos_bin_profiles[t].iter().sum();
                 writeln!(
                     f,
-                    "target_name\tec_unique_frac\tpos_cv\t{}\ttotal_count",
-                    (0..n_pos_bins)
-                        .map(|b| format!("bin_{}", b))
-                        .collect::<Vec<_>>()
-                        .join("\t")
+                    "{}\t{:.4}\t{:.4}\t{}\t{}",
+                    bundles[0].ref_names[t], ec_unique_frac[t], pos_cv[t], bins_str, total
                 )
                 .ok();
-                for t in 0..n_targets {
-                    if !consensus_mask[t] {
-                        continue;
-                    }
-                    let bins_str = pos_bin_profiles[t]
-                        .iter()
-                        .map(|c| c.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\t");
-                    let total: u64 = pos_bin_profiles[t].iter().sum();
-                    writeln!(
-                        f,
-                        "{}\t{:.4}\t{:.4}\t{}\t{}",
-                        bundles[0].ref_names[t], ec_unique_frac[t], pos_cv[t], bins_str, total
-                    )
-                    .ok();
-                }
-                info!("Wrote position diagnostic to pos_diagnostic.tsv");
             }
+            info!("Wrote position diagnostic to pos_diagnostic.tsv");
         }
     }
 
@@ -1912,12 +1909,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     }
 
                     // Profile-correlation filter (gene-annotated version)
-                    if has_pos && gene_frac < 0.05 {
-                        if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
-                            em_res[t] = 0.0;
-                            if i == 0 {
-                                total_gene_frac_removed += 1;
-                            }
+                    if has_pos
+                        && gene_frac < 0.05
+                        && profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins)
+                    {
+                        em_res[t] = 0.0;
+                        if i == 0 {
+                            total_gene_frac_removed += 1;
                         }
                     }
                 }
@@ -1929,7 +1927,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         // from EC graph structure (Jaccard similarity >= 0.10) and apply the
         // same fraction + profile correlation filters within each group.
         {
-            for (&group_root, members) in &ec_graph_group_members {
+            for members in ec_graph_group_members.values() {
                 let active: Vec<usize> = members
                     .iter()
                     .filter(|&&t| em_res[t] > 0.0)
@@ -1979,12 +1977,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     }
 
                     // Profile-correlation filter (group version)
-                    if has_pos && group_frac < 0.05 {
-                        if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
-                            em_res[t] = 0.0;
-                            if i == 0 {
-                                total_nbr_removed += 1;
-                            }
+                    if has_pos
+                        && group_frac < 0.05
+                        && profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins)
+                    {
+                        em_res[t] = 0.0;
+                        if i == 0 {
+                            total_nbr_removed += 1;
                         }
                     }
                 }
@@ -2031,10 +2030,12 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                             ecg_remove = true;
                         }
                     }
-                    if !ecg_remove && has_pos && gf < 0.05 {
-                        if profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins) {
-                            ecg_remove = true;
-                        }
+                    if !ecg_remove
+                        && has_pos
+                        && gf < 0.05
+                        && profile_corr_is_leakage(&pos_bin_profiles, t, dom_t, n_pos_bins)
+                    {
+                        ecg_remove = true;
                     }
 
                     if gene_removed {

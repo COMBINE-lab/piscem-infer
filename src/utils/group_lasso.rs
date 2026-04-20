@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use tracing::info;
 
 use crate::utils::eq_maps::{EqLabel, PackedEqMap, TargetLabelsRef};
@@ -569,6 +571,7 @@ pub fn compute_bic<EqLabelT: EqLabel>(
 /// * `max_em_iter` — maximum EM iterations per sample
 /// * `convergence_thresh` — EM convergence threshold
 /// * `presence_thresh` — threshold below which counts are zeroed
+#[allow(clippy::too_many_arguments)]
 pub fn em_group_shrinkage<EqLabelT: EqLabel>(
     packed_maps: &[PackedEqMap<EqLabelT>],
     eff_lens_per_sample: &[&[f64]],

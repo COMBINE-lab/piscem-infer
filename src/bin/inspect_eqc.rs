@@ -93,7 +93,7 @@ fn main() {
             .iter()
             .filter(|(_, v)| v.len() > 1)
             .collect();
-        dups.sort_by_key(|(k, _)| k.clone());
+        dups.sort_by_key(|(k, _)| (*k).clone());
         for (targets, counts) in dups.iter().take(10) {
             println!("  targets={:?}, counts={:?}", targets, counts);
         }

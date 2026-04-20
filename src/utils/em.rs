@@ -93,6 +93,8 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
 /// - `pos_eff_lens`: flattened `[n_targets * n_pos_bins]` where `[t * n + b]` is the
 ///   effective length of transcript t in bin b
 /// - `totals`: per-transcript totals `Σ_b pos_eff_len[t][b]`
+#[allow(dead_code)]
+#[allow(clippy::needless_range_loop)]
 pub fn compute_positional_eff_lens(
     ref_lens: &[u32],
     frag_length_counts: &[u32],
@@ -500,7 +502,6 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                 let mut prev_counts = vec![avg; eff_lens.len()];
                 let mut curr_counts = vec![0.0f64; eff_lens.len()];
 
-                let mut rel_diff = 0.0_f64;
                 let mut niter = 0_u32;
                 let mut rng = rng();
                 let mut base_counts = vec![0_usize; eq_map.counts.len()];
@@ -511,7 +512,7 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                 while niter < max_iter {
                     m_step(em_info, &base_counts, &prev_counts, &mut curr_counts);
 
-                    rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
+                    let rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
 
                     std::mem::swap(&mut prev_counts, &mut curr_counts);
                     curr_counts.fill(0.0_f64);
@@ -886,8 +887,6 @@ pub fn em_penalized_init<EqLabelT: EqLabel>(
     let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
     let mut curr_counts = vec![0.0f64; eff_lens.len()];
 
-    let mut rel_diff = 0.0_f64;
-    let mut last_rel_diff = f64::INFINITY;
     let mut niter = 0_u32;
 
     while niter < max_iter {
@@ -903,8 +902,7 @@ pub fn em_penalized_init<EqLabelT: EqLabel>(
             *c += a;
         }
 
-        rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
-        last_rel_diff = rel_diff;
+        let rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
 
         std::mem::swap(&mut prev_counts, &mut curr_counts);
         curr_counts.fill(0.0_f64);
@@ -960,6 +958,7 @@ pub fn em_penalized_par_init<EqLabelT: EqLabel>(
     em_penalized_par_with_pool_init(em_info, alpha, init_counts, &pool)
 }
 
+#[allow(dead_code)]
 pub fn em_penalized_par_with_pool<EqLabelT: EqLabel>(
     em_info: &EMInfo<EqLabelT>,
     alpha: &[f64],
@@ -992,8 +991,6 @@ pub fn em_penalized_par_with_pool_init<EqLabelT: EqLabel>(
     let eq_iterates: Vec<(EqLabelT::LabelRefT<'_>, &usize)> =
         eq_map.iter_labels().zip(&eq_map.counts).collect();
 
-    let mut rel_diff = 0.0_f64;
-    let mut last_rel_diff = f64::INFINITY;
     let mut niter = 0_u32;
 
     install_in_pool(Some(pool), || {
@@ -1010,7 +1007,7 @@ pub fn em_penalized_par_with_pool_init<EqLabelT: EqLabel>(
                 c.fetch_add(a, Ordering::AcqRel);
             }
 
-            rel_diff = compute_rel_diff_atomic(&prev_counts, &curr_counts, presence_thresh);
+            let rel_diff = compute_rel_diff_atomic(&prev_counts, &curr_counts, presence_thresh);
 
             std::mem::swap(&mut prev_counts, &mut curr_counts);
             curr_counts
@@ -1067,9 +1064,8 @@ pub fn em_init<EqLabelT: EqLabel>(
     let mut prev_counts = initial_counts(eff_lens, total_weight, init_counts);
     let mut curr_counts = vec![0.0f64; eff_lens.len()];
 
-    let mut rel_diff = 0.0_f64;
-    let mut last_rel_diff = f64::INFINITY;
     let mut niter = 0_u32;
+    let mut last_rel_diff = f64::INFINITY;
 
     while niter < max_iter {
         m_step(
@@ -1079,9 +1075,9 @@ pub fn em_init<EqLabelT: EqLabel>(
             &mut curr_counts,
         );
 
-        rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
-
+        let rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
         last_rel_diff = rel_diff;
+
         std::mem::swap(&mut prev_counts, &mut curr_counts);
         curr_counts.fill(0.0_f64);
 

@@ -1,12 +1,12 @@
-/// Hierarchical Dirichlet-Multinomial model for multi-sample quantification.
-///
-/// Model:
-///   π_c           = condition-level mean proportions (simplex)
-///   α₀            = concentration parameter (controls shrinkage strength)
-///   θ_s ~ Dir(α₀ · π_c)   for sample s in condition c
-///   x_s | θ_s ~ Multinomial(N_s, θ_s)   (via EQ class likelihood)
-///
-/// MAP-EM pseudo-counts: α_t = α₀ · π_c,t for present transcripts.
+//! Hierarchical Dirichlet-Multinomial model for multi-sample quantification.
+//!
+//! Model:
+//!   π_c           = condition-level mean proportions (simplex)
+//!   α₀            = concentration parameter (controls shrinkage strength)
+//!   θ_s ~ Dir(α₀ · π_c)   for sample s in condition c
+//!   x_s | θ_s ~ Multinomial(N_s, θ_s)   (via EQ class likelihood)
+//!
+//! MAP-EM pseudo-counts: α_t = α₀ · π_c,t for present transcripts.
 
 /// Per-sample result from (penalized) EM.
 #[allow(dead_code)]
@@ -68,9 +68,9 @@ pub fn update_condition_means(results: &[SampleResult], hyperparams: &mut Dirich
 
         for res in results.iter().filter(|r| r.condition_idx == c) {
             n_samples += 1;
-            for t in 0..num_targets {
+            for (t, mc) in mean_counts.iter_mut().enumerate().take(num_targets) {
                 if res.present[t] {
-                    mean_counts[t] += res.counts[t];
+                    *mc += res.counts[t];
                 }
             }
         }
@@ -82,8 +82,8 @@ pub fn update_condition_means(results: &[SampleResult], hyperparams: &mut Dirich
         // Normalize to proportions
         let total: f64 = mean_counts.iter().sum();
         if total > 0.0 {
-            for t in 0..num_targets {
-                hyperparams.pi[c][t] = mean_counts[t] / total;
+            for (t, mc) in mean_counts.iter().enumerate().take(num_targets) {
+                hyperparams.pi[c][t] = *mc / total;
             }
         }
     }

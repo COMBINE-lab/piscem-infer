@@ -1272,7 +1272,7 @@ fn process_dispatch<T: Read + Send, D: FldPDF + Sync, EqLabelT: EqLabel + Send>(
     let n_workers = num_threads.max(1);
     let contains_ori = eqmap.contains_ori;
 
-    let (mut merged_eqmap, frag_lengths, unique_frags) = if n_workers <= 1 {
+    let (merged_eqmap, frag_lengths, unique_frags) = if n_workers <= 1 {
         // Sequential path: single worker, no threading overhead.
         let mut state = WorkerState {
             eqmap,

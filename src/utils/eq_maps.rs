@@ -209,7 +209,7 @@ impl EqLabel for RangeFactorizedEqLabel {
                 targets_and_bins.extend_from_slice(pb);
             } else {
                 // Default to bin 0 if not provided
-                targets_and_bins.extend(std::iter::repeat(0u32).take(num_labels));
+                targets_and_bins.extend(std::iter::repeat_n(0u32, num_labels));
             }
         }
 

@@ -36,7 +36,9 @@ pub(crate) fn write_results(
     let inv_denom: f64 = if denom > 0.0 {
         ONE_MILLION / denom
     } else {
-        warn!("The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!");
+        warn!(
+            "The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!"
+        );
         0.0
     };
     let tpms: Vec<f64> = e_counts
@@ -53,7 +55,7 @@ pub(crate) fn write_results(
 
     for (i, name) in ref_names.iter().enumerate() {
         let l = format!(
-            "{}\t{}\t{:.3}\t{:.3}\t{:.3}\n",
+            "{}\t{}\t{:.3}\t{:.6}\t{:.3}\n",
             name, lengths[i], eff_lengths[i], tpms[i], e_counts[i]
         );
         ofile.write_all(l.as_bytes())?;

@@ -58,10 +58,7 @@ pub fn init_hyperparams(
 ///   then normalize so Σ_t π̂_c,t = 1
 ///
 /// Only present transcripts contribute to the mean.
-pub fn update_condition_means(
-    results: &[SampleResult],
-    hyperparams: &mut DirichletHyperparams,
-) {
+pub fn update_condition_means(results: &[SampleResult], hyperparams: &mut DirichletHyperparams) {
     let num_targets = hyperparams.pi[0].len();
     let num_conditions = hyperparams.condition_names.len();
 
@@ -218,11 +215,7 @@ pub fn compute_pseudo_counts_spike_slab(
     let pi = &hyperparams.pi[condition_idx];
     let alpha_0 = hyperparams.alpha_0;
 
-    let weighted_sum: f64 = pi
-        .iter()
-        .zip(gamma.iter())
-        .map(|(&p, &g)| g * p)
-        .sum();
+    let weighted_sum: f64 = pi.iter().zip(gamma.iter()).map(|(&p, &g)| g * p).sum();
 
     if weighted_sum <= 0.0 {
         return vec![0.0; pi.len()];
@@ -235,10 +228,7 @@ pub fn compute_pseudo_counts_spike_slab(
 }
 
 /// Compute convergence metric: max absolute change in pi across all conditions.
-pub fn convergence_metric(
-    old_pi: &[Vec<f64>],
-    new: &DirichletHyperparams,
-) -> f64 {
+pub fn convergence_metric(old_pi: &[Vec<f64>], new: &DirichletHyperparams) -> f64 {
     let mut max_change = 0.0_f64;
     for (c, old_pi_c) in old_pi.iter().enumerate() {
         for (t, &old_val) in old_pi_c.iter().enumerate() {
@@ -270,8 +260,8 @@ fn digamma(mut x: f64) -> f64 {
     // Asymptotic (Stirling) series for x ≥ 6
     let inv_x = 1.0 / x;
     let inv_x2 = inv_x * inv_x;
-    result += x.ln() - 0.5 * inv_x
-        - inv_x2 * (1.0 / 12.0 - inv_x2 * (1.0 / 120.0 - inv_x2 / 252.0));
+    result +=
+        x.ln() - 0.5 * inv_x - inv_x2 * (1.0 / 12.0 - inv_x2 * (1.0 / 120.0 - inv_x2 / 252.0));
     result
 }
 
@@ -290,8 +280,8 @@ fn trigamma(mut x: f64) -> f64 {
     // Asymptotic series
     let inv_x = 1.0 / x;
     let inv_x2 = inv_x * inv_x;
-    result += inv_x + inv_x2 * 0.5
-        + inv_x2 * inv_x * (1.0 / 6.0 - inv_x2 * (1.0 / 30.0 - inv_x2 / 42.0));
+    result +=
+        inv_x + inv_x2 * 0.5 + inv_x2 * inv_x * (1.0 / 6.0 - inv_x2 * (1.0 / 30.0 - inv_x2 / 42.0));
     result
 }
 
@@ -304,7 +294,11 @@ fn inv_trigamma(y: f64) -> f64 {
         return f64::INFINITY;
     }
     // Initial guess
-    let mut x = if y > 1.0 { 1.0 / y.sqrt() } else { 1.0 / (y - 1e-10) };
+    let mut x = if y > 1.0 {
+        1.0 / y.sqrt()
+    } else {
+        1.0 / (y - 1e-10)
+    };
     x = x.max(0.5);
 
     for _ in 0..25 {
@@ -390,10 +384,7 @@ pub fn compute_log_count_variances(
 /// - `E(log s²) = log(s₀²) + ψ(d/2) - log(d/2) + ψ(d₀/2) - log(d₀/2)` → solve for s₀²
 ///
 /// Falls back to (∞, median(s²)) if fitting fails.
-pub fn fit_variance_prior(
-    sample_var: &[f64],
-    df: &[f64],
-) -> (f64, f64) {
+pub fn fit_variance_prior(sample_var: &[f64], df: &[f64]) -> (f64, f64) {
     // Collect valid (finite, positive) log-variances
     let valid: Vec<(f64, f64)> = sample_var
         .iter()
@@ -420,8 +411,11 @@ pub fn fit_variance_prior(
 
     let n = valid.len() as f64;
     let mean_log_s2: f64 = valid.iter().map(|(z, _)| z).sum::<f64>() / n;
-    let var_log_s2: f64 =
-        valid.iter().map(|(z, _)| (z - mean_log_s2).powi(2)).sum::<f64>() / (n - 1.0);
+    let var_log_s2: f64 = valid
+        .iter()
+        .map(|(z, _)| (z - mean_log_s2).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
 
     // Most transcripts share the same df; use the median df
     let mut dfs: Vec<f64> = valid.iter().map(|(_, d)| *d).collect();
@@ -447,8 +441,7 @@ pub fn fit_variance_prior(
     let d0 = 2.0 * half_d0;
 
     // log(s₀²) = E(log s²) - ψ(d/2) + log(d/2) - ψ(d₀/2) + log(d₀/2)
-    let log_s0_sq =
-        mean_log_s2 - digamma(half_d) + half_d.ln() - digamma(half_d0) + half_d0.ln();
+    let log_s0_sq = mean_log_s2 - digamma(half_d) + half_d.ln() - digamma(half_d0) + half_d0.ln();
     let s0_sq = log_s0_sq.exp();
 
     (d0, s0_sq)
@@ -550,10 +543,7 @@ pub fn compute_pseudo_counts_adaptive(
 mod tests {
     use super::*;
 
-    fn make_results(
-        counts: Vec<Vec<f64>>,
-        conditions: Vec<usize>,
-    ) -> Vec<SampleResult> {
+    fn make_results(counts: Vec<Vec<f64>>, conditions: Vec<usize>) -> Vec<SampleResult> {
         counts
             .into_iter()
             .zip(conditions)
@@ -605,9 +595,9 @@ mod tests {
 
         let results = make_results(
             vec![
-                vec![80.0, 20.0],  // ctrl sample 1
-                vec![60.0, 40.0],  // ctrl sample 2
-                vec![20.0, 80.0],  // treat sample 1
+                vec![80.0, 20.0], // ctrl sample 1
+                vec![60.0, 40.0], // ctrl sample 2
+                vec![20.0, 80.0], // treat sample 1
             ],
             vec![0, 0, 1],
         );
@@ -689,14 +679,20 @@ mod tests {
             vec![0.0, 0.0, 70.0, 0.0],
         ];
         let cond_indices = vec![0, 0, 1, 1];
-        let gamma = compute_inclusion_probabilities(
-            &counts, &cond_indices, 2, 4, 1e-8, 0.02,
-        );
+        let gamma = compute_inclusion_probabilities(&counts, &cond_indices, 2, 4, 1e-8, 0.02);
 
         // Target 0: 2/2 in cond 0 → γ = (2 + 0.02) / (2 + 1) = 0.673
-        assert!(gamma[0] > 0.5, "target 0 (2/2 present) should have γ > 0.5, got {}", gamma[0]);
+        assert!(
+            gamma[0] > 0.5,
+            "target 0 (2/2 present) should have γ > 0.5, got {}",
+            gamma[0]
+        );
         // Target 1: 1/2 in cond 0 → γ = (1 + 0.02) / (2 + 1) = 0.34
-        assert!(gamma[1] < 0.5, "target 1 (1/2 present) should have γ < 0.5, got {}", gamma[1]);
+        assert!(
+            gamma[1] < 0.5,
+            "target 1 (1/2 present) should have γ < 0.5, got {}",
+            gamma[1]
+        );
         // Target 2: 2/2 in cond 1 → γ > 0.5
         assert!(gamma[2] > 0.5);
         // Target 3: 1/2 in cond 1 → γ < 0.5
@@ -713,13 +709,15 @@ mod tests {
             vec![0.0, 0.0, 70.0, 0.0],
         ];
         let cond_indices = vec![0, 0, 1, 1];
-        let gamma = compute_inclusion_probabilities(
-            &counts, &cond_indices, 2, 4, 1e-8, 0.5,
-        );
+        let gamma = compute_inclusion_probabilities(&counts, &cond_indices, 2, 4, 1e-8, 0.5);
 
         // With symmetric prior, 1/2 present → γ = (1 + 0.5) / (2 + 1) = 0.5
         // So targets with 1/2 present are borderline (exactly 0.5)
-        assert!(gamma[1] >= 0.49, "with dense prior, 1/2 present should be ~0.5, got {}", gamma[1]);
+        assert!(
+            gamma[1] >= 0.49,
+            "with dense prior, 1/2 present should be ~0.5, got {}",
+            gamma[1]
+        );
     }
 
     #[test]
@@ -742,21 +740,27 @@ mod tests {
         let euler = 0.5772156649015329;
         assert!(
             (digamma(1.0) + euler).abs() < 1e-8,
-            "ψ(1) = {}, expected {}", digamma(1.0), -euler
+            "ψ(1) = {}, expected {}",
+            digamma(1.0),
+            -euler
         );
 
         // ψ'(1) = π²/6
         let pi_sq_6 = std::f64::consts::PI.powi(2) / 6.0;
         assert!(
             (trigamma(1.0) - pi_sq_6).abs() < 1e-8,
-            "ψ'(1) = {}, expected {}", trigamma(1.0), pi_sq_6
+            "ψ'(1) = {}, expected {}",
+            trigamma(1.0),
+            pi_sq_6
         );
 
         // ψ(5) = 1 + 1/2 + 1/3 + 1/4 - γ = 25/12 - γ
         let psi5 = 1.0 + 0.5 + 1.0 / 3.0 + 0.25 - euler;
         assert!(
             (digamma(5.0) - psi5).abs() < 1e-8,
-            "ψ(5) = {}, expected {}", digamma(5.0), psi5
+            "ψ(5) = {}, expected {}",
+            digamma(5.0),
+            psi5
         );
     }
 
@@ -767,7 +771,10 @@ mod tests {
             let x_recovered = inv_trigamma(y);
             assert!(
                 (x_recovered - x).abs() < 1e-6,
-                "inv_trigamma(trigamma({})) = {}, expected {}", x, x_recovered, x
+                "inv_trigamma(trigamma({})) = {}, expected {}",
+                x,
+                x_recovered,
+                x
             );
         }
     }
@@ -778,7 +785,7 @@ mod tests {
         let counts = vec![
             vec![100.0, 10.0, 50.0],
             vec![110.0, 12.0, 50.0],
-            vec![90.0,   8.0, 50.0],
+            vec![90.0, 8.0, 50.0],
             vec![105.0, 11.0, 50.0],
         ];
         let presence = vec![
@@ -796,7 +803,11 @@ mod tests {
         assert_eq!(df[2], 3.0);
 
         // Transcript 2 (constant at 50) should have very low variance
-        assert!(s2[2] < 1e-10, "constant transcript should have ~0 variance, got {}", s2[2]);
+        assert!(
+            s2[2] < 1e-10,
+            "constant transcript should have ~0 variance, got {}",
+            s2[2]
+        );
         // Transcript 0 and 1 should have positive variance
         assert!(s2[0] > 0.0);
         assert!(s2[1] > 0.0);
@@ -843,11 +854,20 @@ mod tests {
         let mv = compute_moderated_variances(&sample_var, &df, d0, s0_sq, base_alpha, 1.0, 1.0);
 
         // High-variance transcript: σ̃² between s0_sq and s²
-        assert!(mv.moderated_var[0] > s0_sq, "high-var σ̃² should exceed s0_sq");
-        assert!(mv.moderated_var[0] < 10.0, "high-var σ̃² should be less than s²");
+        assert!(
+            mv.moderated_var[0] > s0_sq,
+            "high-var σ̃² should exceed s0_sq"
+        );
+        assert!(
+            mv.moderated_var[0] < 10.0,
+            "high-var σ̃² should be less than s²"
+        );
 
         // Low-variance transcript: σ̃² between s² and s0_sq
-        assert!(mv.moderated_var[1] < s0_sq, "low-var σ̃² should be less than s0_sq");
+        assert!(
+            mv.moderated_var[1] < s0_sq,
+            "low-var σ̃² should be less than s0_sq"
+        );
         assert!(mv.moderated_var[1] > 0.1, "low-var σ̃² should exceed s²");
 
         // Typical transcript: σ̃² ≈ s0_sq
@@ -856,7 +876,10 @@ mod tests {
         // Concentration: high-var → less shrinkage (lower α₀_t, squared ratio)
         assert!(mv.alpha_0_t[0] < base_alpha);
         // Low-var → NO increase (one-sided: capped at base)
-        assert_eq!(mv.alpha_0_t[1], base_alpha, "stable transcripts should not get increased shrinkage");
+        assert_eq!(
+            mv.alpha_0_t[1], base_alpha,
+            "stable transcripts should not get increased shrinkage"
+        );
         // Typical → unchanged
         assert_eq!(mv.alpha_0_t[2], base_alpha);
     }
@@ -877,7 +900,10 @@ mod tests {
         let alpha = compute_pseudo_counts_adaptive(&hp, 0, &present, &alpha_0_t);
 
         // Both have equal π (0.5), so ratio is purely from α₀_t
-        assert!(alpha[0] < alpha[1], "DE transcript should get less shrinkage");
+        assert!(
+            alpha[0] < alpha[1],
+            "DE transcript should get less shrinkage"
+        );
         assert_eq!(alpha[0], 20.0 * 0.5 / 1.0); // 10
         assert_eq!(alpha[1], 200.0 * 0.5 / 1.0); // 100
     }

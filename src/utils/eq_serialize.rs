@@ -61,8 +61,12 @@ pub fn serialize_eq_map<EqLabelT: EqLabel>(
     meta: &SampleMeta,
     output_dir: &Path,
 ) -> Result<()> {
-    std::fs::create_dir_all(output_dir)
-        .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
+    std::fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "Failed to create output directory: {}",
+            output_dir.display()
+        )
+    })?;
 
     // Write Parquet file
     let pq_path = output_dir.join(format!("{}.eqc.pq", meta.sample_name));
@@ -97,16 +101,13 @@ pub fn deserialize_eq_map(
 
 /// Write PackedEqMap data as Parquet with a List<UInt32> column for labels
 /// and a UInt64 column for counts.
-fn write_eq_parquet<EqLabelT: EqLabel>(
-    eq_map: &PackedEqMap<EqLabelT>,
-    path: &str,
-) -> Result<()> {
+fn write_eq_parquet<EqLabelT: EqLabel>(eq_map: &PackedEqMap<EqLabelT>, path: &str) -> Result<()> {
     let num_eqcs = eq_map.len();
 
     // Build the offsets for the list array from eq_label_starts
     let offsets: Vec<i32> = eq_map.eq_label_starts.iter().map(|&s| s as i32).collect();
-    let offsets_buf = OffsetsBuffer::try_from(offsets)
-        .map_err(|e| anyhow::anyhow!("Invalid offsets: {}", e))?;
+    let offsets_buf =
+        OffsetsBuffer::try_from(offsets).map_err(|e| anyhow::anyhow!("Invalid offsets: {}", e))?;
 
     // Build the flat values array from eq_labels
     let values = UInt32Array::from_vec(eq_map.eq_labels.clone());
@@ -129,10 +130,7 @@ fn write_eq_parquet<EqLabelT: EqLabel>(
         Field::new("counts", DataType::UInt64, false),
     ];
     let schema = Schema::from(fields);
-    let chunk = Chunk::new(vec![
-        labels_array.boxed(),
-        counts_array.boxed(),
-    ]);
+    let chunk = Chunk::new(vec![labels_array.boxed(), counts_array.boxed()]);
 
     parquet_utils::write_chunk_to_file(path, schema, chunk)
 }
@@ -182,11 +180,7 @@ fn read_eq_parquet(path: &Path, contains_ori: bool) -> Result<DeserializedEqMap>
         .ok_or_else(|| anyhow::anyhow!("List values are not UInt32"))?;
 
     let eq_labels: Vec<u32> = values.values_iter().copied().collect();
-    let eq_label_starts: Vec<u32> = labels_array
-        .offsets()
-        .iter()
-        .map(|&o| o as u32)
-        .collect();
+    let eq_label_starts: Vec<u32> = labels_array.offsets().iter().map(|&o| o as u32).collect();
 
     // Extract counts (UInt64)
     let counts_array = columns[1]
@@ -212,11 +206,21 @@ mod tests {
 
     fn build_test_eq_map() -> PackedEqMap<BasicEqLabel> {
         let mut eqm = BasicEqMap::new(OrientationProperty::OrientationAgnostic);
-        for _ in 0..10 { eqm.add(BasicEqLabel::new(&[0, 1], None, None)); }
-        for _ in 0..15 { eqm.add(BasicEqLabel::new(&[1, 2], None, None)); }
-        for _ in 0..20 { eqm.add(BasicEqLabel::new(&[0], None, None)); }
-        for _ in 0..5 { eqm.add(BasicEqLabel::new(&[2, 3, 4], None, None)); }
-        for _ in 0..8 { eqm.add(BasicEqLabel::new(&[3], None, None)); }
+        for _ in 0..10 {
+            eqm.add(BasicEqLabel::new(&[0, 1], None, None));
+        }
+        for _ in 0..15 {
+            eqm.add(BasicEqLabel::new(&[1, 2], None, None));
+        }
+        for _ in 0..20 {
+            eqm.add(BasicEqLabel::new(&[0], None, None));
+        }
+        for _ in 0..5 {
+            eqm.add(BasicEqLabel::new(&[2, 3, 4], None, None));
+        }
+        for _ in 0..8 {
+            eqm.add(BasicEqLabel::new(&[3], None, None));
+        }
         PackedEqMap::from_eq_map(&eqm)
     }
 
@@ -230,7 +234,11 @@ mod tests {
             num_eqcs: eq_map.len(),
             total_weight: eq_map.total_weight(),
             ref_names: vec![
-                "tx0".into(), "tx1".into(), "tx2".into(), "tx3".into(), "tx4".into(),
+                "tx0".into(),
+                "tx1".into(),
+                "tx2".into(),
+                "tx3".into(),
+                "tx4".into(),
             ],
             ref_lengths: vec![100, 200, 150, 300, 250],
             eff_lengths: vec![90.5, 190.2, 140.8, 290.1, 240.3],
@@ -308,11 +316,13 @@ mod tests {
             assert_eq!(
                 &eq_map.eq_labels[orig_start..orig_end],
                 &deser.eq_labels[deser_start..deser_end],
-                "EQC {} labels mismatch", i
+                "EQC {} labels mismatch",
+                i
             );
             assert_eq!(
                 eq_map.counts[i], deser.counts[i],
-                "EQC {} count mismatch", i
+                "EQC {} count mismatch",
+                i
             );
         }
     }

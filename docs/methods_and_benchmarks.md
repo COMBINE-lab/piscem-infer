@@ -2,6 +2,8 @@
 
 This document summarizes the inference methods implemented in piscem-infer's multi-sample consensus quantification pipeline (`consensus-quant`) and their performance on standard RNA-seq benchmarks.
 
+For the current retained configuration, a summary of major attempted directions that were not kept, and the remaining open method challenge, see [current_status.md](../current_status.md).
+
 ## Overview
 
 piscem-infer implements a multi-sample consensus quantification pipeline that combines positional equivalence classes, structural variable selection, EC-graph-based leakage detection, and SQUAREM-accelerated EM inference to produce transcript-level abundance estimates with substantially improved accuracy and reproducibility compared to single-sample methods.
@@ -24,14 +26,11 @@ Standard equivalence classes group fragments by their compatible transcript set.
 - Fragments with the same transcript membership but different position bins become separate ECs
 - Provides finer-grained evidence for distinguishing transcripts that share sequence
 
-### 2. Positional Effective Lengths
+### 2. Effective Lengths with Positional ECs
 
-When positional ECs are enabled, a single effective length per transcript is insufficient. Edge bins have fewer valid fragment start positions because fragments near transcript ends may extend beyond the boundary.
+Even with positional ECs enabled, the production M-step uses a single per-transcript effective length `eff_len[t]` (the same length used when positional binning is disabled). The positional-bin identity of each EC is consumed by downstream filters (position-CV leakage, coverage smoothing) rather than by the standard M-step, so the collapsed EC view used for EM/SQUAREM/Gibbs/bootstrap remains correct with the per-transcript `inv_eff_lens[t]`.
 
-- For each (transcript, bin) pair: integrate over the fragment length distribution (FLD) to compute the number of valid start positions
-- **Formula:** `pos_eff_len[t][b] = Σ_f FLD(f) * max(0, min(bin_end, L-f+1) - bin_start)`
-- The M-step uses `inv_pos_eff_lens[t * n_bins + b]` instead of a single `inv_eff_lens[t]`
-- Sum across bins approximates the standard effective length
+A per-bin effective length table `pos_eff_len[t][b] = Σ_f FLD(f) · max(0, min(bin_end, L-f+1) - bin_start)` is implemented in `utils::em::compute_positional_eff_lens` and is intended for auxiliary diagnostics; it is not wired into the default EM M-step as of the current `pos-eq-class` branch.
 
 ### 3. Structural Variable Selection (3 Stages)
 

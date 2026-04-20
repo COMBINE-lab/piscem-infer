@@ -65,7 +65,11 @@ impl SelectionStages {
                 "collapse" => stages.collapse = true,
                 "peeling" => stages.peeling = true,
                 "dominance" => stages.dominance = true,
-                other => return Err(format!("unknown selection stage: '{other}'. Valid stages: collapse, peeling, dominance")),
+                other => {
+                    return Err(format!(
+                        "unknown selection stage: '{other}'. Valid stages: collapse, peeling, dominance"
+                    ));
+                }
             }
         }
         // Collapse is always required
@@ -119,12 +123,16 @@ impl TranscriptEqIndex {
         let total_edges = *offsets.last().unwrap() as usize;
 
         // Check if position bins are available.
-        let has_pos = packed_map.len() > 0
-            && packed_map.refs_for_eqc(0).target_pos_bins().is_some();
+        let has_pos =
+            packed_map.len() > 0 && packed_map.refs_for_eqc(0).target_pos_bins().is_some();
 
         // Second pass: fill in EQ class IDs (and pos bins, counts) using write cursors.
         let mut eqc_ids = vec![0u32; total_edges];
-        let mut pos_bins_vec = if has_pos { vec![0u32; total_edges] } else { Vec::new() };
+        let mut pos_bins_vec = if has_pos {
+            vec![0u32; total_edges]
+        } else {
+            Vec::new()
+        };
         let mut ec_counts_vec = vec![0u32; total_edges];
         let mut cursors = vec![0u32; num_targets];
         for eqc_idx in 0..packed_map.len() {
@@ -149,7 +157,8 @@ impl TranscriptEqIndex {
             let e = offsets[t + 1] as usize;
             if has_pos {
                 // Sort (eqc_id, pos_bin, count) triples together by eqc_id.
-                let mut triples: Vec<(u32, u32, u32)> = eqc_ids[s..e].iter()
+                let mut triples: Vec<(u32, u32, u32)> = eqc_ids[s..e]
+                    .iter()
                     .zip(pos_bins_vec[s..e].iter())
                     .zip(ec_counts_vec[s..e].iter())
                     .map(|((&a, &b), &c)| (a, b, c))
@@ -162,7 +171,8 @@ impl TranscriptEqIndex {
                 }
             } else {
                 // Sort (eqc_id, count) pairs together.
-                let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e].iter()
+                let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e]
+                    .iter()
                     .zip(ec_counts_vec[s..e].iter())
                     .map(|(&a, &b)| (a, b))
                     .collect();
@@ -174,7 +184,12 @@ impl TranscriptEqIndex {
             }
         }
 
-        Self { eqc_ids, offsets, pos_bins: pos_bins_vec, ec_counts: ec_counts_vec }
+        Self {
+            eqc_ids,
+            offsets,
+            pos_bins: pos_bins_vec,
+            ec_counts: ec_counts_vec,
+        }
     }
 
     /// Returns the number of transcripts in this index.
@@ -424,10 +439,7 @@ pub fn unique_ec_peeling<EqLabelT: EqLabel>(
 /// signatures, which are identical for all group members).
 ///
 /// Returns a boolean mask over groups: `true` = dominated (can be removed).
-pub fn subset_dominance(
-    index: &TranscriptEqIndex,
-    groups: &SignatureGroups,
-) -> Vec<bool> {
+pub fn subset_dominance(index: &TranscriptEqIndex, groups: &SignatureGroups) -> Vec<bool> {
     let num_groups = groups.num_groups();
     let mut dominated = vec![false; num_groups];
 
@@ -435,9 +447,7 @@ pub fn subset_dominance(
     // Sort groups by signature length (ascending) — smaller signatures are
     // more likely to be subsets.
     let mut group_order: Vec<usize> = (0..num_groups).collect();
-    group_order.sort_unstable_by_key(|&gi| {
-        index.degree(groups.representatives[gi] as usize)
-    });
+    group_order.sort_unstable_by_key(|&gi| index.degree(groups.representatives[gi] as usize));
 
     // Build an inverted index: EQ class → list of groups containing it.
     // This allows us to quickly find candidate supersets.
@@ -536,16 +546,26 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
         }
     }
 
+    // If none of the labels actually carry positional bins (e.g. a
+    // `BasicEqLabel`-backed map built against a globally-enabled
+    // `NUM_POS_BINS`), fall back to the standard subset-dominance check.
+    if eqc_txp_posbin.is_empty() {
+        return subset_dominance(index, groups);
+    }
+
     let num_groups = groups.num_groups();
     let mut dominated = vec![false; num_groups];
 
     let mut group_order: Vec<usize> = (0..num_groups).collect();
-    group_order.sort_unstable_by_key(|&gi| {
-        index.degree(groups.representatives[gi] as usize)
-    });
+    group_order.sort_unstable_by_key(|&gi| index.degree(groups.representatives[gi] as usize));
 
-    let max_eqc = index.eqc_ids.iter().copied().max()
-        .map(|m| m as usize + 1).unwrap_or(0);
+    let max_eqc = index
+        .eqc_ids
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0);
     let mut eqc_to_groups: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
     for gi in 0..num_groups {
         let rep = groups.representatives[gi] as usize;
@@ -555,24 +575,35 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
     }
 
     for &gi in &group_order {
-        if dominated[gi] { continue; }
+        if dominated[gi] {
+            continue;
+        }
         let rep_i = groups.representatives[gi] as usize;
         let sig_i = index.signature(rep_i);
-        if sig_i.is_empty() { continue; }
+        if sig_i.is_empty() {
+            continue;
+        }
         let deg_i = sig_i.len();
 
-        let rarest_eqc = sig_i.iter()
+        let rarest_eqc = sig_i
+            .iter()
             .min_by_key(|&&eqc| eqc_to_groups[eqc as usize].len())
             .unwrap();
 
         for &candidate_gj in &eqc_to_groups[*rarest_eqc as usize] {
             let gj = candidate_gj as usize;
-            if gj == gi || dominated[gj] { continue; }
+            if gj == gi || dominated[gj] {
+                continue;
+            }
             let rep_j = groups.representatives[gj] as usize;
             let sig_j = index.signature(rep_j);
-            if sig_j.len() <= deg_i { continue; }
+            if sig_j.len() <= deg_i {
+                continue;
+            }
 
-            if !is_sorted_subset(sig_i, sig_j) { continue; }
+            if !is_sorted_subset(sig_i, sig_j) {
+                continue;
+            }
 
             // sig_i ⊆ sig_j confirmed. Now check coverage plausibility:
             // For each EC in sig_i, what position bin does transcript j have?
@@ -604,7 +635,10 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
         n_standard - n_coverage
     };
     if n_saved > 0 {
-        info!("  Coverage plausibility rescued {} groups from dominance removal", n_saved);
+        info!(
+            "  Coverage plausibility rescued {} groups from dominance removal",
+            n_saved
+        );
     }
 
     dominated
@@ -666,9 +700,7 @@ pub fn run_selection_with_stages<EqLabelT: EqLabel>(
     // Stage 1: Build reverse index and collapse signatures.
     let index = TranscriptEqIndex::from_packed_eq_map(packed_map, num_targets);
     let groups = signature_collapse(&index);
-    let n_no_eqc = (0..num_targets)
-        .filter(|&t| index.degree(t) == 0)
-        .count();
+    let n_no_eqc = (0..num_targets).filter(|&t| index.degree(t) == 0).count();
     info!(
         "  Stage 1 (signature collapse): {} transcripts → {} groups ({} with no EQ classes)",
         num_targets,
@@ -783,8 +815,16 @@ pub fn merge_transcript_indices(
 
     // Second pass: fill in remapped EQ class IDs (and pos bins, counts).
     let mut eqc_ids = vec![0u32; total_edges];
-    let mut pos_bins_vec = if has_pos { vec![0u32; total_edges] } else { Vec::new() };
-    let mut ec_counts_vec = if has_counts { vec![0u32; total_edges] } else { Vec::new() };
+    let mut pos_bins_vec = if has_pos {
+        vec![0u32; total_edges]
+    } else {
+        Vec::new()
+    };
+    let mut ec_counts_vec = if has_counts {
+        vec![0u32; total_edges]
+    } else {
+        Vec::new()
+    };
     let mut cursors = vec![0u32; num_targets];
     for (sample_idx, index) in indices.iter().enumerate() {
         let offset = eqc_offsets[sample_idx];
@@ -811,23 +851,34 @@ pub fn merge_transcript_indices(
         let e = offsets[t + 1] as usize;
         if has_pos || has_counts {
             // Build sortable tuples: (eqc_id, pos_bin, count)
-            let mut triples: Vec<(u32, u32, u32)> = (s..e).map(|k| {
-                let pb = if has_pos { pos_bins_vec[k] } else { 0 };
-                let cnt = if has_counts { ec_counts_vec[k] } else { 0 };
-                (eqc_ids[k], pb, cnt)
-            }).collect();
+            let mut triples: Vec<(u32, u32, u32)> = (s..e)
+                .map(|k| {
+                    let pb = if has_pos { pos_bins_vec[k] } else { 0 };
+                    let cnt = if has_counts { ec_counts_vec[k] } else { 0 };
+                    (eqc_ids[k], pb, cnt)
+                })
+                .collect();
             triples.sort_unstable_by_key(|&(eqc, _, _)| eqc);
             for (j, &(eqc, pb, cnt)) in triples.iter().enumerate() {
                 eqc_ids[s + j] = eqc;
-                if has_pos { pos_bins_vec[s + j] = pb; }
-                if has_counts { ec_counts_vec[s + j] = cnt; }
+                if has_pos {
+                    pos_bins_vec[s + j] = pb;
+                }
+                if has_counts {
+                    ec_counts_vec[s + j] = cnt;
+                }
             }
         } else {
             eqc_ids[s..e].sort_unstable();
         }
     }
 
-    TranscriptEqIndex { eqc_ids, offsets, pos_bins: pos_bins_vec, ec_counts: ec_counts_vec }
+    TranscriptEqIndex {
+        eqc_ids,
+        offsets,
+        pos_bins: pos_bins_vec,
+        ec_counts: ec_counts_vec,
+    }
 }
 
 /// Peeling algorithm that works from TranscriptEqIndex + SignatureGroups,
@@ -920,7 +971,9 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
     let n_no_eqc = (0..num_targets).filter(|&t| index.degree(t) == 0).count();
     info!(
         "  Stage 1 (signature collapse): {} transcripts → {} groups ({} with no EQ classes)",
-        num_targets, groups.num_groups(), n_no_eqc
+        num_targets,
+        groups.num_groups(),
+        n_no_eqc
     );
 
     let required = if stages.peeling {
@@ -928,7 +981,8 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
         let n_required = req.iter().filter(|&&r| r).count();
         info!(
             "  Stage 2 (unique EC peeling): {} / {} groups are structurally required",
-            n_required, groups.num_groups()
+            n_required,
+            groups.num_groups()
         );
         req
     } else {
@@ -943,12 +997,16 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
             let mut dominated = vec![false; num_groups];
 
             let mut group_order: Vec<usize> = (0..num_groups).collect();
-            group_order.sort_unstable_by_key(|&gi| {
-                index.degree(groups.representatives[gi] as usize)
-            });
+            group_order
+                .sort_unstable_by_key(|&gi| index.degree(groups.representatives[gi] as usize));
 
-            let max_eqc = index.eqc_ids.iter().copied().max()
-                .map(|m| m as usize + 1).unwrap_or(0);
+            let max_eqc = index
+                .eqc_ids
+                .iter()
+                .copied()
+                .max()
+                .map(|m| m as usize + 1)
+                .unwrap_or(0);
             let mut eqc_to_groups: Vec<Vec<u32>> = vec![Vec::new(); max_eqc];
             for gi in 0..num_groups {
                 let rep = groups.representatives[gi] as usize;
@@ -969,23 +1027,34 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
             }
 
             for &gi in &group_order {
-                if dominated[gi] { continue; }
+                if dominated[gi] {
+                    continue;
+                }
                 let rep_i = groups.representatives[gi] as usize;
                 let sig_i = index.signature(rep_i);
-                if sig_i.is_empty() { continue; }
+                if sig_i.is_empty() {
+                    continue;
+                }
                 let deg_i = sig_i.len();
 
-                let rarest_eqc = sig_i.iter()
+                let rarest_eqc = sig_i
+                    .iter()
                     .min_by_key(|&&eqc| eqc_to_groups[eqc as usize].len())
                     .unwrap();
 
                 for &candidate_gj in &eqc_to_groups[*rarest_eqc as usize] {
                     let gj = candidate_gj as usize;
-                    if gj == gi || dominated[gj] { continue; }
+                    if gj == gi || dominated[gj] {
+                        continue;
+                    }
                     let rep_j = groups.representatives[gj] as usize;
                     let sig_j = index.signature(rep_j);
-                    if sig_j.len() <= deg_i { continue; }
-                    if !is_sorted_subset(sig_i, sig_j) { continue; }
+                    if sig_j.len() <= deg_i {
+                        continue;
+                    }
+                    if !is_sorted_subset(sig_i, sig_j) {
+                        continue;
+                    }
 
                     // Coverage plausibility: check j's pos bins from i's shared ECs.
                     let mut j_bins_used = [false; 32];
@@ -1013,7 +1082,10 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                 n_standard - n_coverage
             };
             if n_saved > 0 {
-                info!("  Coverage plausibility rescued {} groups from dominance removal", n_saved);
+                info!(
+                    "  Coverage plausibility rescued {} groups from dominance removal",
+                    n_saved
+                );
             }
 
             dominated
@@ -1024,7 +1096,8 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
         let n_dominated = dom.iter().filter(|&&d| d).count();
         info!(
             "  Stage 3 (subset dominance): {} / {} groups are dominated (removable)",
-            n_dominated, groups.num_groups()
+            n_dominated,
+            groups.num_groups()
         );
         dom
     } else {
@@ -1044,7 +1117,9 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
     let num_removed = num_targets - num_kept;
     info!(
         "  Variable selection result: {} kept, {} removed ({:.1}% reduction)",
-        num_kept, num_removed, 100.0 * num_removed as f64 / num_targets as f64
+        num_kept,
+        num_removed,
+        100.0 * num_removed as f64 / num_targets as f64
     );
 
     SelectionResult {
@@ -1077,9 +1152,7 @@ pub fn run_selection_from_index_with_stages(
     stages: &SelectionStages,
 ) -> SelectionResult {
     let groups = signature_collapse(index);
-    let n_no_eqc = (0..num_targets)
-        .filter(|&t| index.degree(t) == 0)
-        .count();
+    let n_no_eqc = (0..num_targets).filter(|&t| index.degree(t) == 0).count();
     info!(
         "  Stage 1 (signature collapse): {} transcripts → {} groups ({} with no EQ classes)",
         num_targets,
@@ -1212,12 +1285,7 @@ mod tests {
         //   EQC 1: {0, 1}   count=10
         //   EQC 2: {1, 2}   count=8
         //   EQC 3: {2}      count=3
-        let packed = build_packed_map(&[
-            (&[0], 5),
-            (&[0, 1], 10),
-            (&[1, 2], 8),
-            (&[2], 3),
-        ]);
+        let packed = build_packed_map(&[(&[0], 5), (&[0, 1], 10), (&[1, 2], 8), (&[2], 3)]);
         let index = TranscriptEqIndex::from_packed_eq_map(&packed, 3);
         let groups = signature_collapse(&index);
 
@@ -1231,7 +1299,10 @@ mod tests {
         // After removing 0 and 2, EQC {0,1} becomes degree-1 for target 1,
         // and EQC {1,2} becomes degree-1 for target 1.
         // So target 1 also becomes required via cascading.
-        assert!(required.iter().all(|&r| r), "all groups should be required after cascading");
+        assert!(
+            required.iter().all(|&r| r),
+            "all groups should be required after cascading"
+        );
     }
 
     #[test]
@@ -1301,12 +1372,7 @@ mod tests {
         //   EQC 1: {0, 1}   count=10
         //   EQC 2: {2}      count=15
         //   EQC 3: {3, 4}   count=8
-        let packed = build_packed_map(&[
-            (&[0], 20),
-            (&[0, 1], 10),
-            (&[2], 15),
-            (&[3, 4], 8),
-        ]);
+        let packed = build_packed_map(&[(&[0], 20), (&[0, 1], 10), (&[2], 15), (&[3, 4], 8)]);
         let result = run_selection(&packed, 5);
 
         // Targets 0 and 2: required (unique EQCs), kept
@@ -1353,7 +1419,10 @@ mod tests {
         let sig0 = merged.signature(0);
         let sig1 = merged.signature(1);
         let sig2 = merged.signature(2);
-        assert_ne!(sig0, sig1, "targets 0 and 1 should be distinguishable after merge");
+        assert_ne!(
+            sig0, sig1,
+            "targets 0 and 1 should be distinguishable after merge"
+        );
         assert_ne!(sig1, sig2);
         assert_ne!(sig0, sig2);
     }

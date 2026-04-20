@@ -10,14 +10,13 @@ use tracing::{info, warn};
 
 use crate::process_rad::{RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::MultiQuantOpts;
+use crate::utils::collapsed_eq::{CollapsedEqMap, build_collapsed};
 use crate::utils::em::{self, EMInfo};
 use crate::utils::eq_maps::{
     BasicEqLabel, BasicEqMap, EqLabel, EqMapType, OrientationProperty, PackedEqMap,
     RangeFactorizedEqLabel, RangeFactorizedEqMap,
 };
-use crate::utils::eq_serialize::{
-    EqMapTypeTag, SampleMeta, deserialize_eq_map, serialize_eq_map,
-};
+use crate::utils::eq_serialize::{EqMapTypeTag, SampleMeta, deserialize_eq_map, serialize_eq_map};
 use crate::utils::group_lasso;
 use crate::utils::hierarchical;
 use crate::utils::io;
@@ -62,8 +61,8 @@ fn parse_csv_manifest(path: &Path) -> Result<Vec<SampleEntry>> {
 
     let mut entries = Vec::new();
     for result in reader.deserialize() {
-        let entry: SampleEntry = result
-            .with_context(|| format!("Failed to parse CSV row in: {}", path.display()))?;
+        let entry: SampleEntry =
+            result.with_context(|| format!("Failed to parse CSV row in: {}", path.display()))?;
         entries.push(entry);
     }
 
@@ -197,8 +196,7 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
 
             match eq_map_type {
                 EqMapType::BasicEqMap => {
-                    let bundle =
-                        build_eq_map_from_rad(&rad_opts, BasicEqMap::new(eqmap_ori))?;
+                    let bundle = build_eq_map_from_rad(&rad_opts, BasicEqMap::new(eqmap_ori))?;
                     let meta = SampleMeta {
                         sample_name: sample.sample_name.clone(),
                         condition: sample.condition.clone(),
@@ -220,10 +218,8 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                     );
                 }
                 EqMapType::RangeFactorizedEqMap => {
-                    let bundle = build_eq_map_from_rad(
-                        &rad_opts,
-                        RangeFactorizedEqMap::new(eqmap_ori),
-                    )?;
+                    let bundle =
+                        build_eq_map_from_rad(&rad_opts, RangeFactorizedEqMap::new(eqmap_ori))?;
                     let meta = SampleMeta {
                         sample_name: sample.sample_name.clone(),
                         condition: sample.condition.clone(),
@@ -257,12 +253,15 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
         let mut all_deser = Vec::with_capacity(samples.len());
 
         for sample in &samples {
-            let pq_path = sample.output_dir.join(format!("{}.eqc.pq", sample.sample_name));
+            let pq_path = sample
+                .output_dir
+                .join(format!("{}.eqc.pq", sample.sample_name));
             let meta_path = sample
                 .output_dir
                 .join(format!("{}.eqmeta.json", sample.sample_name));
-            let (deser, meta) = deserialize_eq_map(&pq_path, &meta_path)
-                .with_context(|| format!("Failed to load EQ map for sample '{}'", sample.sample_name))?;
+            let (deser, meta) = deserialize_eq_map(&pq_path, &meta_path).with_context(|| {
+                format!("Failed to load EQ map for sample '{}'", sample.sample_name)
+            })?;
             all_deser.push(deser);
             all_meta.push(meta);
         }
@@ -319,8 +318,10 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                 bail!(
                     "EQ map type mismatch: sample '{}' has {:?} but sample '{}' has {:?}. \
                      All samples must use the same EQ map type.",
-                    samples[0].sample_name, eq_map_type_tag,
-                    samples[i].sample_name, meta.eq_map_type,
+                    samples[0].sample_name,
+                    eq_map_type_tag,
+                    samples[i].sample_name,
+                    meta.eq_map_type,
                 );
             }
         }
@@ -331,12 +332,33 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                 info!("Using basic equivalence classes");
                 let packed_maps: Vec<PackedEqMap<BasicEqLabel>> = all_deser
                     .into_iter()
-                    .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
+                    .map(|d| {
+                        PackedEqMap::from_raw(
+                            d.eq_labels,
+                            d.eq_label_starts,
+                            d.counts,
+                            d.contains_ori,
+                        )
+                    })
                     .collect();
                 if opts.group_lasso {
-                    run_phase_b_group_lasso(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                    run_phase_b_group_lasso(
+                        &packed_maps,
+                        &all_meta,
+                        &samples,
+                        opts,
+                        &conditions,
+                        num_targets,
+                    )?;
                 } else {
-                    run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                    run_phase_b_inner(
+                        &packed_maps,
+                        &all_meta,
+                        &samples,
+                        opts,
+                        &conditions,
+                        num_targets,
+                    )?;
                 }
             }
             EqMapTypeTag::RangeFactorized => {
@@ -347,18 +369,44 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
                     bail!(
                         "Bin count mismatch: serialized data used {} bins but current setting is {}. \
                          Use --factorized-eqc-bins {} to match.",
-                        meta_bins, current_bins, meta_bins,
+                        meta_bins,
+                        current_bins,
+                        meta_bins,
                     );
                 }
-                info!("Using range-factorized equivalence classes ({} bins)", meta_bins);
+                info!(
+                    "Using range-factorized equivalence classes ({} bins)",
+                    meta_bins
+                );
                 let packed_maps: Vec<PackedEqMap<RangeFactorizedEqLabel>> = all_deser
                     .into_iter()
-                    .map(|d| PackedEqMap::from_raw(d.eq_labels, d.eq_label_starts, d.counts, d.contains_ori))
+                    .map(|d| {
+                        PackedEqMap::from_raw(
+                            d.eq_labels,
+                            d.eq_label_starts,
+                            d.counts,
+                            d.contains_ori,
+                        )
+                    })
                     .collect();
                 if opts.group_lasso {
-                    run_phase_b_group_lasso(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                    run_phase_b_group_lasso(
+                        &packed_maps,
+                        &all_meta,
+                        &samples,
+                        opts,
+                        &conditions,
+                        num_targets,
+                    )?;
                 } else {
-                    run_phase_b_inner(&packed_maps, &all_meta, &samples, opts, &conditions, num_targets)?;
+                    run_phase_b_inner(
+                        &packed_maps,
+                        &all_meta,
+                        &samples,
+                        opts,
+                        &conditions,
+                        num_targets,
+                    )?;
                 }
             }
         }
@@ -369,9 +417,52 @@ pub fn run(opts: &MultiQuantOpts) -> Result<()> {
     Ok(())
 }
 
+/// Run standard (unpenalized) EM for a single sample's packed EC map.
+/// Works for either the positional or collapsed `PackedEqMap` variant.
+fn run_em_unpenalized<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eff_lengths: Vec<f64>,
+    opts: &MultiQuantOpts,
+) -> Vec<f64> {
+    let em_info = EMInfo::new(
+        packed,
+        eff_lengths,
+        opts.max_em_iter,
+        opts.convergence_thresh,
+        opts.presence_thresh,
+    );
+    if opts.num_threads > 1 {
+        em::em_par(&em_info, opts.num_threads)
+    } else {
+        em::em(&em_info)
+    }
+}
+
+/// Run penalized EM for a single sample's packed EC map with the given
+/// pseudo-counts vector.
+fn run_em_penalized<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eff_lengths: Vec<f64>,
+    alpha: &[f64],
+    opts: &MultiQuantOpts,
+) -> Vec<f64> {
+    let em_info = EMInfo::new(
+        packed,
+        eff_lengths,
+        opts.max_em_iter,
+        opts.convergence_thresh,
+        opts.presence_thresh,
+    );
+    if opts.num_threads > 1 {
+        em::em_penalized_par(&em_info, alpha, opts.num_threads)
+    } else {
+        em::em_penalized(&em_info, alpha)
+    }
+}
+
 /// Generic Phase B inner loop: runs hierarchical inference on packed EQ maps
 /// of any label type (BasicEqLabel or RangeFactorizedEqLabel).
-fn run_phase_b_inner<EqLabelT: EqLabel>(
+fn run_phase_b_inner<EqLabelT: EqLabel + 'static>(
     packed_maps: &[PackedEqMap<EqLabelT>],
     all_meta: &[SampleMeta],
     samples: &[SampleEntry],
@@ -383,10 +474,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
     let selection_mask: Option<Vec<bool>> = if opts.txp_selection {
         info!("Running multi-sample transcript variable selection...");
         use crate::utils::txp_selection;
-        let stages = opts
-            .selection_stages
-            .clone()
-            .unwrap_or_default();
+        let stages = opts.selection_stages.clone().unwrap_or_default();
         let indices: Vec<_> = packed_maps
             .iter()
             .map(|m| txp_selection::TranscriptEqIndex::from_packed_eq_map(m, num_targets))
@@ -406,17 +494,52 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
         None
     };
 
+    // Optional collapsed EC views: merge positional ECs that share the same
+    // (targets, prob_bins) key. The hierarchical Phase B does not run
+    // coverage smoothing, so when pos_bins > 1 and the label type is
+    // range-factorized we can always route per-sample EM through the
+    // collapsed map. All unique-EC / consensus counting below continues to
+    // use the positional maps.
+    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
+        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let use_collapsed =
+        is_range_factorized && !opts.no_collapsed_ec_em && opts.pos_bins > 1;
+    let collapsed_maps: Vec<Option<CollapsedEqMap>> = if use_collapsed {
+        info!(
+            "building collapsed EC views for {} sample{} (hierarchical EM will iterate over the collapsed map)",
+            packed_maps.len(),
+            if packed_maps.len() == 1 { "" } else { "s" }
+        );
+        packed_maps
+            .iter()
+            .map(|m| {
+                // SAFETY: `is_range_factorized` above verified EqLabelT == RangeFactorizedEqLabel.
+                let pos_map: &PackedEqMap<RangeFactorizedEqLabel> = unsafe {
+                    &*(m as *const PackedEqMap<EqLabelT>
+                        as *const PackedEqMap<RangeFactorizedEqLabel>)
+                };
+                Some(build_collapsed(pos_map))
+            })
+            .collect()
+    } else {
+        (0..packed_maps.len()).map(|_| None).collect()
+    };
+
     // Initialize Dirichlet-Multinomial hyperparameters.
     // α₀ = prior_weight × average total reads across samples.
-    let avg_total_reads: f64 = packed_maps.iter()
+    let avg_total_reads: f64 = packed_maps
+        .iter()
         .map(|m| m.total_weight() as f64)
         .sum::<f64>()
         / packed_maps.len() as f64;
     let alpha_0 = opts.prior_weight * avg_total_reads;
-    let mut hyperparams =
-        hierarchical::init_hyperparams(num_targets, conditions.to_vec(), alpha_0);
+    let mut hyperparams = hierarchical::init_hyperparams(num_targets, conditions.to_vec(), alpha_0);
 
-    let mode_label = if opts.spike_slab { "spike-and-slab" } else { "Dirichlet-Multinomial" };
+    let mode_label = if opts.spike_slab {
+        "spike-and-slab"
+    } else {
+        "Dirichlet-Multinomial"
+    };
     info!(
         "Starting hierarchical outer loop ({} iterations, α₀={:.1}, mode={})",
         opts.num_outer_iters, alpha_0, mode_label
@@ -468,20 +591,20 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
         for (i, sample) in samples.iter().enumerate() {
             info!("  Sample '{}'", sample.sample_name);
 
-            let em_info = EMInfo::new(
-                &packed_maps[i],
-                all_meta[i].eff_lengths.clone(),
-                opts.max_em_iter,
-                opts.convergence_thresh,
-                opts.presence_thresh,
-            );
-
             let counts = if is_init_iter {
                 // Standard EM to establish presence mask and data-driven estimates
-                let c = if opts.num_threads > 1 {
-                    em::em_par(&em_info, opts.num_threads)
+                let c = if let Some(cm) = collapsed_maps[i].as_ref() {
+                    run_em_unpenalized(
+                        &cm.packed,
+                        all_meta[i].eff_lengths.clone(),
+                        opts,
+                    )
                 } else {
-                    em::em(&em_info)
+                    run_em_unpenalized(
+                        &packed_maps[i],
+                        all_meta[i].eff_lengths.clone(),
+                        opts,
+                    )
                 };
                 let mask: Vec<bool> = c.iter().map(|&v| v > opts.presence_thresh).collect();
                 let n_present = mask.iter().filter(|&&b| b).count();
@@ -499,30 +622,29 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
                         &alpha_0_adaptive,
                     )
                 } else if opts.spike_slab {
-                    hierarchical::compute_pseudo_counts_spike_slab(
-                        &hyperparams,
-                        cond_idx,
-                        &gamma,
-                    )
+                    hierarchical::compute_pseudo_counts_spike_slab(&hyperparams, cond_idx, &gamma)
                 } else {
-                    hierarchical::compute_pseudo_counts(
-                        &hyperparams,
-                        cond_idx,
-                        &presence_masks[i],
-                    )
+                    hierarchical::compute_pseudo_counts(&hyperparams, cond_idx, &presence_masks[i])
                 };
 
-                if opts.num_threads > 1 {
-                    em::em_penalized_par(&em_info, &alpha, opts.num_threads)
+                if let Some(cm) = collapsed_maps[i].as_ref() {
+                    run_em_penalized(
+                        &cm.packed,
+                        all_meta[i].eff_lengths.clone(),
+                        &alpha,
+                        opts,
+                    )
                 } else {
-                    em::em_penalized(&em_info, &alpha)
+                    run_em_penalized(
+                        &packed_maps[i],
+                        all_meta[i].eff_lengths.clone(),
+                        &alpha,
+                        opts,
+                    )
                 }
             };
 
-            let present: Vec<bool> = counts
-                .iter()
-                .map(|&c| c > opts.presence_thresh)
-                .collect();
+            let present: Vec<bool> = counts.iter().map(|&c| c > opts.presence_thresh).collect();
 
             results.push(hierarchical::SampleResult {
                 counts: counts.clone(),
@@ -578,8 +700,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
             let mut unique_eq_counts = vec![0usize; num_targets];
             for packed_map in packed_maps.iter() {
                 for eqc_idx in 0..packed_map.len() {
-                    if packed_map.counts[eqc_idx] > 0
-                        && packed_map.num_targets_in_eqc(eqc_idx) == 1
+                    if packed_map.counts[eqc_idx] > 0 && packed_map.num_targets_in_eqc(eqc_idx) == 1
                     {
                         let s = packed_map.eq_label_starts[eqc_idx] as usize;
                         let target_id = packed_map.eq_labels[s] as usize;
@@ -612,8 +733,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
             info!("--- Consensus support filtering ---");
 
             let num_conditions = conditions.len();
-            let mut cond_counts: Vec<Vec<u32>> =
-                vec![vec![0u32; num_targets]; num_conditions];
+            let mut cond_counts: Vec<Vec<u32>> = vec![vec![0u32; num_targets]; num_conditions];
             let mut cond_n_reps: Vec<u32> = vec![0u32; num_conditions];
 
             for (i, _sample) in samples.iter().enumerate() {
@@ -643,8 +763,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
             let mut unique_eq_counts = vec![0usize; num_targets];
             for packed_map in packed_maps.iter() {
                 for eqc_idx in 0..packed_map.len() {
-                    if packed_map.counts[eqc_idx] > 0
-                        && packed_map.num_targets_in_eqc(eqc_idx) == 1
+                    if packed_map.counts[eqc_idx] > 0 && packed_map.num_targets_in_eqc(eqc_idx) == 1
                     {
                         let s = packed_map.eq_label_starts[eqc_idx] as usize;
                         let target_id = packed_map.eq_labels[s] as usize;
@@ -657,8 +776,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
                     consensus_support[t] = true;
                 }
             }
-            let n_unique_added = consensus_support.iter().filter(|&&b| b).count()
-                - n_before_unique;
+            let n_unique_added = consensus_support.iter().filter(|&&b| b).count() - n_before_unique;
             if n_unique_added > 0 {
                 info!(
                     "  Added {} transcripts via unique EQ class rule",
@@ -687,23 +805,30 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
         // unpenalized init counts (same "compute once" pattern as spike-and-slab γ).
         if opts.adaptive_variance && is_init_iter {
             info!("--- Variance-adaptive shrinkage ---");
-            let (sample_var, df, _mean_log) =
-                hierarchical::compute_log_count_variances(
-                    &prev_counts,
-                    &presence_masks,
-                    num_targets,
-                    1.0,
-                );
+            let (sample_var, df, _mean_log) = hierarchical::compute_log_count_variances(
+                &prev_counts,
+                &presence_masks,
+                num_targets,
+                1.0,
+            );
             let (d0, s0_sq) = hierarchical::fit_variance_prior(&sample_var, &df);
             info!("  Variance prior: d0={:.2}, s0_sq={:.4}", d0, s0_sq);
 
             let mod_var = hierarchical::compute_moderated_variances(
-                &sample_var, &df, d0, s0_sq, alpha_0, 1.0, 1.0,
+                &sample_var,
+                &df,
+                d0,
+                s0_sq,
+                alpha_0,
+                1.0,
+                1.0,
             );
 
             // Log summary statistics of the adaptive concentration
-            let mut sorted_a: Vec<f64> = mod_var.alpha_0_t.iter()
-                .filter(|a| **a < alpha_0 * 3.99)  // exclude clamped-at-max
+            let mut sorted_a: Vec<f64> = mod_var
+                .alpha_0_t
+                .iter()
+                .filter(|a| **a < alpha_0 * 3.99) // exclude clamped-at-max
                 .copied()
                 .collect();
             sorted_a.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -716,7 +841,9 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
                     q25, q50, q75, alpha_0
                 );
             }
-            let n_reduced = mod_var.alpha_0_t.iter()
+            let n_reduced = mod_var
+                .alpha_0_t
+                .iter()
                 .filter(|&&a| a < alpha_0 * 0.9)
                 .count();
             info!(
@@ -749,7 +876,11 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
                 .enumerate()
                 .map(|(t, &c)| {
                     let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
-                    if gamma[t] >= 0.5 && structural_ok { c } else { 0.0 }
+                    if gamma[t] >= 0.5 && structural_ok {
+                        c
+                    } else {
+                        0.0
+                    }
                 })
                 .collect()
         } else {
@@ -758,13 +889,21 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
                 .enumerate()
                 .map(|(t, &c)| {
                     let structural_ok = selection_mask.as_ref().is_none_or(|m| m[t]);
-                    if presence_masks[i][t] && structural_ok { c } else { 0.0 }
+                    if presence_masks[i][t] && structural_ok {
+                        c
+                    } else {
+                        0.0
+                    }
                 })
                 .collect()
         };
 
-        create_dir_all(&sample.output_dir)
-            .with_context(|| format!("Failed to create output dir: {}", sample.output_dir.display()))?;
+        create_dir_all(&sample.output_dir).with_context(|| {
+            format!(
+                "Failed to create output dir: {}",
+                sample.output_dir.display()
+            )
+        })?;
 
         let quant_path = sample
             .output_dir
@@ -839,7 +978,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel>(
 ///
 /// Runs per-sample EM for warm-start, then joint FISTA optimization
 /// with group L2 penalty to encourage shared sparsity across samples.
-fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
+fn run_phase_b_group_lasso<EqLabelT: EqLabel + 'static>(
     packed_maps: &[PackedEqMap<EqLabelT>],
     all_meta: &[SampleMeta],
     samples: &[SampleEntry],
@@ -851,10 +990,7 @@ fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
     let selection_mask: Option<Vec<bool>> = if opts.txp_selection {
         info!("Running multi-sample transcript variable selection...");
         use crate::utils::txp_selection;
-        let stages = opts
-            .selection_stages
-            .clone()
-            .unwrap_or_default();
+        let stages = opts.selection_stages.clone().unwrap_or_default();
         let indices: Vec<_> = packed_maps
             .iter()
             .map(|m| txp_selection::TranscriptEqIndex::from_packed_eq_map(m, num_targets))
@@ -870,7 +1006,10 @@ fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
             &stages,
         );
         let n_removed = result.keep_mask.iter().filter(|&&b| !b).count();
-        info!("  Selection removed {} / {} transcripts", n_removed, num_targets);
+        info!(
+            "  Selection removed {} / {} transcripts",
+            n_removed, num_targets
+        );
         Some(result.keep_mask)
     } else {
         None
@@ -905,7 +1044,11 @@ fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
         lam
     };
 
-    let scope_label = if opts.gl_per_condition { "per-condition" } else { "all-samples" };
+    let scope_label = if opts.gl_per_condition {
+        "per-condition"
+    } else {
+        "all-samples"
+    };
     info!(
         "Starting EM with group shrinkage (λ={:.6e}, max_iter={}, scope={})",
         lambda, opts.gl_max_iter, scope_label,
@@ -914,17 +1057,59 @@ fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
     // Step 4: Build effective lengths refs
     let eff_lens_refs: Vec<&[f64]> = all_meta.iter().map(|m| m.eff_lengths.as_slice()).collect();
 
-    // Step 5: Run EM with group shrinkage
-    let result_theta = group_lasso::em_group_shrinkage(
-        packed_maps,
-        &eff_lens_refs,
-        lambda,
-        &group_scope,
-        opts.gl_max_iter,
-        opts.max_em_iter,
-        opts.gl_convergence_thresh,
-        opts.presence_thresh,
-    );
+    // Step 5: Run EM with group shrinkage. Collapse the positional
+    // ECs when possible so the inner EM iterates over the smaller
+    // (targets, prob_bins) key space.
+    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
+        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let use_collapsed =
+        is_range_factorized && !opts.no_collapsed_ec_em && opts.pos_bins > 1;
+    let collapsed_packed: Option<Vec<PackedEqMap<crate::utils::collapsed_eq::CollapsedRangeFactorizedEqLabel>>> =
+        if use_collapsed {
+            info!(
+                "building collapsed EC views for {} samples (group-lasso EM will iterate over the collapsed map)",
+                packed_maps.len()
+            );
+            Some(
+                packed_maps
+                    .iter()
+                    .map(|m| {
+                        // SAFETY: `is_range_factorized` verified above.
+                        let pos_map: &PackedEqMap<RangeFactorizedEqLabel> = unsafe {
+                            &*(m as *const PackedEqMap<EqLabelT>
+                                as *const PackedEqMap<RangeFactorizedEqLabel>)
+                        };
+                        build_collapsed(pos_map).packed
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+    let result_theta = if let Some(ref cmaps) = collapsed_packed {
+        group_lasso::em_group_shrinkage(
+            cmaps.as_slice(),
+            &eff_lens_refs,
+            lambda,
+            &group_scope,
+            opts.gl_max_iter,
+            opts.max_em_iter,
+            opts.gl_convergence_thresh,
+            opts.presence_thresh,
+        )
+    } else {
+        group_lasso::em_group_shrinkage(
+            packed_maps,
+            &eff_lens_refs,
+            lambda,
+            &group_scope,
+            opts.gl_max_iter,
+            opts.max_em_iter,
+            opts.gl_convergence_thresh,
+            opts.presence_thresh,
+        )
+    };
 
     // Step 6: Count sparsity results
     let n_zero_rows = (0..num_targets)
@@ -951,8 +1136,12 @@ fn run_phase_b_group_lasso<EqLabelT: EqLabel>(
             })
             .collect();
 
-        create_dir_all(&sample.output_dir)
-            .with_context(|| format!("Failed to create output dir: {}", sample.output_dir.display()))?;
+        create_dir_all(&sample.output_dir).with_context(|| {
+            format!(
+                "Failed to create output dir: {}",
+                sample.output_dir.display()
+            )
+        })?;
 
         let quant_path = sample
             .output_dir
@@ -1110,14 +1299,16 @@ mod tests {
         use crate::utils::eq_maps::{BasicEqMap, OrientationProperty};
 
         let num_targets = theta.len();
-        assert!(num_targets % 2 == 0, "need even number of targets for pairing");
+        assert!(
+            num_targets % 2 == 0,
+            "need even number of targets for pairing"
+        );
 
         let mut eqm = BasicEqMap::new(OrientationProperty::OrientationAgnostic);
 
         for t in 0..num_targets {
             // Unique reads for this transcript
-            let n_unique =
-                (total_reads as f64 * theta[t] * unique_frac).round() as usize;
+            let n_unique = (total_reads as f64 * theta[t] * unique_frac).round() as usize;
             for _ in 0..n_unique {
                 eqm.add(BasicEqLabel::new(&[t as u32], None, None));
             }
@@ -1177,8 +1368,7 @@ mod tests {
         let num_targets = 8;
         let eff_lengths = vec![200.0; num_targets];
         let ref_lengths = vec![250u32; num_targets];
-        let ref_names: Vec<String> =
-            (0..num_targets).map(|i| format!("tx{}", i)).collect();
+        let ref_names: Vec<String> = (0..num_targets).map(|i| format!("tx{}", i)).collect();
 
         // Ground truth theta per condition (sums to 1.0)
         let control_theta = [0.30, 0.20, 0.10, 0.08, 0.10, 0.08, 0.07, 0.07];
@@ -1275,6 +1465,7 @@ mod tests {
             adaptive_variance: false,
             txp_selection: false,
             selection_stages: None,
+            no_collapsed_ec_em: false,
             group_lasso: false,
             gl_lambda: None,
             gl_max_iter: 500,
@@ -1363,8 +1554,7 @@ mod tests {
                 // Convert ecounts to proportions
                 let total: f64 = quant_data.iter().map(|(_, c)| c).sum();
                 assert!(total > 0.0, "Total estimated count should be positive");
-                let est_theta: Vec<f64> =
-                    quant_data.iter().map(|(_, c)| c / total).collect();
+                let est_theta: Vec<f64> = quant_data.iter().map(|(_, c)| c / total).collect();
 
                 // The top transcript should match ground truth direction:
                 // In control, tx0 should be the most abundant
@@ -1392,18 +1582,15 @@ mod tests {
 
                 // Spearman-like check: rank correlation should be positive
                 // (simplified: just check the top-2 match)
-                let mut gt_ranked: Vec<(usize, f64)> =
-                    gt.iter().copied().enumerate().collect();
+                let mut gt_ranked: Vec<(usize, f64)> = gt.iter().copied().enumerate().collect();
                 gt_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                 let mut est_ranked: Vec<(usize, f64)> =
                     est_theta.iter().copied().enumerate().collect();
                 est_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
                 // Top-2 ground truth transcripts should be in the top-4 estimated
-                let top2_gt: Vec<usize> =
-                    gt_ranked.iter().take(2).map(|(i, _)| *i).collect();
-                let top4_est: Vec<usize> =
-                    est_ranked.iter().take(4).map(|(i, _)| *i).collect();
+                let top2_gt: Vec<usize> = gt_ranked.iter().take(2).map(|(i, _)| *i).collect();
+                let top4_est: Vec<usize> = est_ranked.iter().take(4).map(|(i, _)| *i).collect();
                 for &t in &top2_gt {
                     assert!(
                         top4_est.contains(&t),

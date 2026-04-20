@@ -145,11 +145,7 @@ pub fn detect_library_type(counts: &OrientationCounts, paired_end: bool) -> (Lib
 }
 
 /// Emit warnings about strand bias based on detected library type.
-pub fn check_strand_warnings(
-    detected: LibraryType,
-    ratio: f64,
-    paired_end: bool,
-) {
+pub fn check_strand_warnings(detected: LibraryType, ratio: f64, paired_end: bool) {
     let (fw_like, rv_like_frac) = (ratio, 1.0 - ratio);
     let _ = paired_end; // used only for context in the message
 

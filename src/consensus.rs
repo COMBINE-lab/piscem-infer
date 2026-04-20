@@ -15,12 +15,15 @@ use tracing::info;
 use crate::multi_sample::{SampleEntry, parse_manifest};
 use crate::process_rad::{EqMapBundle, RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::{ConsensusQuantOpts, FilterMode};
+use crate::utils::collapsed_eq::{CollapsedEqMap, build_collapsed};
 use crate::utils::em::{
     EMInfo, em, em_init, em_par, em_par_init, em_par_with_pool, em_par_with_pool_init,
     em_penalized_init, em_penalized_par_init, em_penalized_par_with_pool_init, em_with_coverage,
     squarem_em, squarem_em_par, squarem_em_par_with_pool,
 };
-use crate::utils::eq_maps::{EqLabel, EqMap, OrientationProperty, PackedEqMap, TargetLabelsRef};
+use crate::utils::eq_maps::{
+    EqLabel, EqMap, OrientationProperty, PackedEqMap, RangeFactorizedEqLabel, TargetLabelsRef,
+};
 use crate::utils::hierarchical;
 use crate::utils::io;
 
@@ -613,6 +616,87 @@ fn sample_condition_indices(samples: &[SampleEntry], condition_names: &[String])
         .collect()
 }
 
+/// Phase-1 EM dispatch over any `PackedEqMap<L>`. `allow_coverage_smoothing`
+/// must be false when `packed` is a collapsed map (no positional bins).
+fn phase1_em_step<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eff_lengths: Vec<f64>,
+    opts: &ConsensusQuantOpts,
+    inner_threads: usize,
+    serial_inner_pool: Option<&rayon::ThreadPool>,
+    allow_coverage_smoothing: bool,
+) -> Vec<f64> {
+    let eminfo = EMInfo::new(
+        packed,
+        eff_lengths,
+        phase1_max_iter(opts),
+        phase1_convergence_thresh(opts),
+        opts.presence_thresh,
+    );
+    if allow_coverage_smoothing && opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
+        em_with_coverage(
+            &eminfo,
+            None,
+            opts.pos_bins as usize,
+            opts.coverage_smooth_rounds,
+            opts.coverage_epsilon,
+        )
+    } else if !opts.no_phase1_squarem {
+        if let Some(pool) = serial_inner_pool {
+            squarem_em_par_with_pool(&eminfo, pool)
+        } else if inner_threads > 1 {
+            squarem_em_par(&eminfo, inner_threads)
+        } else {
+            squarem_em(&eminfo)
+        }
+    } else if let Some(pool) = serial_inner_pool {
+        em_par_with_pool(&eminfo, pool)
+    } else if inner_threads > 1 {
+        em_par(&eminfo, inner_threads)
+    } else {
+        em(&eminfo)
+    }
+}
+
+/// Phase-2 EM dispatch over any `PackedEqMap<L>`. Always uses standard or
+/// penalized (non-SQUAREM) EM and requires a transcript-level mask to be
+/// applied via `EMInfo::apply_mask` before the EM call.
+#[allow(clippy::too_many_arguments)]
+fn phase2_em_step<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eff_lengths: Vec<f64>,
+    phase2_mask: &[bool],
+    init: Option<&[f64]>,
+    alpha: Option<&[f64]>,
+    opts: &ConsensusQuantOpts,
+    inner_threads: usize,
+    serial_inner_pool: Option<&rayon::ThreadPool>,
+) -> Vec<f64> {
+    let mut eminfo = EMInfo::new(
+        packed,
+        eff_lengths,
+        phase2_max_iter(opts),
+        phase2_convergence_thresh(opts),
+        opts.presence_thresh,
+    );
+    eminfo.apply_mask(phase2_mask);
+    if let Some(alpha) = alpha {
+        if let Some(pool) = serial_inner_pool {
+            em_penalized_par_with_pool_init(&eminfo, alpha, init, pool)
+        } else if inner_threads > 1 {
+            em_penalized_par_init(&eminfo, alpha, init, inner_threads)
+        } else {
+            em_penalized_init(&eminfo, alpha, init)
+        }
+    } else if let Some(pool) = serial_inner_pool {
+        em_par_with_pool_init(&eminfo, init, pool)
+    } else if inner_threads > 1 {
+        em_par_init(&eminfo, init, inner_threads)
+    } else {
+        em_init(&eminfo, init)
+    }
+}
+
 /// Core implementation generic over EQ label type.
 fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     opts: &ConsensusQuantOpts,
@@ -743,6 +827,42 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         None
     };
 
+    // ====== Optional: collapsed EC view for EM/SQUAREM ======
+    // Collapse positional ECs that share the same (targets, prob_bins) key.
+    // Semantics-preserving for the M-step (which reads only target_labels()
+    // and target_probs()). We gate on RangeFactorizedEqLabel (the only
+    // label type whose positional bins can be stripped), the
+    // `--no-collapsed-ec-em` override, pos_bins > 1 (otherwise nothing to
+    // collapse), and whether coverage-smoothing EM is active (it needs the
+    // positional map and hence blocks collapse).
+    let cov_smoothing_active = opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1;
+    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
+        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let use_collapsed = is_range_factorized
+        && !opts.no_collapsed_ec_em
+        && opts.pos_bins > 1
+        && !cov_smoothing_active;
+    let collapsed_maps: Vec<Option<CollapsedEqMap>> = if use_collapsed {
+        info!(
+            "building collapsed EC views for {} sample{} (EM will iterate over the collapsed map)",
+            n_samples,
+            if n_samples == 1 { "" } else { "s" }
+        );
+        bundles
+            .iter()
+            .map(|b| {
+                // SAFETY: `is_range_factorized` above verified EqLabelT == RangeFactorizedEqLabel.
+                let pos_map: &PackedEqMap<RangeFactorizedEqLabel> = unsafe {
+                    &*(&b.packed_eq_map as *const PackedEqMap<EqLabelT>
+                        as *const PackedEqMap<RangeFactorizedEqLabel>)
+                };
+                Some(build_collapsed(pos_map))
+            })
+            .collect()
+    } else {
+        (0..n_samples).map(|_| None).collect()
+    };
+
     // ====== Phase 1: Run initial per-sample EM ======
     info!("Phase 1: running initial EM for {} samples", n_samples);
 
@@ -762,31 +882,24 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         n_samples,
                         samples[i].sample_name
                     );
-                    let eminfo = EMInfo::new(
-                        &bundle.packed_eq_map,
-                        bundle.eff_lengths.clone(),
-                        phase1_max_iter(opts),
-                        phase1_convergence_thresh(opts),
-                        opts.presence_thresh,
-                    );
-                    let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
-                        em_with_coverage(
-                            &eminfo,
+                    let counts = if let Some(cm) = collapsed_maps[i].as_ref() {
+                        phase1_em_step(
+                            &cm.packed,
+                            bundle.eff_lengths.clone(),
+                            opts,
+                            inner_threads,
                             None,
-                            opts.pos_bins as usize,
-                            opts.coverage_smooth_rounds,
-                            opts.coverage_epsilon,
+                            false,
                         )
-                    } else if !opts.no_phase1_squarem {
-                        if inner_threads > 1 {
-                            squarem_em_par(&eminfo, inner_threads)
-                        } else {
-                            squarem_em(&eminfo)
-                        }
-                    } else if inner_threads > 1 {
-                        em_par(&eminfo, inner_threads)
                     } else {
-                        em(&eminfo)
+                        phase1_em_step(
+                            &bundle.packed_eq_map,
+                            bundle.eff_lengths.clone(),
+                            opts,
+                            inner_threads,
+                            None,
+                            true,
+                        )
                     };
                     Ok((i, counts))
                 })
@@ -805,35 +918,24 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 n_samples,
                 samples[i].sample_name
             );
-            let eminfo = EMInfo::new(
-                &bundle.packed_eq_map,
-                bundle.eff_lengths.clone(),
-                phase1_max_iter(opts),
-                phase1_convergence_thresh(opts),
-                opts.presence_thresh,
-            );
-            let counts = if opts.coverage_smooth_rounds > 0 && opts.pos_bins > 1 {
-                em_with_coverage(
-                    &eminfo,
-                    None,
-                    opts.pos_bins as usize,
-                    opts.coverage_smooth_rounds,
-                    opts.coverage_epsilon,
+            let counts = if let Some(cm) = collapsed_maps[i].as_ref() {
+                phase1_em_step(
+                    &cm.packed,
+                    bundle.eff_lengths.clone(),
+                    opts,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                    false,
                 )
-            } else if !opts.no_phase1_squarem {
-                if let Some(pool) = serial_inner_pool.as_ref() {
-                    squarem_em_par_with_pool(&eminfo, pool)
-                } else if inner_threads > 1 {
-                    squarem_em_par(&eminfo, inner_threads)
-                } else {
-                    squarem_em(&eminfo)
-                }
-            } else if let Some(pool) = serial_inner_pool.as_ref() {
-                em_par_with_pool(&eminfo, pool)
-            } else if inner_threads > 1 {
-                em_par(&eminfo, inner_threads)
             } else {
-                em(&eminfo)
+                phase1_em_step(
+                    &bundle.packed_eq_map,
+                    bundle.eff_lengths.clone(),
+                    opts,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                    true,
+                )
             };
             counts_vec.push(counts);
         }
@@ -1286,29 +1388,34 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         sample.sample_name
                     );
                     let phase2_mask = &phase2_sample_masks[i];
-                    let mut eminfo = EMInfo::new(
-                        &bundles[i].packed_eq_map,
-                        bundles[i].eff_lengths.clone(),
-                        phase2_max_iter(opts),
-                        phase2_convergence_thresh(opts),
-                        opts.presence_thresh,
-                    );
-                    eminfo.apply_mask(phase2_mask);
                     let init = if opts.no_phase2_warm_start {
                         None
                     } else {
                         Some(phase2_init_counts(&phase1_counts[i], phase2_mask))
                     };
-                    let em_res = if let Some(alpha) = phase2_prior_alpha.as_ref() {
-                        if inner_threads > 1 {
-                            em_penalized_par_init(&eminfo, &alpha[i], init.as_deref(), inner_threads)
-                        } else {
-                            em_penalized_init(&eminfo, &alpha[i], init.as_deref())
-                        }
-                    } else if inner_threads > 1 {
-                        em_par_init(&eminfo, init.as_deref(), inner_threads)
+                    let alpha = phase2_prior_alpha.as_ref().map(|a| a[i].as_slice());
+                    let em_res = if let Some(cm) = collapsed_maps[i].as_ref() {
+                        phase2_em_step(
+                            &cm.packed,
+                            bundles[i].eff_lengths.clone(),
+                            phase2_mask,
+                            init.as_deref(),
+                            alpha,
+                            opts,
+                            inner_threads,
+                            None,
+                        )
                     } else {
-                        em_init(&eminfo, init.as_deref())
+                        phase2_em_step(
+                            &bundles[i].packed_eq_map,
+                            bundles[i].eff_lengths.clone(),
+                            phase2_mask,
+                            init.as_deref(),
+                            alpha,
+                            opts,
+                            inner_threads,
+                            None,
+                        )
                     };
                     Ok((i, em_res))
                 })
@@ -1328,33 +1435,34 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 sample.sample_name
             );
             let phase2_mask = &phase2_sample_masks[i];
-            let mut eminfo = EMInfo::new(
-                &bundles[i].packed_eq_map,
-                bundles[i].eff_lengths.clone(),
-                phase2_max_iter(opts),
-                phase2_convergence_thresh(opts),
-                opts.presence_thresh,
-            );
-            eminfo.apply_mask(phase2_mask);
             let init = if opts.no_phase2_warm_start {
                 None
             } else {
                 Some(phase2_init_counts(&phase1_counts[i], phase2_mask))
             };
-            let em_res = if let Some(alpha) = phase2_prior_alpha.as_ref() {
-                if let Some(pool) = serial_inner_pool.as_ref() {
-                    em_penalized_par_with_pool_init(&eminfo, &alpha[i], init.as_deref(), pool)
-                } else if inner_threads > 1 {
-                    em_penalized_par_init(&eminfo, &alpha[i], init.as_deref(), inner_threads)
-                } else {
-                    em_penalized_init(&eminfo, &alpha[i], init.as_deref())
-                }
-            } else if let Some(pool) = serial_inner_pool.as_ref() {
-                em_par_with_pool_init(&eminfo, init.as_deref(), pool)
-            } else if inner_threads > 1 {
-                em_par_init(&eminfo, init.as_deref(), inner_threads)
+            let alpha = phase2_prior_alpha.as_ref().map(|a| a[i].as_slice());
+            let em_res = if let Some(cm) = collapsed_maps[i].as_ref() {
+                phase2_em_step(
+                    &cm.packed,
+                    bundles[i].eff_lengths.clone(),
+                    phase2_mask,
+                    init.as_deref(),
+                    alpha,
+                    opts,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                )
             } else {
-                em_init(&eminfo, init.as_deref())
+                phase2_em_step(
+                    &bundles[i].packed_eq_map,
+                    bundles[i].eff_lengths.clone(),
+                    phase2_mask,
+                    init.as_deref(),
+                    alpha,
+                    opts,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                )
             };
             results.push((i, em_res));
         }

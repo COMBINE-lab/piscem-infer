@@ -127,9 +127,7 @@ fn poisson_nll_and_gradient<EqLabelT: EqLabel>(
 
             // Compute λ_cs = Σ_t p_ct · θ[s][t] / eff_len[t]
             let mut lambda_cs = 0.0_f64;
-            for (&target_id, &p) in
-                label.target_labels().iter().zip(norm_probs.iter())
-            {
+            for (&target_id, &p) in label.target_labels().iter().zip(norm_probs.iter()) {
                 let t = target_id as usize;
                 lambda_cs += p * theta.theta[s][t] * inv_eff_lens[t];
             }
@@ -142,9 +140,7 @@ fn poisson_nll_and_gradient<EqLabelT: EqLabel>(
 
             // Gradient contribution
             let ratio = 1.0 - count / lambda_cs_safe;
-            for (&target_id, &p) in
-                label.target_labels().iter().zip(norm_probs.iter())
-            {
+            for (&target_id, &p) in label.target_labels().iter().zip(norm_probs.iter()) {
                 let t = target_id as usize;
                 grad.theta[s][t] += p * inv_eff_lens[t] * ratio;
             }
@@ -501,9 +497,7 @@ pub fn compute_bic<EqLabelT: EqLabel>(
     // Count non-zero transcript rows (or groups for per-condition)
     let k = match scope {
         GroupScope::AllSamples => (0..theta.num_targets)
-            .filter(|&t| {
-                (0..theta.num_samples).any(|s| theta.theta[s][t] > 0.0)
-            })
+            .filter(|&t| (0..theta.num_samples).any(|s| theta.theta[s][t] > 0.0))
             .count(),
         GroupScope::PerCondition {
             condition_indices,
@@ -528,7 +522,9 @@ pub fn compute_bic<EqLabelT: EqLabel>(
     // k parameters per active group, times num_samples (or num_samples_in_condition)
     let effective_k = match scope {
         GroupScope::AllSamples => k * theta.num_samples,
-        GroupScope::PerCondition { condition_indices, .. } => {
+        GroupScope::PerCondition {
+            condition_indices, ..
+        } => {
             // For simplicity, use k * avg_samples_per_condition
             // Actually each active group has its condition's sample count
             // For BIC, just count total free parameters
@@ -654,9 +650,7 @@ pub fn em_group_shrinkage<EqLabelT: EqLabel>(
                     }
                     if denom > 1e-8 {
                         let count_over_denom = count / denom;
-                        for (&target_id, w) in
-                            label.target_labels().iter().zip(weights.iter())
-                        {
+                        for (&target_id, w) in label.target_labels().iter().zip(weights.iter()) {
                             curr_counts[target_id as usize] += count_over_denom * w;
                         }
                     }
@@ -706,9 +700,7 @@ pub fn em_group_shrinkage<EqLabelT: EqLabel>(
                 }
                 if denom > 1e-8 {
                     let count_over_denom = count / denom;
-                    for (&target_id, w) in
-                        label.target_labels().iter().zip(weights.iter())
-                    {
+                    for (&target_id, w) in label.target_labels().iter().zip(weights.iter()) {
                         curr_counts[target_id as usize] += count_over_denom * w;
                     }
                 }
@@ -1026,12 +1018,12 @@ mod tests {
         let result = em_group_shrinkage(
             &packed_maps,
             &eff_lens_refs,
-            5.0,   // lambda
+            5.0, // lambda
             &scope,
-            20,    // outer iters
-            100,   // max EM iters
-            1e-6,  // convergence thresh
-            1e-8,  // presence thresh
+            20,   // outer iters
+            100,  // max EM iters
+            1e-6, // convergence thresh
+            1e-8, // presence thresh
         );
 
         // Txp 0 must remain active

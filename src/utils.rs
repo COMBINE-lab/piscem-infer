@@ -1,3 +1,4 @@
+pub mod collapsed_eq;
 pub mod em;
 pub mod eq_maps;
 pub mod eq_serialize;

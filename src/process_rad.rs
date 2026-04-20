@@ -20,10 +20,12 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
-use crate::utils::gibbs::{do_gibbs, do_gibbs_with_pool};
+use crate::utils::collapsed_eq::build_collapsed;
 use crate::utils::eq_maps::{
-    BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
+    BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqLabel,
+    RangeFactorizedEqMap,
 };
+use crate::utils::gibbs::{do_gibbs, do_gibbs_with_pool};
 use crate::utils::io;
 use crate::utils::map_record_types::{
     LibraryType, OrientationCounts, check_strand_warnings, detect_library_type,
@@ -35,9 +37,8 @@ use crate::{
 use crate::{
     fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
-        EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params,
-        do_bootstrap, do_bootstrap_with_pool, em, em_par_with_pool, squarem_em,
-        squarem_em_par_with_pool,
+        EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
+        do_bootstrap_with_pool, em, em_par_with_pool, squarem_em, squarem_em_par_with_pool,
     },
 };
 
@@ -238,9 +239,12 @@ fn detect_lib_type_from_sample<T: Read>(
     info!(
         "Auto-detection sampled {} reads: forward={}, reverse={}, FR={}, RF={}, FF={}, RR={}, unknown={}",
         sampled,
-        counts.forward, counts.reverse,
-        counts.forward_reverse, counts.reverse_forward,
-        counts.forward_forward, counts.reverse_reverse,
+        counts.forward,
+        counts.reverse,
+        counts.forward_reverse,
+        counts.reverse_forward,
+        counts.forward_forward,
+        counts.reverse_reverse,
         counts.unknown
     );
 
@@ -290,8 +294,7 @@ fn detect_lib_type_and_fld_from_sample<T: Read>(
             let nm = mappings.positions.len();
             if nm == 1
                 && !ft.is_orphan()
-                && let (Some(o), Some(fl)) =
-                    (mappings.dirs.first(), mappings.frag_lengths.first())
+                && let (Some(o), Some(fl)) = (mappings.dirs.first(), mappings.frag_lengths.first())
             {
                 temp_frag_lengths_by_ori[u32::from(*o) as usize][*fl as usize] += 1;
                 param_est_frags -= 1;
@@ -306,9 +309,12 @@ fn detect_lib_type_and_fld_from_sample<T: Read>(
     info!(
         "Auto-detection sampled {} reads: forward={}, reverse={}, FR={}, RF={}, FF={}, RR={}, unknown={}",
         sampled,
-        counts.forward, counts.reverse,
-        counts.forward_reverse, counts.reverse_forward,
-        counts.forward_forward, counts.reverse_reverse,
+        counts.forward,
+        counts.reverse,
+        counts.forward_reverse,
+        counts.reverse_forward,
+        counts.forward_forward,
+        counts.reverse_reverse,
         counts.unknown
     );
 
@@ -484,9 +490,18 @@ pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send + 'static>(
             _ => info!("unknown alignment-level tag {}", at.name),
         }
     }
-    assert!(found_ref_ori_t, "required alignment-level tag \"{REF_ORI_NAME}\" is missing");
-    assert!(found_pos_t, "required alignment-level tag \"{POS_NAME}\" is missing");
-    assert!(found_fraglen_t, "required alignment-level tag \"{FRAGLEN_NAME}\" is missing");
+    assert!(
+        found_ref_ori_t,
+        "required alignment-level tag \"{REF_ORI_NAME}\" is missing"
+    );
+    assert!(
+        found_pos_t,
+        "required alignment-level tag \"{POS_NAME}\" is missing"
+    );
+    assert!(
+        found_fraglen_t,
+        "required alignment-level tag \"{FRAGLEN_NAME}\" is missing"
+    );
 
     const REF_LENGTHS_NAME: &str = "ref_lengths";
     let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
@@ -607,7 +622,9 @@ pub fn build_eq_map_from_rad<EqLabelT: EqLabel + Send + 'static>(
     );
     info!(
         "total equivalence map weight = {}",
-        packed_eq_map.total_weight().to_formatted_string(&Locale::en)
+        packed_eq_map
+            .total_weight()
+            .to_formatted_string(&Locale::en)
     );
 
     Ok(EqMapBundle {
@@ -627,12 +644,6 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
     eqc_map: EqMap<EqLabelT>,
 ) -> anyhow::Result<()> {
     let output = quant_opts.output.clone();
-    let max_iter = quant_opts.max_iter;
-    let convergence_thresh = quant_opts.convergence_thresh;
-    let presence_thresh = quant_opts.presence_thresh;
-    let num_bootstraps = quant_opts.num_bootstraps;
-    let num_gibbs_samples = quant_opts.num_gibbs_samples;
-    let gibbs_thinning_factor = quant_opts.gibbs_thinning_factor;
     let num_threads = quant_opts.num_threads;
     let em_pool = if num_threads > 1 {
         Some(
@@ -662,7 +673,6 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         num_threads: quant_opts.num_threads,
     };
     let bundle = build_eq_map_from_rad(&rad_opts, eqc_map)?;
-    let frag_lengths = bundle.frag_lengths;
 
     let transcript_mask = if let Some(mask_path) = quant_opts.transcript_mask.as_deref() {
         info!("Applying transcript mask from {}", mask_path.display());
@@ -692,13 +702,11 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         None
     };
 
-    // Optional transcript variable selection
+    // Optional transcript variable selection runs on the positional/basic
+    // packed map (before any EC collapsing).
     let selection_mask = if quant_opts.txp_selection {
         info!("Running transcript variable selection...");
-        let stages = quant_opts
-            .selection_stages
-            .clone()
-            .unwrap_or_default();
+        let stages = quant_opts.selection_stages.clone().unwrap_or_default();
         let result = crate::utils::txp_selection::run_selection_with_stages(
             &bundle.packed_eq_map,
             bundle.ref_names.len(),
@@ -709,18 +717,106 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         None
     };
 
+    // Decide whether to route EM/SQUAREM/Gibbs/bootstrap through a
+    // collapsed (pos-bin-stripped) view of the equivalence class map.
+    // The collapse is semantics-preserving for M-steps that read only
+    // target_labels() + target_probs() (true for standard EM, bootstrap,
+    // and the Gibbs multinomial reassignment). Coverage-smoothing EM
+    // must see the positional map because `target_pos_bins()` is
+    // required by its M-step — so we fall back to the positional map
+    // whenever coverage smoothing is active.
+    let cov_smoothing_active =
+        quant_opts.coverage_smooth_rounds > 0 && quant_opts.pos_bins > 1;
+    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
+        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let use_collapsed = is_range_factorized
+        && !quant_opts.no_collapsed_ec_em
+        && quant_opts.pos_bins > 1
+        && !cov_smoothing_active;
+
+    if use_collapsed {
+        // SAFETY: is_range_factorized was verified via TypeId above.
+        let pos_map: &PackedEqMap<RangeFactorizedEqLabel> = unsafe {
+            &*(&bundle.packed_eq_map as *const PackedEqMap<EqLabelT>
+                as *const PackedEqMap<RangeFactorizedEqLabel>)
+        };
+        info!(
+            "building collapsed EC view over {} positional ECs",
+            pos_map.len().to_formatted_string(&Locale::en)
+        );
+        let collapsed = build_collapsed(pos_map);
+        info!(
+            "collapsed view has {} ECs ({} → {})",
+            collapsed.len().to_formatted_string(&Locale::en),
+            pos_map.len().to_formatted_string(&Locale::en),
+            collapsed.len().to_formatted_string(&Locale::en)
+        );
+        run_inference_and_output(
+            &collapsed.packed,
+            &bundle,
+            transcript_mask.as_deref(),
+            selection_mask.as_deref(),
+            em_pool.as_ref(),
+            &quant_opts,
+            &output,
+            /* allow_coverage_smoothing = */ false,
+        )
+    } else {
+        run_inference_and_output(
+            &bundle.packed_eq_map,
+            &bundle,
+            transcript_mask.as_deref(),
+            selection_mask.as_deref(),
+            em_pool.as_ref(),
+            &quant_opts,
+            &output,
+            /* allow_coverage_smoothing = */ true,
+        )
+    }
+}
+
+/// Run the post-bundle inference (EM / bootstrap / Gibbs) and write all
+/// outputs. `packed` is the EC map actually used for inference; it can
+/// be either the positional/basic map from `bundle` or a collapsed view
+/// of it (with a different `EqLabelT`). `bundle` is only read for its
+/// per-transcript data (effective lengths, ref names, fragment stats).
+///
+/// When `allow_coverage_smoothing` is false, the caller has passed a
+/// map without positional bins, so `em_with_coverage` is skipped even if
+/// the flags would normally trigger it.
+#[allow(clippy::too_many_arguments)]
+fn run_inference_and_output<EqLabelT: EqLabel, BundleEqLabelT: EqLabel>(
+    packed: &PackedEqMap<EqLabelT>,
+    bundle: &EqMapBundle<BundleEqLabelT>,
+    transcript_mask: Option<&[bool]>,
+    selection_mask: Option<&[bool]>,
+    em_pool: Option<&rayon::ThreadPool>,
+    quant_opts: &QuantOpts,
+    output: &Path,
+    allow_coverage_smoothing: bool,
+) -> anyhow::Result<()> {
+    let max_iter = quant_opts.max_iter;
+    let convergence_thresh = quant_opts.convergence_thresh;
+    let presence_thresh = quant_opts.presence_thresh;
+    let num_bootstraps = quant_opts.num_bootstraps;
+    let num_gibbs_samples = quant_opts.num_gibbs_samples;
+    let gibbs_thinning_factor = quant_opts.gibbs_thinning_factor;
+
     let mut eminfo = EMInfo::new(
-        &bundle.packed_eq_map,
+        packed,
         bundle.eff_lengths.clone(),
         max_iter,
         convergence_thresh,
         presence_thresh,
     );
-    if let Some(ref mask) = transcript_mask {
+    if let Some(mask) = transcript_mask {
         eminfo.apply_mask(mask);
     }
 
-    let em_res = if quant_opts.coverage_smooth_rounds > 0 && quant_opts.pos_bins > 1 {
+    let em_res = if allow_coverage_smoothing
+        && quant_opts.coverage_smooth_rounds > 0
+        && quant_opts.pos_bins > 1
+    {
         crate::utils::em::em_with_coverage(
             &eminfo,
             None,
@@ -729,19 +825,19 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
             quant_opts.coverage_epsilon,
         )
     } else if !quant_opts.no_squarem {
-        if let Some(pool) = em_pool.as_ref() {
+        if let Some(pool) = em_pool {
             squarem_em_par_with_pool(&eminfo, pool)
         } else {
             squarem_em(&eminfo)
         }
-    } else if let Some(pool) = em_pool.as_ref() {
+    } else if let Some(pool) = em_pool {
         em_par_with_pool(&eminfo, pool)
     } else {
         em(&eminfo)
     };
 
     // Apply selection mask: zero out structurally redundant transcripts
-    let em_res = if let Some(ref mask) = selection_mask {
+    let em_res = if let Some(mask) = selection_mask {
         em_res
             .iter()
             .enumerate()
@@ -751,7 +847,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         em_res
     };
 
-    let quant_output = output.with_additional_extension(".quant");
+    let quant_output = output.to_path_buf().with_additional_extension(".quant");
     io::write_results(
         &quant_output,
         &bundle.ref_names,
@@ -762,17 +858,16 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
     .context("failed to write quant output")?;
 
     {
-        let fld_array = UInt32Array::from_vec(frag_lengths);
+        let fld_array = UInt32Array::from_vec(bundle.frag_lengths.clone());
         let field = Field::new("fragment_length_dist", fld_array.data_type().clone(), false);
-
         let chunk = Chunk::new(vec![fld_array.boxed()]);
         let fields = vec![field];
-        io::write_fld_file(&output, fields, chunk)?;
+        io::write_fld_file(output, fields, chunk)?;
     }
 
     if num_bootstraps > 0 {
         info!("performing bootstraps");
-        let bootstraps = if let Some(pool) = em_pool.as_ref() {
+        let bootstraps = if let Some(pool) = em_pool {
             do_bootstrap_with_pool(&eminfo, num_bootstraps, pool)
         } else {
             do_bootstrap(&eminfo, num_bootstraps)
@@ -790,12 +885,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
             new_arrays.push(bs_array.boxed());
         }
         let chunk = Chunk::new(new_arrays);
-        io::write_infrep_file(&output, bs_fields, chunk)?;
+        io::write_infrep_file(output, bs_fields, chunk)?;
     }
 
     if num_gibbs_samples > 0 {
-        info!("performing Gibbs sampling ({num_gibbs_samples} samples, thinning factor {gibbs_thinning_factor})");
-        let gibbs_samples = if let Some(pool) = em_pool.as_ref() {
+        info!(
+            "performing Gibbs sampling ({num_gibbs_samples} samples, thinning factor {gibbs_thinning_factor})"
+        );
+        let gibbs_samples = if let Some(pool) = em_pool {
             do_gibbs_with_pool(
                 &eminfo,
                 &em_res,
@@ -819,7 +916,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
             new_arrays.push(gs_array.boxed());
         }
         let chunk = Chunk::new(new_arrays);
-        io::write_infrep_file(&output, gs_fields, chunk)?;
+        io::write_infrep_file(output, gs_fields, chunk)?;
     }
 
     let infrep_method = if num_gibbs_samples > 0 {
@@ -830,7 +927,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
         "none"
     };
 
-    let meta_info_output = output.with_additional_extension(".meta_info.json");
+    let meta_info_output = output.to_path_buf().with_additional_extension(".meta_info.json");
     let ofile = File::create(meta_info_output)?;
     let meta_info = json!({
         "quant_opts": quant_opts,
@@ -953,8 +1050,7 @@ fn process_parallel<EqLabelT: EqLabel + Send + 'static>(
         .collect();
 
     // Main thread: fill the work queue (blocks until all chunks are enqueued).
-    let _ = rad_reader
-        .start_chunk_parsing(libradicl::readers::EMPTY_METACHUNK_CALLBACK);
+    let _ = rad_reader.start_chunk_parsing(libradicl::readers::EMPTY_METACHUNK_CALLBACK);
 
     // Collect and merge worker results.
     let mut merged = EqMap::new(if contains_ori {
@@ -1026,10 +1122,26 @@ fn process<T: Read + Send, EqLabelT: EqLabel + Send>(
 ) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
     match fld_pdf {
         Fld::Empirical(f) => process_dispatch(
-            br, nrec, record_context, lib_type, mapped_stats, ref_lengths, f, eq_map, num_threads,
+            br,
+            nrec,
+            record_context,
+            lib_type,
+            mapped_stats,
+            ref_lengths,
+            f,
+            eq_map,
+            num_threads,
         ),
         Fld::Parametric(f) => process_dispatch(
-            br, nrec, record_context, lib_type, mapped_stats, ref_lengths, f, eq_map, num_threads,
+            br,
+            nrec,
+            record_context,
+            lib_type,
+            mapped_stats,
+            ref_lengths,
+            f,
+            eq_map,
+            num_threads,
         ),
     }
 }
@@ -1149,9 +1261,11 @@ fn process_dispatch<T: Read + Send, D: FldPDF + Sync, EqLabelT: EqLabel + Send>(
 ) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
     let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(1));
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} Processed {human_pos} reads [{elapsed_precise}]")
-            .unwrap()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        ProgressStyle::with_template(
+            "{spinner:.green} Processed {human_pos} reads [{elapsed_precise}]",
+        )
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
     );
     pb.enable_steady_tick(Duration::from_secs(1));
 
@@ -1179,8 +1293,7 @@ fn process_dispatch<T: Read + Send, D: FldPDF + Sync, EqLabelT: EqLabel + Send>(
         let mut senders = Vec::with_capacity(n_workers);
         let mut receivers = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
-            let (tx, rx) =
-                std::sync::mpsc::sync_channel::<chunk::Chunk<PiscemBulkReadRecord>>(2);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<chunk::Chunk<PiscemBulkReadRecord>>(2);
             senders.push(tx);
             receivers.push(Some(rx));
         }

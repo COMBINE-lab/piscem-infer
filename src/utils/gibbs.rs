@@ -1,9 +1,9 @@
 use rand::prelude::*;
 use rand::rng;
-use rand_distr::weighted::WeightedIndex;
 use rand_distr::Gamma;
-use rayon::prelude::*;
+use rand_distr::weighted::WeightedIndex;
 use rayon::ThreadPool;
+use rayon::prelude::*;
 use tracing::info;
 
 use crate::utils::em::EMInfo;

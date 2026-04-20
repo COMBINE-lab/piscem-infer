@@ -9,8 +9,7 @@ fn main() {
     let path = env::args().nth(1).expect("need path arg");
     let file = File::open(&path).unwrap();
     let reader = BufReader::new(file);
-    let metadata =
-        pq_read::read_metadata(&mut BufReader::new(File::open(&path).unwrap())).unwrap();
+    let metadata = pq_read::read_metadata(&mut BufReader::new(File::open(&path).unwrap())).unwrap();
     let schema = pq_read::infer_schema(&metadata).unwrap();
     let mut file_reader = FileReader::new(reader, metadata.row_groups, schema, None, None, None);
     let chunk = file_reader.next().unwrap().unwrap();
@@ -65,10 +64,7 @@ fn main() {
             .collect();
         labels.sort();
         let count = counts_array.value(i);
-        target_set_counts
-            .entry(labels)
-            .or_default()
-            .push(count);
+        target_set_counts.entry(labels).or_default().push(count);
     }
     let mut lens: Vec<_> = len_counts.into_iter().collect();
     lens.sort();
@@ -78,10 +74,7 @@ fn main() {
     }
 
     let n_unique_sets = target_set_counts.len();
-    let n_duplicated = target_set_counts
-        .values()
-        .filter(|v| v.len() > 1)
-        .count();
+    let n_duplicated = target_set_counts.values().filter(|v| v.len() > 1).count();
     let n_dup_entries: usize = target_set_counts
         .values()
         .filter(|v| v.len() > 1)

@@ -208,6 +208,11 @@ pub struct QuantOpts {
     /// Only used when --txp-selection is enabled. Default: all stages.
     #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
     pub selection_stages: Option<SelectionStages>,
+    /// disable the collapsed-EC optimization for EM/SQUAREM/Gibbs/bootstrap.
+    /// When set, EM iterates over the full positional equivalence-class map.
+    /// Provided for A/B timing and output comparison.
+    #[arg(long, help_heading = "Advanced")]
+    pub no_collapsed_ec_em: bool,
 }
 
 #[derive(Args, Serialize, Clone, Debug)]
@@ -308,6 +313,11 @@ pub struct MultiQuantOpts {
     /// Only used when --txp-selection is enabled. Default: all stages.
     #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
     pub selection_stages: Option<SelectionStages>,
+    /// disable the collapsed-EC optimization for EM/SQUAREM/Gibbs/bootstrap.
+    /// When set, EM iterates over the full positional equivalence-class map.
+    /// Provided for A/B timing and output comparison.
+    #[arg(long, help_heading = "Advanced")]
+    pub no_collapsed_ec_em: bool,
 
     // --- Group LASSO ---
     /// use group LASSO sparse inference instead of hierarchical EM.
@@ -523,6 +533,11 @@ pub struct ConsensusQuantOpts {
     /// Only used when --txp-selection is enabled. Default: all stages.
     #[arg(long, requires = "txp_selection", value_parser = parse_selection_stages, help_heading = "Advanced")]
     pub selection_stages: Option<SelectionStages>,
+    /// disable the collapsed-EC optimization for EM/SQUAREM/Gibbs/bootstrap.
+    /// When set, EM iterates over the full positional equivalence-class map.
+    /// Provided for A/B timing and output comparison.
+    #[arg(long, help_heading = "Advanced")]
+    pub no_collapsed_ec_em: bool,
 }
 
 #[derive(Debug, Subcommand)]

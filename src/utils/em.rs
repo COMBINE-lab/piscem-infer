@@ -2,8 +2,8 @@ use atomic_float::AtomicF64;
 use rand::prelude::*;
 use rand::rng;
 use rand_distr::weighted::WeightedAliasIndex;
-use rayon::prelude::*;
 use rayon::ThreadPool;
+use rayon::prelude::*;
 use std::sync::atomic::Ordering;
 use tracing::info;
 
@@ -101,9 +101,15 @@ pub fn compute_positional_eff_lens(
     // Normalize FLD to probabilities
     let total_count: f64 = frag_length_counts.iter().map(|&x| x as f64).sum();
     let fld_probs: Vec<f64> = if total_count > 0.0 {
-        frag_length_counts.iter().map(|&x| x as f64 / total_count).collect()
+        frag_length_counts
+            .iter()
+            .map(|&x| x as f64 / total_count)
+            .collect()
     } else {
-        return (vec![0.0; ref_lens.len() * n_pos_bins], vec![0.0; ref_lens.len()]);
+        return (
+            vec![0.0; ref_lens.len() * n_pos_bins],
+            vec![0.0; ref_lens.len()],
+        );
     };
 
     // Find max fragment length with nonzero probability
@@ -280,7 +286,13 @@ fn initial_counts(eff_lens: &[f64], total_weight: f64, init_counts: Option<&[f64
         let counts = init
             .iter()
             .zip(eff_lens.iter())
-            .map(|(&c, &el)| if el > 0.0 && c.is_finite() && c > 0.0 { c } else { 0.0 })
+            .map(|(&c, &el)| {
+                if el > 0.0 && c.is_finite() && c > 0.0 {
+                    c
+                } else {
+                    0.0
+                }
+            })
             .collect::<Vec<f64>>();
         if counts.iter().any(|&x| x > 0.0) {
             return counts;
@@ -450,7 +462,6 @@ fn should_try_squarem(step_count: u32, rel_diff: f64, opts: SquaremOptions) -> b
         && rel_diff > 10.0 * f64::EPSILON
 }
 
-
 pub fn do_bootstrap<EqLabelT: EqLabel>(
     em_info: &EMInfo<EqLabelT>,
     num_boot: usize,
@@ -498,12 +509,7 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                 }
 
                 while niter < max_iter {
-                    m_step(
-                        em_info,
-                        &base_counts,
-                        &prev_counts,
-                        &mut curr_counts,
-                    );
+                    m_step(em_info, &base_counts, &prev_counts, &mut curr_counts);
 
                     rel_diff = compute_rel_diff(&prev_counts, &curr_counts, presence_thresh);
 
@@ -521,12 +527,7 @@ fn do_bootstrap_in_pool<EqLabelT: EqLabel>(
                         *x = 0.0
                     }
                 });
-                m_step(
-                    em_info,
-                    &base_counts,
-                    &prev_counts,
-                    &mut curr_counts,
-                );
+                m_step(em_info, &base_counts, &prev_counts, &mut curr_counts);
 
                 curr_counts
             })
@@ -693,8 +694,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
                 em_step_plain(em_info, &x_sq, &mut x_next);
                 em_steps += 1;
                 let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
-                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0)
-                    && candidate_rel < ordinary_rel
+                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel
                 {
                     accel_accepts += 1;
                     &x_next
@@ -820,8 +820,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
                 );
                 em_steps += 1;
                 let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
-                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0)
-                    && candidate_rel < ordinary_rel
+                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel
                 {
                     accel_accepts += 1;
                     x_next
@@ -847,8 +846,13 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
             *x = 0.0;
         }
     });
-    let final_counts =
-        em_step_plain_par_in_pool::<EqLabelT>(&eq_iterates, inv_eff_lens, &x0, &mut curr_counts, pool);
+    let final_counts = em_step_plain_par_in_pool::<EqLabelT>(
+        &eq_iterates,
+        inv_eff_lens,
+        &x0,
+        &mut curr_counts,
+        pool,
+    );
     info!(
         "SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
         em_steps, accel_attempts, accel_accepts, last_rel_diff
@@ -863,10 +867,7 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
 /// unlike post-hoc L-BFGS which can only reweight the point estimate.
 ///
 /// Returns the final estimated counts (not normalized).
-pub fn em_penalized<EqLabelT: EqLabel>(
-    em_info: &EMInfo<EqLabelT>,
-    alpha: &[f64],
-) -> Vec<f64> {
+pub fn em_penalized<EqLabelT: EqLabel>(em_info: &EMInfo<EqLabelT>, alpha: &[f64]) -> Vec<f64> {
     em_penalized_init(em_info, alpha, None)
 }
 
@@ -983,10 +984,7 @@ pub fn em_penalized_par_with_pool_init<EqLabelT: EqLabel>(
 
     // init
     let init = initial_counts(eff_lens, total_weight, init_counts);
-    let mut prev_counts: Vec<AtomicF64> = init
-        .iter()
-        .map(|x| AtomicF64::new(*x))
-        .collect();
+    let mut prev_counts: Vec<AtomicF64> = init.iter().map(|x| AtomicF64::new(*x)).collect();
     let mut curr_counts: Vec<AtomicF64> = vec![0.0f64; eff_lens.len()]
         .iter()
         .map(|x| AtomicF64::new(*x))
@@ -1128,9 +1126,15 @@ pub fn compute_coverage_profile<EqLabelT: EqLabel>(
 
     let mut profile = vec![0.0f64; n_targets * n_pos_bins];
 
-    for (label, &count) in em_info.eq_map.iter_labels().zip(em_info.eq_map.counts.iter()) {
+    for (label, &count) in em_info
+        .eq_map
+        .iter_labels()
+        .zip(em_info.eq_map.counts.iter())
+    {
         let ec_count = count as f64;
-        if ec_count == 0.0 { continue; }
+        if ec_count == 0.0 {
+            continue;
+        }
 
         let pos_bins = label.target_pos_bins();
 
@@ -1215,17 +1219,20 @@ pub fn em_with_coverage<EqLabelT: EqLabel>(
 
     for round in 0..n_coverage_rounds {
         // Compute coverage profile from current estimates
-        let profile = compute_coverage_profile(
-            em_info, &counts, n_targets, n_pos_bins,
-        );
+        let profile = compute_coverage_profile(em_info, &counts, n_targets, n_pos_bins);
 
         // Compute coverage weights
-        let cov_weights = coverage_weights_from_profile(&profile, n_targets, n_pos_bins, coverage_epsilon);
+        let cov_weights =
+            coverage_weights_from_profile(&profile, n_targets, n_pos_bins, coverage_epsilon);
 
         // Run coverage-weighted EM
         counts = em_coverage_weighted(em_info, Some(&counts), &cov_weights, n_pos_bins);
 
-        info!("Coverage EM round {}/{} complete", round + 1, n_coverage_rounds);
+        info!(
+            "Coverage EM round {}/{} complete",
+            round + 1,
+            n_coverage_rounds
+        );
     }
 
     counts
@@ -1243,11 +1250,17 @@ fn m_step_coverage_weighted<EqLabelT: EqLabel>(
     out.fill(0.0);
     let inv_eff_lens = &em_info.inv_eff_lens;
     let mut weights: Vec<f64> = Vec::with_capacity(64);
-    for (label, &count) in em_info.eq_map.iter_labels().zip(em_info.eq_map.counts.iter()) {
+    for (label, &count) in em_info
+        .eq_map
+        .iter_labels()
+        .zip(em_info.eq_map.counts.iter())
+    {
         let ec_count = count as f64;
         let pos_bins = label.target_pos_bins();
         let mut denom = 0.0f64;
-        for (i, (tid, cond_prob)) in label.target_labels().iter()
+        for (i, (tid, cond_prob)) in label
+            .target_labels()
+            .iter()
             .zip(label.target_probs())
             .enumerate()
         {
@@ -1314,7 +1327,8 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
 
         let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
         let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
-            for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter()) {
+            for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
+            {
                 let r = b - a;
                 let v = c - (2.0 * b) + a;
                 *sq = a - (2.0 * alpha * r) + (alpha * alpha * v);
@@ -1324,7 +1338,8 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
                 m_step_coverage_weighted(em_info, &x_sq, cov_weights, n_pos_bins, &mut x_next);
                 em_steps += 1;
                 let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
-                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel {
+                if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel
+                {
                     accel_accepts += 1;
                     &x_next
                 } else {
@@ -1344,7 +1359,11 @@ fn em_coverage_weighted<EqLabelT: EqLabel>(
         }
     }
 
-    x0.iter_mut().for_each(|x| { if *x < presence_thresh { *x = 0.0 } });
+    x0.iter_mut().for_each(|x| {
+        if *x < presence_thresh {
+            *x = 0.0
+        }
+    });
     m_step_coverage_weighted(em_info, &x0, cov_weights, n_pos_bins, &mut x1);
 
     info!(
@@ -1434,11 +1453,18 @@ mod tests {
         }
         // Long transcript (1000bp >> FLD): should be close to standard
         let rel = (totals[0] - standard_el[0]).abs() / standard_el[0].max(1.0);
-        assert!(rel < 0.05, "long transcript: positional {} vs standard {} (rel {})",
-            totals[0], standard_el[0], rel);
+        assert!(
+            rel < 0.05,
+            "long transcript: positional {} vs standard {} (rel {})",
+            totals[0],
+            standard_el[0],
+            rel
+        );
         // Short transcript (300bp ~ FLD): exact integration < conditional-mean approx
-        assert!(totals[2] < standard_el[2],
-            "short transcript positional total should be less than standard (heavy FLD truncation)");
+        assert!(
+            totals[2] < standard_el[2],
+            "short transcript positional total should be less than standard (heavy FLD truncation)"
+        );
     }
 
     #[test]
@@ -1459,8 +1485,14 @@ mod tests {
             if rl > 500 {
                 // For transcripts much longer than fragment length, should be close
                 let rel = (totals[t] - standard_el[t]).abs() / standard_el[t].max(1.0);
-                assert!(rel < 0.05, "transcript len {}: positional total {:.1} vs standard {:.1} (rel diff {:.4})",
-                    rl, totals[t], standard_el[t], rel);
+                assert!(
+                    rel < 0.05,
+                    "transcript len {}: positional total {:.1} vs standard {:.1} (rel diff {:.4})",
+                    rl,
+                    totals[t],
+                    standard_el[t],
+                    rel
+                );
             }
         }
     }

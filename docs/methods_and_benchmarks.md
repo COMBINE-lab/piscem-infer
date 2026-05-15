@@ -75,6 +75,8 @@ When multiple experimental conditions are present (detected automatically from t
 
 This recovers condition-specific transcripts that may not meet the global threshold but have consistent within-condition abundance evidence. Rescue-only transcripts keep their phase-1 estimates after phase 2, which avoids re-suppressing rescued signal during re-estimation. Auto-enabled when multiple conditions are detected; disable with `--no-condition-rescue`.
 
+For the locked-rescue variant currently under evaluation, pass `--lock-condition-rescue-allocations`. This locks condition-rescued transcripts to their phase-1 per-EC posterior allocations, subtracts that locked mass from each EC, and runs phase-2 EM on the residual EC counts. The default lock rule is the targeted confidence rule used in the current benchmark sweep: fully lock rescued allocations when rescued posterior mass is at least 0.5 of the EC, lock 75% for moderate rescued support, and leave very weak rescued support unlocked.
+
 ### 7. Fragment Length Distribution Estimation
 
 Two modes depending on data type:

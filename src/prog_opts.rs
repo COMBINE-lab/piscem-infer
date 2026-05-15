@@ -51,12 +51,105 @@ impl Serialize for FilterMode {
     }
 }
 
+/// How structured condition rescue ranks candidate representatives in each EC group.
+#[derive(Debug, Clone, Default)]
+pub enum StructuredRescueRankMode {
+    /// Rank by the largest mean TPM in any admitted condition.
+    #[default]
+    Peak,
+    /// Prefer transcripts supported across more admitted conditions, then rank by mean TPM.
+    Breadth,
+}
+
+impl FromStr for StructuredRescueRankMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "peak" => Ok(Self::Peak),
+            "breadth" => Ok(Self::Breadth),
+            other => bail!(
+                "unknown structured rescue rank mode '{}'; expected peak or breadth",
+                other
+            ),
+        }
+    }
+}
+
+impl Serialize for StructuredRescueRankMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Peak => serializer.serialize_str("peak"),
+            Self::Breadth => serializer.serialize_str("breadth"),
+        }
+    }
+}
+
+/// How locked condition rescue chooses the fraction of Phase-1 allocation to lock.
+#[derive(Debug, Clone, Default)]
+pub enum ConditionRescueLockMode {
+    /// Lock the same fraction for every rescued posterior allocation.
+    #[default]
+    Fixed,
+    /// Choose full, partial, or no lock from the per-EC rescued posterior fraction.
+    Confidence,
+    /// Apply confidence-style relaxation only to condition-local rescued
+    /// transcripts; rescued transcripts with evidence in multiple conditions
+    /// stay fully locked.
+    GuardedConfidence,
+    /// Apply confidence-style relaxation only to rescued transcripts with
+    /// replicate-level instability in the current condition.
+    Instability,
+    /// Apply confidence-style relaxation unless a rescued transcript has
+    /// stable aggregate Phase-1 count support in the current condition.
+    TranscriptStability,
+}
+
+impl FromStr for ConditionRescueLockMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fixed" => Ok(Self::Fixed),
+            "confidence" => Ok(Self::Confidence),
+            "guarded-confidence" | "guarded_confidence" => Ok(Self::GuardedConfidence),
+            "instability" => Ok(Self::Instability),
+            "transcript-stability" | "transcript_stability" => Ok(Self::TranscriptStability),
+            other => bail!(
+                "unknown condition rescue lock mode '{}'; expected fixed, confidence, guarded-confidence, instability, or transcript-stability",
+                other
+            ),
+        }
+    }
+}
+
+impl Serialize for ConditionRescueLockMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Fixed => serializer.serialize_str("fixed"),
+            Self::Confidence => serializer.serialize_str("confidence"),
+            Self::GuardedConfidence => serializer.serialize_str("guarded-confidence"),
+            Self::Instability => serializer.serialize_str("instability"),
+            Self::TranscriptStability => serializer.serialize_str("transcript-stability"),
+        }
+    }
+}
+
 const PRESENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 5e-4;
 const MAX_EM_ITER: u32 = 1500;
 
 fn greater_than_0(s: &str) -> std::result::Result<u32, String> {
     number_range(s, 1, u32::MAX)
+}
+
+fn fraction_0_to_1(s: &str) -> std::result::Result<f64, String> {
+    let value = s
+        .parse::<f64>()
+        .map_err(|e| format!("failed to parse fraction '{}': {}", s, e))?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("fraction must be finite and in [0, 1], got {}", s))
+    }
 }
 
 fn parse_selection_stages(s: &str) -> std::result::Result<SelectionStages, String> {
@@ -367,6 +460,21 @@ pub struct ConsensusQuantOpts {
     /// CSV columns: sample_name, condition, rad_path, output_dir
     #[arg(short, long, help_heading = "Input / Output")]
     pub manifest: PathBuf,
+    /// optional TSV audit path recording per-transcript consensus decisions.
+    /// Useful for diagnosing why transcripts passed or failed structural
+    /// selection, global consensus, condition rescue, and gene rescue.
+    #[arg(long, help_heading = "Input / Output")]
+    pub consensus_audit_output: Option<PathBuf>,
+    /// optional TSV audit path recording structural selection decisions.
+    /// Includes the removal reason and a retained superset competitor when one
+    /// is found.
+    #[arg(long, requires = "txp_selection", help_heading = "Input / Output")]
+    pub selection_audit_output: Option<PathBuf>,
+    /// optional TSV report path for non-mutating ambiguity-group repair
+    /// candidates. This computes local repair/pruning features but does not
+    /// change quantification output.
+    #[arg(long, help_heading = "Input / Output")]
+    pub ambiguity_repair_report: Option<PathBuf>,
     /// the expected library type (or 'auto' for automatic detection)
     #[arg(short, long, value_parser = clap::value_parser!(LibTypeArg), help_heading = "Input / Output")]
     pub lib_type: LibTypeArg,
@@ -423,9 +531,9 @@ pub struct ConsensusQuantOpts {
     pub condition_aware_consensus: bool,
     /// use strict global consensus, then rescue transcripts that fail globally
     /// but have reproducible phase-1 TPM evidence within at least one
-    /// condition. Rescue-only transcripts retain their phase-1 estimates after
-    /// phase 2. Enabled automatically when the manifest has multiple
-    /// conditions. Use --no-condition-rescue to disable.
+    /// condition. By default, rescue-only transcripts retain their phase-1
+    /// estimates after phase 2. Enabled automatically when the manifest has
+    /// multiple conditions. Use --no-condition-rescue to disable.
     #[arg(
         long,
         conflicts_with = "condition_aware_consensus",
@@ -435,6 +543,205 @@ pub struct ConsensusQuantOpts {
     /// disable automatic condition rescue when multiple conditions are present.
     #[arg(long, conflicts_with_all = ["condition_rescue", "condition_aware_consensus"], help_heading = "Consensus Filter")]
     pub no_condition_rescue: bool,
+    /// re-estimate condition-rescued transcripts during phase 2 instead of
+    /// restoring their phase-1 estimates. The phase-2 active set remains
+    /// sample-specific: strict global consensus plus transcripts rescued for
+    /// the sample's condition.
+    #[arg(long, requires = "condition_rescue", help_heading = "Consensus Filter")]
+    pub reestimate_condition_rescue: bool,
+    /// lock condition-rescued transcripts to their phase-1 per-EC posterior
+    /// allocations, subtract that locked mass from each EC, then run phase-2 EM
+    /// on the residual EC counts. By default this uses the recommended
+    /// targeted confidence rule: fully lock ECs where rescued transcripts have
+    /// at least half the posterior mass, lock 75% for moderate rescue support,
+    /// and leave very weak rescue support unlocked. With a multi-condition
+    /// manifest, condition rescue is enabled automatically, so this flag is the
+    /// only extra flag needed to request the locked-rescue path.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "reestimate_condition_rescue",
+            "no_condition_rescue",
+            "condition_aware_consensus"
+        ],
+        help_heading = "Consensus Filter"
+    )]
+    pub lock_condition_rescue_allocations: bool,
+    /// fraction of each condition-rescued transcript's phase-1 per-EC posterior
+    /// allocation to lock. A value below 1 leaves the un-locked residual mass
+    /// available to phase-2 EM over the full active set.
+    #[arg(long, default_value_t = 0.75, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    pub condition_rescue_lock_fraction: f64,
+    /// rule for choosing how much condition-rescued posterior allocation to
+    /// lock. `fixed` uses --condition-rescue-lock-fraction everywhere;
+    /// `confidence` locks fully when rescued posterior mass dominates an EC,
+    /// partially when it is moderate, and not at all when it is tiny;
+    /// `guarded-confidence` uses that rule only for condition-local rescued
+    /// transcripts and fully locks rescued transcripts with evidence in multiple
+    /// conditions;
+    /// `instability` applies the confidence rule only to rescued transcripts
+    /// with replicate-level instability in the current condition, keeping
+    /// stable rescued transcripts fully locked;
+    /// `transcript-stability` applies the confidence rule unless the rescued
+    /// transcript has stable aggregate Phase-1 count support in the current
+    /// condition.
+    #[arg(long, default_value = "confidence", requires = "lock_condition_rescue_allocations", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Consensus Filter")]
+    pub condition_rescue_lock_mode: ConditionRescueLockMode,
+    /// in confidence lock mode, fully lock rescued allocation when rescued
+    /// posterior mass is at least this fraction of the EC.
+    #[arg(long, default_value_t = 0.5, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    pub condition_rescue_full_lock_threshold: f64,
+    /// in confidence lock mode, do not lock rescued allocation when rescued
+    /// posterior mass is below this fraction of the EC.
+    #[arg(long, default_value_t = 0.1, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    pub condition_rescue_min_lock_threshold: f64,
+    /// in instability lock mode, relax rescued transcripts whose within-condition
+    /// Phase-1 count CV is at least this value.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        requires = "lock_condition_rescue_allocations",
+        help_heading = "Consensus Filter"
+    )]
+    pub condition_rescue_instability_cv_threshold: f64,
+    /// in instability lock mode, relax rescued transcripts whose within-condition
+    /// sample pass fraction is below this value. The default relaxes rescued
+    /// transcripts with any replicate dropout in their rescued condition.
+    #[arg(long, default_value_t = 1.0, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    pub condition_rescue_instability_min_pass_fraction: f64,
+    /// in guarded-confidence lock mode, count a transcript as having condition
+    /// evidence when its mean Phase-1 count in that condition is at least this
+    /// value. Rescued transcripts with evidence in more than one condition are
+    /// fully locked.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        requires = "lock_condition_rescue_allocations",
+        help_heading = "Consensus Filter"
+    )]
+    pub condition_rescue_guard_mean_count_threshold: f64,
+    /// in transcript-stability lock mode, fully lock rescued transcripts only
+    /// when their mean Phase-1 count in the current condition is at least this
+    /// value.
+    #[arg(
+        long,
+        default_value_t = 5.0,
+        requires = "lock_condition_rescue_allocations",
+        help_heading = "Consensus Filter"
+    )]
+    pub condition_rescue_stability_mean_count_threshold: f64,
+    /// in transcript-stability lock mode, fully lock rescued transcripts only
+    /// when their within-condition Phase-1 count CV is at most this value.
+    #[arg(
+        long,
+        default_value_t = 0.5,
+        requires = "lock_condition_rescue_allocations",
+        help_heading = "Consensus Filter"
+    )]
+    pub condition_rescue_stability_cv_threshold: f64,
+    /// in transcript-stability lock mode, fully lock rescued transcripts only
+    /// when their sample pass fraction in the current condition is at least
+    /// this value.
+    #[arg(long, default_value_t = 1.0, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    pub condition_rescue_stability_min_pass_fraction: f64,
+    /// experimental rescue mode: admit rescue at an EC-graph-group level, then
+    /// emit only the dominant rescued isoforms within each admitted group.
+    #[arg(long, requires = "condition_rescue", help_heading = "Consensus Filter")]
+    pub structured_condition_rescue: bool,
+    /// minimum summed Phase-1 TPM for an EC-graph group to be rescued within a
+    /// condition. Only used with --structured-condition-rescue.
+    #[arg(
+        long,
+        default_value_t = 3.0,
+        requires = "structured_condition_rescue",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_group_tpm_floor: f64,
+    /// fraction of an admitted group's rescue TPM captured by selected
+    /// isoforms. Only used with --structured-condition-rescue.
+    #[arg(
+        long,
+        default_value_t = 0.9,
+        requires = "structured_condition_rescue",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_cumulative_frac: f64,
+    /// maximum number of rescue-only isoforms emitted per admitted EC-graph
+    /// group. Strict-global transcripts are not counted against this cap.
+    #[arg(long, default_value_t = 3_u32, value_parser = greater_than_0, requires = "structured_condition_rescue", help_heading = "Consensus Filter")]
+    pub structured_rescue_max_isoforms: u32,
+    /// ranking rule for rescue candidates within each admitted EC-graph group.
+    #[arg(long, default_value = "peak", value_parser = clap::value_parser!(StructuredRescueRankMode), requires = "structured_condition_rescue", help_heading = "Consensus Filter")]
+    pub structured_rescue_rank_mode: StructuredRescueRankMode,
+    /// include the top rescue representative for each admitted condition in
+    /// each EC-graph group before applying the general group-level ranking.
+    #[arg(
+        long,
+        requires = "structured_condition_rescue",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_per_condition_representatives: bool,
+    /// allow rescue from EC-graph groups that also contain strict-global
+    /// transcripts, but only as one top raw representative per admitted
+    /// condition.
+    #[arg(
+        long,
+        requires = "structured_condition_rescue",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_strict_group_escape: bool,
+    /// minimum condition mean Phase-1 TPM for a non-strict candidate rescued
+    /// from a strict-containing EC-graph group.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        requires = "structured_rescue_strict_group_escape",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_strict_group_candidate_tpm_floor: f64,
+    /// allow at most one balanced non-strict rescue candidate from an EC-graph
+    /// group that also contains strict-global transcripts.
+    #[arg(
+        long,
+        requires = "structured_condition_rescue",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_strict_group_balanced_escape: bool,
+    /// minimum condition mean Phase-1 TPM for balanced strict-group escape.
+    #[arg(
+        long,
+        default_value_t = 0.1,
+        requires = "structured_rescue_strict_group_balanced_escape",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_strict_group_balanced_tpm_floor: f64,
+    /// minimum number of conditions with signal for balanced strict-group
+    /// escape.
+    #[arg(
+        long,
+        default_value_t = 2_u32,
+        value_parser = greater_than_0,
+        requires = "structured_rescue_strict_group_balanced_escape",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_strict_group_balanced_min_conditions: u32,
+    /// add one Phase-1 complement representative for admitted conditions where
+    /// selected rescue representatives have no signal but the EC-graph group
+    /// does.
+    #[arg(
+        long,
+        requires = "structured_condition_rescue",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_phase1_condition_complements: bool,
+    /// minimum condition mean Phase-1 TPM for a complement representative.
+    #[arg(
+        long,
+        default_value_t = 0.1,
+        requires = "structured_rescue_phase1_condition_complements",
+        help_heading = "Consensus Filter"
+    )]
+    pub structured_rescue_phase1_complement_tpm_floor: f64,
     /// TPM threshold above which a transcript is considered expressed
     /// in a given sample. Only used with --filter-mode tpm. (default: 0.0)
     #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]
@@ -478,6 +785,36 @@ pub struct ConsensusQuantOpts {
     /// as it also captures cross-gene leakage.
     #[arg(long, help_heading = "Consensus Filter")]
     pub use_gene_annotation: bool,
+    /// diagnostic mode: do not zero condition-rescue-only transcripts in the
+    /// post-EM leakage filter. This tests whether rescue dropout is being
+    /// introduced downstream of locked/partial allocation.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub preserve_condition_rescue_leakage: bool,
+    /// diagnostic mode: exempt condition-rescue-only transcripts from the
+    /// post-EM fraction leakage filter only when local pairwise EM against the
+    /// dominant competitor gives direct sample-local support. Position-profile
+    /// leakage is still removed.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub selective_condition_rescue_leakage: bool,
+    /// minimum local pairwise EM count required for
+    /// --selective-condition-rescue-leakage.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        requires = "selective_condition_rescue_leakage",
+        help_heading = "Consensus Filter"
+    )]
+    pub selective_condition_rescue_leakage_min_count: f64,
+    /// minimum local pairwise EM fraction required for
+    /// --selective-condition-rescue-leakage.
+    #[arg(long, default_value_t = 0.05, requires = "selective_condition_rescue_leakage", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    pub selective_condition_rescue_leakage_min_fraction: f64,
+    /// diagnostic mode: exempt condition-rescue-only transcripts from the
+    /// post-EM fraction leakage filter when their sample-local Phase-1 count is
+    /// at least this value. Position-profile leakage is still removed. Set to
+    /// 0 to disable.
+    #[arg(long, default_value_t = 0.0, help_heading = "Consensus Filter")]
+    pub condition_rescue_leakage_phase1_floor_count: f64,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use for fragment length distribution estimation

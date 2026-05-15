@@ -226,7 +226,8 @@ mod tests {
     fn collapse_merges_ecs_differing_only_by_pos_bins() {
         init_globals();
 
-        let mut eqm = EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
+        let mut eqm =
+            EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
 
         // Three ECs all with targets = [3, 7] and prob_bins that will
         // hash to the same pair; they differ only in pos_bins.
@@ -249,8 +250,7 @@ mod tests {
         let collapsed = build_collapsed(&pos_packed);
         assert_eq!(collapsed.len(), 1, "all 3 positional ECs share key");
         assert_eq!(
-            collapsed.packed.counts[0],
-            10,
+            collapsed.packed.counts[0], 10,
             "counts should sum: 5 + 3 + 2"
         );
         assert_eq!(
@@ -265,7 +265,8 @@ mod tests {
     fn collapse_preserves_distinct_keys() {
         init_globals();
 
-        let mut eqm = EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
+        let mut eqm =
+            EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
         let lab_a = RangeFactorizedEqLabel::new(&[1u32, 2u32], Some(&[0.5, 0.5]), Some(&[0, 0]));
         let lab_b = RangeFactorizedEqLabel::new(&[1u32, 3u32], Some(&[0.5, 0.5]), Some(&[0, 0]));
         let lab_c = RangeFactorizedEqLabel::new(&[1u32, 2u32], Some(&[0.2, 0.8]), Some(&[0, 0]));
@@ -290,15 +291,28 @@ mod tests {
     fn m_step_bit_identical_serial() {
         init_globals();
 
-        let mut eqm = EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
+        let mut eqm =
+            EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
 
         // A richer set: transcripts 0..5; four distinct target/prob
         // keys, each split across 2-3 positional bins.
         let t1 = [0u32, 1u32, 2u32];
         let p1 = [0.2_f64, 0.3, 0.5];
-        *eqm.add(RangeFactorizedEqLabel::new(&t1, Some(&p1), Some(&[0, 0, 0]))) = 6;
-        *eqm.add(RangeFactorizedEqLabel::new(&t1, Some(&p1), Some(&[1, 2, 3]))) = 4;
-        *eqm.add(RangeFactorizedEqLabel::new(&t1, Some(&p1), Some(&[4, 4, 4]))) = 2;
+        *eqm.add(RangeFactorizedEqLabel::new(
+            &t1,
+            Some(&p1),
+            Some(&[0, 0, 0]),
+        )) = 6;
+        *eqm.add(RangeFactorizedEqLabel::new(
+            &t1,
+            Some(&p1),
+            Some(&[1, 2, 3]),
+        )) = 4;
+        *eqm.add(RangeFactorizedEqLabel::new(
+            &t1,
+            Some(&p1),
+            Some(&[4, 4, 4]),
+        )) = 2;
 
         let t2 = [1u32, 3u32];
         let p2 = [0.4_f64, 0.6];

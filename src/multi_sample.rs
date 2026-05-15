@@ -500,10 +500,9 @@ fn run_phase_b_inner<EqLabelT: EqLabel + 'static>(
     // range-factorized we can always route per-sample EM through the
     // collapsed map. All unique-EC / consensus counting below continues to
     // use the positional maps.
-    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
-        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
-    let use_collapsed =
-        is_range_factorized && !opts.no_collapsed_ec_em && opts.pos_bins > 1;
+    let is_range_factorized =
+        std::any::TypeId::of::<EqLabelT>() == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let use_collapsed = is_range_factorized && !opts.no_collapsed_ec_em && opts.pos_bins > 1;
     let collapsed_maps: Vec<Option<CollapsedEqMap>> = if use_collapsed {
         info!(
             "building collapsed EC views for {} sample{} (hierarchical EM will iterate over the collapsed map)",
@@ -594,17 +593,9 @@ fn run_phase_b_inner<EqLabelT: EqLabel + 'static>(
             let counts = if is_init_iter {
                 // Standard EM to establish presence mask and data-driven estimates
                 let c = if let Some(cm) = collapsed_maps[i].as_ref() {
-                    run_em_unpenalized(
-                        &cm.packed,
-                        all_meta[i].eff_lengths.clone(),
-                        opts,
-                    )
+                    run_em_unpenalized(&cm.packed, all_meta[i].eff_lengths.clone(), opts)
                 } else {
-                    run_em_unpenalized(
-                        &packed_maps[i],
-                        all_meta[i].eff_lengths.clone(),
-                        opts,
-                    )
+                    run_em_unpenalized(&packed_maps[i], all_meta[i].eff_lengths.clone(), opts)
                 };
                 let mask: Vec<bool> = c.iter().map(|&v| v > opts.presence_thresh).collect();
                 let n_present = mask.iter().filter(|&&b| b).count();
@@ -628,12 +619,7 @@ fn run_phase_b_inner<EqLabelT: EqLabel + 'static>(
                 };
 
                 if let Some(cm) = collapsed_maps[i].as_ref() {
-                    run_em_penalized(
-                        &cm.packed,
-                        all_meta[i].eff_lengths.clone(),
-                        &alpha,
-                        opts,
-                    )
+                    run_em_penalized(&cm.packed, all_meta[i].eff_lengths.clone(), &alpha, opts)
                 } else {
                     run_em_penalized(
                         &packed_maps[i],
@@ -1060,32 +1046,32 @@ fn run_phase_b_group_lasso<EqLabelT: EqLabel + 'static>(
     // Step 5: Run EM with group shrinkage. Collapse the positional
     // ECs when possible so the inner EM iterates over the smaller
     // (targets, prob_bins) key space.
-    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
-        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
-    let use_collapsed =
-        is_range_factorized && !opts.no_collapsed_ec_em && opts.pos_bins > 1;
-    let collapsed_packed: Option<Vec<PackedEqMap<crate::utils::collapsed_eq::CollapsedRangeFactorizedEqLabel>>> =
-        if use_collapsed {
-            info!(
-                "building collapsed EC views for {} samples (group-lasso EM will iterate over the collapsed map)",
-                packed_maps.len()
-            );
-            Some(
-                packed_maps
-                    .iter()
-                    .map(|m| {
-                        // SAFETY: `is_range_factorized` verified above.
-                        let pos_map: &PackedEqMap<RangeFactorizedEqLabel> = unsafe {
-                            &*(m as *const PackedEqMap<EqLabelT>
-                                as *const PackedEqMap<RangeFactorizedEqLabel>)
-                        };
-                        build_collapsed(pos_map).packed
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
+    let is_range_factorized =
+        std::any::TypeId::of::<EqLabelT>() == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let use_collapsed = is_range_factorized && !opts.no_collapsed_ec_em && opts.pos_bins > 1;
+    let collapsed_packed: Option<
+        Vec<PackedEqMap<crate::utils::collapsed_eq::CollapsedRangeFactorizedEqLabel>>,
+    > = if use_collapsed {
+        info!(
+            "building collapsed EC views for {} samples (group-lasso EM will iterate over the collapsed map)",
+            packed_maps.len()
+        );
+        Some(
+            packed_maps
+                .iter()
+                .map(|m| {
+                    // SAFETY: `is_range_factorized` verified above.
+                    let pos_map: &PackedEqMap<RangeFactorizedEqLabel> = unsafe {
+                        &*(m as *const PackedEqMap<EqLabelT>
+                            as *const PackedEqMap<RangeFactorizedEqLabel>)
+                    };
+                    build_collapsed(pos_map).packed
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     let result_theta = if let Some(ref cmaps) = collapsed_packed {
         group_lasso::em_group_shrinkage(

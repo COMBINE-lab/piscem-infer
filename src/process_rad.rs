@@ -22,8 +22,8 @@ use tracing::{info, warn};
 
 use crate::utils::collapsed_eq::build_collapsed;
 use crate::utils::eq_maps::{
-    BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqLabel,
-    RangeFactorizedEqMap,
+    BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap,
+    RangeFactorizedEqLabel, RangeFactorizedEqMap,
 };
 use crate::utils::gibbs::{do_gibbs, do_gibbs_with_pool};
 use crate::utils::io;
@@ -725,10 +725,9 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel + Send + 'static>(
     // must see the positional map because `target_pos_bins()` is
     // required by its M-step — so we fall back to the positional map
     // whenever coverage smoothing is active.
-    let cov_smoothing_active =
-        quant_opts.coverage_smooth_rounds > 0 && quant_opts.pos_bins > 1;
-    let is_range_factorized = std::any::TypeId::of::<EqLabelT>()
-        == std::any::TypeId::of::<RangeFactorizedEqLabel>();
+    let cov_smoothing_active = quant_opts.coverage_smooth_rounds > 0 && quant_opts.pos_bins > 1;
+    let is_range_factorized =
+        std::any::TypeId::of::<EqLabelT>() == std::any::TypeId::of::<RangeFactorizedEqLabel>();
     let use_collapsed = is_range_factorized
         && !quant_opts.no_collapsed_ec_em
         && quant_opts.pos_bins > 1
@@ -927,7 +926,9 @@ fn run_inference_and_output<EqLabelT: EqLabel, BundleEqLabelT: EqLabel>(
         "none"
     };
 
-    let meta_info_output = output.to_path_buf().with_additional_extension(".meta_info.json");
+    let meta_info_output = output
+        .to_path_buf()
+        .with_additional_extension(".meta_info.json");
     let ofile = File::create(meta_info_output)?;
     let meta_info = json!({
         "quant_opts": quant_opts,

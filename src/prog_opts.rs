@@ -101,6 +101,13 @@ pub enum ConditionRescueLockMode {
     /// Lock rescued mass in proportion to its posterior enrichment over the
     /// uniform rescued-target share of the EC.
     EnrichmentFloor,
+    /// Apply the floor-smooth rule only when rescued mass is credibly enriched
+    /// over the uniform rescued-target share of the EC.
+    EnrichmentCredibleFloor,
+    /// Apply the enrichment-credible floor rule, except condition-rescued
+    /// transcripts with stable within-condition Phase-1 support bypass the
+    /// enrichment gate and use the floor-smooth rule.
+    EnrichmentCredibleStability,
     /// Penalize phase-2 estimates that fall below the phase-1 rescued
     /// allocation floor without subtracting locked mass from EC counts.
     FloorBarrier,
@@ -120,6 +127,7 @@ impl FromStr for ConditionRescueLockMode {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "default" | "recommended" => Ok(Self::EnrichmentCredibleStability),
             "fixed" => Ok(Self::Fixed),
             "confidence" => Ok(Self::Confidence),
             "floor-smooth-confidence" | "floor_smooth_confidence" => {
@@ -127,12 +135,18 @@ impl FromStr for ConditionRescueLockMode {
             }
             "credible-floor" | "credible_floor" => Ok(Self::CredibleFloor),
             "enrichment-floor" | "enrichment_floor" => Ok(Self::EnrichmentFloor),
+            "enrichment-credible-floor" | "enrichment_credible_floor" => {
+                Ok(Self::EnrichmentCredibleFloor)
+            }
+            "enrichment-credible-stability" | "enrichment_credible_stability" => {
+                Ok(Self::EnrichmentCredibleStability)
+            }
             "floor-barrier" | "floor_barrier" => Ok(Self::FloorBarrier),
             "guarded-confidence" | "guarded_confidence" => Ok(Self::GuardedConfidence),
             "instability" => Ok(Self::Instability),
             "transcript-stability" | "transcript_stability" => Ok(Self::TranscriptStability),
             other => bail!(
-                "unknown condition rescue lock mode '{}'; expected fixed, confidence, floor-smooth-confidence, credible-floor, enrichment-floor, floor-barrier, guarded-confidence, instability, or transcript-stability",
+                "unknown condition rescue lock mode '{}'; expected default, recommended, fixed, confidence, floor-smooth-confidence, credible-floor, enrichment-floor, enrichment-credible-floor, enrichment-credible-stability, floor-barrier, guarded-confidence, instability, or transcript-stability",
                 other
             ),
         }
@@ -147,6 +161,10 @@ impl Serialize for ConditionRescueLockMode {
             Self::FloorSmoothConfidence => serializer.serialize_str("floor-smooth-confidence"),
             Self::CredibleFloor => serializer.serialize_str("credible-floor"),
             Self::EnrichmentFloor => serializer.serialize_str("enrichment-floor"),
+            Self::EnrichmentCredibleFloor => serializer.serialize_str("enrichment-credible-floor"),
+            Self::EnrichmentCredibleStability => {
+                serializer.serialize_str("enrichment-credible-stability")
+            }
             Self::FloorBarrier => serializer.serialize_str("floor-barrier"),
             Self::GuardedConfidence => serializer.serialize_str("guarded-confidence"),
             Self::Instability => serializer.serialize_str("instability"),
@@ -571,14 +589,13 @@ pub struct ConsensusQuantOpts {
     /// the sample's condition.
     #[arg(long, requires = "condition_rescue", help_heading = "Consensus Filter")]
     pub reestimate_condition_rescue: bool,
-    /// lock condition-rescued transcripts to their phase-1 per-EC posterior
+    /// lock condition-rescued transcripts to phase-1 per-EC posterior
     /// allocations, subtract that locked mass from each EC, then run phase-2 EM
-    /// on the residual EC counts. By default this uses the recommended
-    /// targeted confidence rule: fully lock ECs where rescued transcripts have
-    /// at least half the posterior mass, lock 75% for moderate rescue support,
-    /// and leave very weak rescue support unlocked. With a multi-condition
-    /// manifest, condition rescue is enabled automatically, so this flag is the
-    /// only extra flag needed to request the locked-rescue path.
+    /// on the residual EC counts. By default, rescued mass is locked when it has
+    /// stable within-condition Phase-1 support or credibly enriched EC-level
+    /// posterior support. With a multi-condition manifest, condition rescue is
+    /// enabled automatically, so this flag is the only extra flag needed to
+    /// request the recommended locked-rescue path.
     #[arg(
         long,
         conflicts_with_all = [
@@ -592,10 +609,13 @@ pub struct ConsensusQuantOpts {
     /// fraction of each condition-rescued transcript's phase-1 per-EC posterior
     /// allocation to lock. A value below 1 leaves the un-locked residual mass
     /// available to phase-2 EM over the full active set.
-    #[arg(long, default_value_t = 0.75, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    #[arg(long, default_value_t = 0.75, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_lock_fraction: f64,
-    /// rule for choosing how much condition-rescued posterior allocation to
-    /// lock. `fixed` uses --condition-rescue-lock-fraction everywhere;
+    /// advanced rule for choosing how much condition-rescued posterior
+    /// allocation to lock. The default, `enrichment-credible-stability`, locks
+    /// rescued mass when it has stable within-condition Phase-1 support or
+    /// credible EC-level enrichment. `default` and `recommended` are aliases for
+    /// this rule. `fixed` uses --condition-rescue-lock-fraction everywhere;
     /// `confidence` locks fully when rescued posterior mass dominates an EC,
     /// partially when it is moderate, and not at all when it is tiny;
     /// `floor-smooth-confidence` uses the partial lock fraction just above the
@@ -605,6 +625,11 @@ pub struct ConsensusQuantOpts {
     /// uncertainty adjustment;
     /// `enrichment-floor` locks rescued mass according to its posterior
     /// enrichment over the rescued targets' uniform EC share;
+    /// `enrichment-credible-floor` applies the floor-smooth rule when the
+    /// Phase-1 rescued mass is credibly enriched over that uniform EC share;
+    /// `enrichment-credible-stability` uses that rule but lets rescued
+    /// transcripts with stable within-condition Phase-1 support bypass the
+    /// enrichment gate and use the floor-smooth mass rule;
     /// `floor-barrier` keeps all condition-rescued transcripts in phase 2 and
     /// applies a one-sided penalty when estimates fall below their Phase-1
     /// rescued allocation floor;
@@ -617,7 +642,7 @@ pub struct ConsensusQuantOpts {
     /// `transcript-stability` applies the confidence rule unless the rescued
     /// transcript has stable aggregate Phase-1 count support in the current
     /// condition.
-    #[arg(long, default_value = "floor-smooth-confidence", requires = "lock_condition_rescue_allocations", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Consensus Filter")]
+    #[arg(long, default_value = "enrichment-credible-stability", requires = "lock_condition_rescue_allocations", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_lock_mode: ConditionRescueLockMode,
     /// z-score used by --condition-rescue-lock-mode credible-floor. Larger
     /// values protect only rescue mass with stronger per-EC posterior support.
@@ -625,7 +650,7 @@ pub struct ConsensusQuantOpts {
         long,
         default_value_t = 1.96,
         requires = "lock_condition_rescue_allocations",
-        help_heading = "Consensus Filter"
+        help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_credible_floor_z: f64,
     /// strength of the one-sided rescued-allocation floor penalty used by
@@ -635,16 +660,27 @@ pub struct ConsensusQuantOpts {
         long,
         default_value_t = 10.0,
         requires = "lock_condition_rescue_allocations",
-        help_heading = "Consensus Filter"
+        help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_floor_barrier_weight: f64,
+    /// posterior probability threshold used by --condition-rescue-lock-mode
+    /// enrichment-credible-floor to decide whether rescued EC mass is enriched
+    /// above the uniform rescued-target share.
+    #[arg(
+        long,
+        default_value_t = 0.5,
+        requires = "lock_condition_rescue_allocations",
+        value_parser = fraction_0_to_1,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub condition_rescue_enrichment_posterior_threshold: f64,
     /// in confidence lock mode, fully lock rescued allocation when rescued
     /// posterior mass is at least this fraction of the EC.
-    #[arg(long, default_value_t = 0.5, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    #[arg(long, default_value_t = 0.5, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_full_lock_threshold: f64,
     /// in confidence lock mode, do not lock rescued allocation when rescued
     /// posterior mass is below this fraction of the EC.
-    #[arg(long, default_value_t = 0.1, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    #[arg(long, default_value_t = 0.1, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_min_lock_threshold: f64,
     /// in instability lock mode, relax rescued transcripts whose within-condition
     /// Phase-1 count CV is at least this value.
@@ -652,13 +688,13 @@ pub struct ConsensusQuantOpts {
         long,
         default_value_t = 1.0,
         requires = "lock_condition_rescue_allocations",
-        help_heading = "Consensus Filter"
+        help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_instability_cv_threshold: f64,
     /// in instability lock mode, relax rescued transcripts whose within-condition
     /// sample pass fraction is below this value. The default relaxes rescued
     /// transcripts with any replicate dropout in their rescued condition.
-    #[arg(long, default_value_t = 1.0, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    #[arg(long, default_value_t = 1.0, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_instability_min_pass_fraction: f64,
     /// in guarded-confidence lock mode, count a transcript as having condition
     /// evidence when its mean Phase-1 count in that condition is at least this
@@ -668,32 +704,32 @@ pub struct ConsensusQuantOpts {
         long,
         default_value_t = 1.0,
         requires = "lock_condition_rescue_allocations",
-        help_heading = "Consensus Filter"
+        help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_guard_mean_count_threshold: f64,
-    /// in transcript-stability lock mode, fully lock rescued transcripts only
+    /// in stability-aware lock modes, treat rescued transcripts as stable only
     /// when their mean Phase-1 count in the current condition is at least this
     /// value.
     #[arg(
         long,
         default_value_t = 5.0,
         requires = "lock_condition_rescue_allocations",
-        help_heading = "Consensus Filter"
+        help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_stability_mean_count_threshold: f64,
-    /// in transcript-stability lock mode, fully lock rescued transcripts only
+    /// in stability-aware lock modes, treat rescued transcripts as stable only
     /// when their within-condition Phase-1 count CV is at most this value.
     #[arg(
         long,
-        default_value_t = 0.5,
+        default_value_t = 1.0,
         requires = "lock_condition_rescue_allocations",
-        help_heading = "Consensus Filter"
+        help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_stability_cv_threshold: f64,
-    /// in transcript-stability lock mode, fully lock rescued transcripts only
+    /// in stability-aware lock modes, treat rescued transcripts as stable only
     /// when their sample pass fraction in the current condition is at least
     /// this value.
-    #[arg(long, default_value_t = 1.0, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]
+    #[arg(long, default_value_t = 0.75, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_stability_min_pass_fraction: f64,
     /// experimental rescue mode: admit rescue at an EC-graph-group level, then
     /// emit only the dominant rescued isoforms within each admitted group.
@@ -929,6 +965,7 @@ pub struct ConsensusQuantOpts {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// quantify from the rad file (single sample)
     #[command(arg_required_else_help = true)]

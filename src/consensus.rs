@@ -9,7 +9,8 @@ use anyhow::{Context, Result, bail};
 use path_tools::WithAdditionalExtension;
 use rayon::prelude::*;
 use serde_json::json;
-use std::fs::{File, create_dir_all};
+use std::collections::HashSet;
+use std::fs::{File, create_dir_all, read_to_string};
 use std::io::Write;
 use tracing::info;
 
@@ -294,10 +295,10 @@ fn write_selection_audit(
     result: &crate::utils::txp_selection::SelectionResult,
     index: &crate::utils::txp_selection::TranscriptEqIndex,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent)?;
     }
 
     let n_targets = target_names.len();
@@ -1762,6 +1763,22 @@ fn compute_residual_mean_rel_diff(prev: &[f64], curr: &[f64], presence_thresh: f
     if n > 0 { sum_abs_rel / n as f64 } else { 0.0 }
 }
 
+fn normal_cdf(z: f64) -> f64 {
+    if !z.is_finite() {
+        return if z.is_sign_positive() { 1.0 } else { 0.0 };
+    }
+    let x = z.abs() / 2.0f64.sqrt();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let erf_approx = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+    let erf = if z >= 0.0 { erf_approx } else { -erf_approx };
+    0.5 * (1.0 + erf)
+}
+
 fn residual_squarem_alpha(x0: &[f64], x1: &[f64], x2: &[f64]) -> Option<f64> {
     let mut rr = 0.0f64;
     let mut vv = 0.0f64;
@@ -1974,6 +1991,7 @@ fn expand_tail_component<L: EqLabel>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn residual_tail_em_step_f64_counts<L: EqLabel>(
     packed: &PackedEqMap<L>,
     eq_counts: &[f64],
@@ -2022,6 +2040,7 @@ fn residual_tail_em_step_f64_counts<L: EqLabel>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refine_residual_tail_f64_counts<L: EqLabel>(
     packed: &PackedEqMap<L>,
     eq_counts: &[f64],
@@ -2340,6 +2359,7 @@ fn sample_cv_f64(values: &[f64]) -> f64 {
     var.sqrt() / (mean + 1e-6)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn condition_rescue_instability_masks(
     samples: &[SampleEntry],
     condition_names: &[String],
@@ -2443,6 +2463,7 @@ fn condition_rescue_guarded_confidence_masks(
     allow_relax
 }
 
+#[allow(clippy::too_many_arguments)]
 fn condition_rescue_transcript_stability_masks(
     samples: &[SampleEntry],
     condition_names: &[String],
@@ -2499,8 +2520,10 @@ fn condition_rescue_transcript_stability_masks(
     allow_relax
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
     sample_name: &str,
+    ref_names: &[String],
     packed: &PackedEqMap<L>,
     phase1_counts: &[f64],
     eff_lens: &[f64],
@@ -2511,9 +2534,21 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
     full_lock_threshold: f64,
     min_lock_threshold: f64,
     credible_floor_z: f64,
+    enrichment_posterior_threshold: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     let mut residual_eq_counts = Vec::with_capacity(packed.len());
     let mut locked_counts = vec![0.0f64; phase1_counts.len()];
+    let audit_targets: Option<HashSet<String>> = std::env::var("PISCEM_LOCK_AUDIT_TARGETS")
+        .ok()
+        .and_then(|path| read_to_string(path).ok())
+        .map(|contents| {
+            contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        });
     let mut audit = std::env::var("PISCEM_LOCK_AUDIT_DIR")
         .ok()
         .and_then(|dir| {
@@ -2522,7 +2557,7 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             let mut file = File::create(path).ok()?;
             writeln!(
                 file,
-                "sample\teq_idx\teq_count\tresidual_count\tlocked_sum\trescue_fraction\tselected_lock_fraction\tec_size\trescued_targets\tlocked_positive_targets"
+                "sample\teq_idx\teq_count\tresidual_count\tlocked_sum\trescue_fraction\tselected_lock_fraction\tec_size\trescued_targets\tlocked_positive_targets\trescued_target_indices\trescued_target_names\tlocked_target_indices"
             )
             .ok()?;
             Some(file)
@@ -2531,6 +2566,7 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
     let min_lock_threshold = min_lock_threshold.clamp(0.0, 1.0);
     let full_lock_threshold = full_lock_threshold.clamp(min_lock_threshold, 1.0);
     let credible_floor_z = credible_floor_z.max(0.0);
+    let enrichment_posterior_threshold = enrichment_posterior_threshold.clamp(0.0, 1.0);
     let inv_eff_lens = eff_lens
         .iter()
         .map(|&eff_len| {
@@ -2594,10 +2630,37 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
                 0.0
             }
         };
+    let enrichment_credible_floor_lock_fraction =
+        |rescue_fraction: f64, eq_count: f64, rescued_targets: usize, ec_size: usize| {
+            if rescue_fraction <= 0.0 || eq_count <= 0.0 {
+                return 0.0;
+            }
+            if rescued_targets == 0 || rescued_targets >= ec_size || ec_size == 0 {
+                return floor_smooth_confidence_lock_fraction(rescue_fraction);
+            }
+            let null_fraction = (rescued_targets as f64 / ec_size as f64).clamp(1e-9, 1.0 - 1e-9);
+            let variance = (rescue_fraction * (1.0 - rescue_fraction) / eq_count).max(1e-12);
+            let enrichment_posterior =
+                normal_cdf((rescue_fraction - null_fraction) / variance.sqrt());
+            if enrichment_posterior >= enrichment_posterior_threshold {
+                floor_smooth_confidence_lock_fraction(rescue_fraction)
+            } else {
+                0.0
+            }
+        };
 
     for label_idx in 0..packed.len() {
         let label = packed.refs_for_eqc(label_idx);
         let eq_count = packed.counts[label_idx] as f64;
+        let audit_label_selected = audit_targets
+            .as_ref()
+            .map(|targets| {
+                label.target_labels().iter().any(|tid| {
+                    let t = *tid as usize;
+                    targets.contains(&ref_names[t]) || targets.contains(&t.to_string())
+                })
+            })
+            .unwrap_or(true);
         if eq_count <= 0.0 {
             residual_eq_counts.push(0.0);
             continue;
@@ -2611,10 +2674,10 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             denom += w;
         }
         if denom <= 0.0 {
-            if let Some(file) = audit.as_mut() {
+            if audit_label_selected && let Some(file) = audit.as_mut() {
                 let _ = writeln!(
                     file,
-                    "{sample_name}\t{label_idx}\t{eq_count:.6}\t{eq_count:.6}\t0.000000\t0.000000\t0.000000\t{}\t0\t0",
+                    "{sample_name}\t{label_idx}\t{eq_count:.6}\t{eq_count:.6}\t0.000000\t0.000000\t0.000000\t{}\t0\t0\t\t\t",
                     label.target_labels().len()
                 );
             }
@@ -2637,6 +2700,24 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             .iter()
             .filter(|tid| condition_locked_mask[**tid as usize])
             .count();
+        let rescued_target_indices = label
+            .target_labels()
+            .iter()
+            .filter_map(|tid| {
+                let t = *tid as usize;
+                condition_locked_mask[t].then_some(t.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let rescued_target_names = label
+            .target_labels()
+            .iter()
+            .filter_map(|tid| {
+                let t = *tid as usize;
+                condition_locked_mask[t].then_some(ref_names[t].as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let relaxed_ec_lock_fraction = match lock_mode {
             ConditionRescueLockMode::FloorSmoothConfidence => {
                 floor_smooth_confidence_lock_fraction(rescue_fraction)
@@ -2649,6 +2730,22 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
                 rescued_targets,
                 label.target_labels().len(),
             ),
+            ConditionRescueLockMode::EnrichmentCredibleFloor => {
+                enrichment_credible_floor_lock_fraction(
+                    rescue_fraction,
+                    eq_count,
+                    rescued_targets,
+                    label.target_labels().len(),
+                )
+            }
+            ConditionRescueLockMode::EnrichmentCredibleStability => {
+                enrichment_credible_floor_lock_fraction(
+                    rescue_fraction,
+                    eq_count,
+                    rescued_targets,
+                    label.target_labels().len(),
+                )
+            }
             _ => confidence_lock_fraction(rescue_fraction),
         };
         let any_lockable = match lock_mode {
@@ -2659,6 +2756,20 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             ConditionRescueLockMode::FloorSmoothConfidence => relaxed_ec_lock_fraction > 0.0,
             ConditionRescueLockMode::CredibleFloor => relaxed_ec_lock_fraction > 0.0,
             ConditionRescueLockMode::EnrichmentFloor => relaxed_ec_lock_fraction > 0.0,
+            ConditionRescueLockMode::EnrichmentCredibleFloor => relaxed_ec_lock_fraction > 0.0,
+            ConditionRescueLockMode::EnrichmentCredibleStability => {
+                label.target_labels().iter().any(|tid| {
+                    let t = *tid as usize;
+                    condition_locked_mask[t]
+                        && condition_relax_mask.map(|mask| mask[t]).unwrap_or(false)
+                        && relaxed_ec_lock_fraction > 0.0
+                }) || label.target_labels().iter().any(|tid| {
+                    let t = *tid as usize;
+                    condition_locked_mask[t]
+                        && !condition_relax_mask.map(|mask| mask[t]).unwrap_or(false)
+                        && floor_smooth_confidence_lock_fraction(rescue_fraction) > 0.0
+                })
+            }
             ConditionRescueLockMode::GuardedConfidence => {
                 label.target_labels().iter().any(|tid| {
                     let t = *tid as usize;
@@ -2697,17 +2808,18 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             }
         };
         if !any_lockable {
-            if let Some(file) = audit.as_mut() {
+            if audit_label_selected && let Some(file) = audit.as_mut() {
                 let _ = writeln!(
                     file,
-                    "{sample_name}\t{label_idx}\t{eq_count:.6}\t{eq_count:.6}\t0.000000\t{rescue_fraction:.6}\t0.000000\t{}\t{rescued_targets}\t0",
-                    label.target_labels().len()
+                    "{sample_name}\t{label_idx}\t{eq_count:.6}\t{eq_count:.6}\t0.000000\t{rescue_fraction:.6}\t0.000000\t{}\t{rescued_targets}\t0\t{rescued_target_indices}\t{rescued_target_names}\t",
+                    label.target_labels().len(),
                 );
             }
             residual_eq_counts.push(eq_count);
             continue;
         }
         let mut locked_positive_targets = 0usize;
+        let mut locked_target_indices = Vec::new();
         for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
             let t = *tid as usize;
             if condition_locked_mask[t] && w > 0.0 {
@@ -2719,6 +2831,14 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
                     ConditionRescueLockMode::FloorSmoothConfidence => relaxed_ec_lock_fraction,
                     ConditionRescueLockMode::CredibleFloor => relaxed_ec_lock_fraction,
                     ConditionRescueLockMode::EnrichmentFloor => relaxed_ec_lock_fraction,
+                    ConditionRescueLockMode::EnrichmentCredibleFloor => relaxed_ec_lock_fraction,
+                    ConditionRescueLockMode::EnrichmentCredibleStability => {
+                        if condition_relax_mask.map(|mask| mask[t]).unwrap_or(false) {
+                            relaxed_ec_lock_fraction
+                        } else {
+                            floor_smooth_confidence_lock_fraction(rescue_fraction)
+                        }
+                    }
                     ConditionRescueLockMode::GuardedConfidence => {
                         if condition_relax_mask.map(|mask| mask[t]).unwrap_or(false) {
                             relaxed_ec_lock_fraction
@@ -2747,17 +2867,19 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
                 let locked = target_lock_fraction * eq_count * w / denom;
                 if locked > 0.0 {
                     locked_positive_targets += 1;
+                    locked_target_indices.push(t.to_string());
                 }
                 locked_counts[t] += locked;
                 locked_sum += locked;
             }
         }
         let residual_count = (eq_count - locked_sum).max(0.0);
-        if let Some(file) = audit.as_mut() {
+        if audit_label_selected && let Some(file) = audit.as_mut() {
             let _ = writeln!(
                 file,
-                "{sample_name}\t{label_idx}\t{eq_count:.6}\t{residual_count:.6}\t{locked_sum:.6}\t{rescue_fraction:.6}\t{relaxed_ec_lock_fraction:.6}\t{}\t{rescued_targets}\t{locked_positive_targets}",
-                label.target_labels().len()
+                "{sample_name}\t{label_idx}\t{eq_count:.6}\t{residual_count:.6}\t{locked_sum:.6}\t{rescue_fraction:.6}\t{relaxed_ec_lock_fraction:.6}\t{}\t{rescued_targets}\t{locked_positive_targets}\t{rescued_target_indices}\t{rescued_target_names}\t{}",
+                label.target_labels().len(),
+                locked_target_indices.join(",")
             );
         }
         residual_eq_counts.push(residual_count);
@@ -3646,6 +3768,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             ConditionRescueLockMode::GuardedConfidence
                 | ConditionRescueLockMode::Instability
                 | ConditionRescueLockMode::TranscriptStability
+                | ConditionRescueLockMode::EnrichmentCredibleStability
         ) {
         condition_data
             .as_ref()
@@ -3671,7 +3794,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         opts.condition_rescue_instability_cv_threshold,
                         opts.condition_rescue_instability_min_pass_fraction,
                     ),
-                    ConditionRescueLockMode::TranscriptStability => {
+                    ConditionRescueLockMode::TranscriptStability
+                    | ConditionRescueLockMode::EnrichmentCredibleStability => {
                         condition_rescue_transcript_stability_masks(
                             samples,
                             condition_names,
@@ -3704,6 +3828,13 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     ),
                     ConditionRescueLockMode::TranscriptStability => info!(
                         "Condition-rescue transcript-stability lock: {} condition/transcript pairs marked relaxable (mean_count_threshold={:.3}, cv_threshold={:.3}, min_pass_fraction={:.3})",
+                        n_relaxable,
+                        opts.condition_rescue_stability_mean_count_threshold,
+                        opts.condition_rescue_stability_cv_threshold,
+                        opts.condition_rescue_stability_min_pass_fraction
+                    ),
+                    ConditionRescueLockMode::EnrichmentCredibleStability => info!(
+                        "Condition-rescue enrichment-credible-stability lock: {} condition/transcript pairs require enrichment gate (mean_count_threshold={:.3}, cv_threshold={:.3}, min_pass_fraction={:.3})",
                         n_relaxable,
                         opts.condition_rescue_stability_mean_count_threshold,
                         opts.condition_rescue_stability_cv_threshold,
@@ -3827,6 +3958,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                     ConditionRescueLockMode::GuardedConfidence
                                         | ConditionRescueLockMode::Instability
                                         | ConditionRescueLockMode::TranscriptStability
+                                        | ConditionRescueLockMode::EnrichmentCredibleStability
                                 ) && locked
                                 {
                                     condition_relax_mask.map(|mask| mask[t]).unwrap_or(false)
@@ -3838,6 +3970,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         let (residual_eq_counts, locked_counts) =
                             lock_condition_rescue_allocations_for_sample(
                                 &sample.sample_name,
+                                &bundles[i].ref_names,
                                 &bundles[i].packed_eq_map,
                                 &phase1_counts[i],
                                 &bundles[i].eff_lengths,
@@ -3856,6 +3989,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                 opts.condition_rescue_full_lock_threshold,
                                 opts.condition_rescue_min_lock_threshold,
                                 opts.condition_rescue_credible_floor_z,
+                                opts.condition_rescue_enrichment_posterior_threshold,
                             );
                         let free_init = init
                             .as_ref()
@@ -3991,6 +4125,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                             ConditionRescueLockMode::GuardedConfidence
                                 | ConditionRescueLockMode::Instability
                                 | ConditionRescueLockMode::TranscriptStability
+                                | ConditionRescueLockMode::EnrichmentCredibleStability
                         ) && locked
                         {
                             condition_relax_mask.map(|mask| mask[t]).unwrap_or(false)
@@ -4002,6 +4137,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 let (residual_eq_counts, locked_counts) =
                     lock_condition_rescue_allocations_for_sample(
                         &sample.sample_name,
+                        &bundles[i].ref_names,
                         &bundles[i].packed_eq_map,
                         &phase1_counts[i],
                         &bundles[i].eff_lengths,
@@ -4020,6 +4156,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         opts.condition_rescue_full_lock_threshold,
                         opts.condition_rescue_min_lock_threshold,
                         opts.condition_rescue_credible_floor_z,
+                        opts.condition_rescue_enrichment_posterior_threshold,
                     );
                 let free_init = init
                     .as_ref()
@@ -4485,10 +4622,10 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     }
 
     let mut ambiguity_repair_report = if let Some(report_path) = &opts.ambiguity_repair_report {
-        if let Some(parent) = report_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                create_dir_all(parent)?;
-            }
+        if let Some(parent) = report_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            create_dir_all(parent)?;
         }
         let mut file = File::create(report_path).with_context(|| {
             format!(
@@ -4570,7 +4707,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             let pos_profile = transcript_position_profile(&merged_index, t, report_pos_bins);
             let effective_bins = position_effective_bins(&pos_profile);
             let max_bin_frac = max_position_bin_fraction(&pos_profile);
-            let private_ec_fraction = if merged_index.degree(t) > 0 { 0.0 } else { 0.0 };
+            let private_ec_fraction = 0.0;
             writeln!(
                 file,
                 "NA\tstructural_injection_candidate\t{}\t{}\t{}\t{}\t{}\t0.000000\t0.000000\t0.000000\t0.000000\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\tNA\tNA\tNA\tweak_dominator_private_support",
@@ -5157,6 +5294,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         });
         meta_info["condition_rescue_credible_floor_z"] =
             json!(opts.condition_rescue_credible_floor_z);
+        meta_info["condition_rescue_enrichment_posterior_threshold"] =
+            json!(opts.condition_rescue_enrichment_posterior_threshold);
         if let Some((kept, removed)) = selection_stats {
             meta_info["structural_selection"] = json!({
                 "enabled": true,

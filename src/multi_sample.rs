@@ -1286,15 +1286,15 @@ mod tests {
 
         let num_targets = theta.len();
         assert!(
-            num_targets % 2 == 0,
+            num_targets.is_multiple_of(2),
             "need even number of targets for pairing"
         );
 
         let mut eqm = BasicEqMap::new(OrientationProperty::OrientationAgnostic);
 
-        for t in 0..num_targets {
+        for (t, &theta_t) in theta.iter().enumerate().take(num_targets) {
             // Unique reads for this transcript
-            let n_unique = (total_reads as f64 * theta[t] * unique_frac).round() as usize;
+            let n_unique = (total_reads as f64 * theta_t * unique_frac).round() as usize;
             for _ in 0..n_unique {
                 eqm.add(BasicEqLabel::new(&[t as u32], None, None));
             }
@@ -1377,14 +1377,14 @@ mod tests {
         let mut manifest_lines = vec!["sample_name,condition,rad_path,output_dir".to_string()];
 
         for (cond_idx, &cond_name) in conditions.iter().enumerate() {
-            for rep in 0..3 {
+            for (rep, perturbation) in perturbations.iter().enumerate() {
                 let sample_name = format!("{}_{}", cond_name, rep);
                 let sample_dir = tmp.path().join(&sample_name);
 
                 // Compute per-replicate theta with biological variation
                 let base = base_thetas[cond_idx];
                 let mut theta_rep: Vec<f64> = (0..num_targets)
-                    .map(|t| base[t] * perturbations[rep][t].exp())
+                    .map(|t| base[t] * perturbation[t].exp())
                     .collect();
                 let sum: f64 = theta_rep.iter().sum();
                 for t in theta_rep.iter_mut() {

@@ -224,9 +224,11 @@ mod tests {
 
     #[test]
     fn auto_detect_paired_isf() {
-        let mut counts = OrientationCounts::default();
-        counts.forward_reverse = 8000;
-        counts.reverse_forward = 200;
+        let counts = OrientationCounts {
+            forward_reverse: 8000,
+            reverse_forward: 200,
+            ..Default::default()
+        };
         let (lt, ratio) = detect_library_type(&counts, true);
         assert_eq!(lt, LibraryType::InwardStrandedForward);
         assert!(ratio > 0.7);
@@ -234,9 +236,11 @@ mod tests {
 
     #[test]
     fn auto_detect_paired_isr() {
-        let mut counts = OrientationCounts::default();
-        counts.forward_reverse = 200;
-        counts.reverse_forward = 8000;
+        let counts = OrientationCounts {
+            forward_reverse: 200,
+            reverse_forward: 8000,
+            ..Default::default()
+        };
         let (lt, ratio) = detect_library_type(&counts, true);
         assert_eq!(lt, LibraryType::InwardStrandedReverse);
         assert!(ratio < 0.3);
@@ -244,9 +248,11 @@ mod tests {
 
     #[test]
     fn auto_detect_paired_iu() {
-        let mut counts = OrientationCounts::default();
-        counts.forward_reverse = 5000;
-        counts.reverse_forward = 5000;
+        let counts = OrientationCounts {
+            forward_reverse: 5000,
+            reverse_forward: 5000,
+            ..Default::default()
+        };
         let (lt, ratio) = detect_library_type(&counts, true);
         assert_eq!(lt, LibraryType::InwardUnstranded);
         assert!((0.3..=0.7).contains(&ratio));
@@ -254,27 +260,33 @@ mod tests {
 
     #[test]
     fn auto_detect_single_sf() {
-        let mut counts = OrientationCounts::default();
-        counts.forward = 9000;
-        counts.reverse = 1000;
+        let counts = OrientationCounts {
+            forward: 9000,
+            reverse: 1000,
+            ..Default::default()
+        };
         let (lt, _) = detect_library_type(&counts, false);
         assert_eq!(lt, LibraryType::StrandedForward);
     }
 
     #[test]
     fn auto_detect_single_sr() {
-        let mut counts = OrientationCounts::default();
-        counts.forward = 1000;
-        counts.reverse = 9000;
+        let counts = OrientationCounts {
+            forward: 1000,
+            reverse: 9000,
+            ..Default::default()
+        };
         let (lt, _) = detect_library_type(&counts, false);
         assert_eq!(lt, LibraryType::StrandedReverse);
     }
 
     #[test]
     fn auto_detect_single_u() {
-        let mut counts = OrientationCounts::default();
-        counts.forward = 5000;
-        counts.reverse = 5000;
+        let counts = OrientationCounts {
+            forward: 5000,
+            reverse: 5000,
+            ..Default::default()
+        };
         let (lt, ratio) = detect_library_type(&counts, false);
         assert_eq!(lt, LibraryType::Unstranded);
         assert!((0.3..=0.7).contains(&ratio));
@@ -299,9 +311,11 @@ mod tests {
     #[test]
     fn auto_detect_boundary_030() {
         // Exactly at 0.3 boundary — should be unstranded (not < 0.3)
-        let mut counts = OrientationCounts::default();
-        counts.forward = 3000;
-        counts.reverse = 7000;
+        let counts = OrientationCounts {
+            forward: 3000,
+            reverse: 7000,
+            ..Default::default()
+        };
         let (lt, _) = detect_library_type(&counts, false);
         assert_eq!(lt, LibraryType::Unstranded);
     }
@@ -309,9 +323,11 @@ mod tests {
     #[test]
     fn auto_detect_boundary_070() {
         // Exactly at 0.7 boundary — should be unstranded (not > 0.7)
-        let mut counts = OrientationCounts::default();
-        counts.forward = 7000;
-        counts.reverse = 3000;
+        let counts = OrientationCounts {
+            forward: 7000,
+            reverse: 3000,
+            ..Default::default()
+        };
         let (lt, _) = detect_library_type(&counts, false);
         assert_eq!(lt, LibraryType::Unstranded);
     }

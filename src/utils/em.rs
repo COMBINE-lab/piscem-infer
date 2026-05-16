@@ -1434,8 +1434,8 @@ mod tests {
         // for short ones (L ~ max_frag_len), the exact integration diverges
         // from the conditional-mean approximation.
         let mut fld = vec![0u32; 500];
-        for f in 200..400 {
-            fld[f] = 10;
+        for value in fld.iter_mut().take(400).skip(200) {
+            *value = 10;
         }
 
         let ref_lens = vec![1000u32, 500u32, 300u32];
@@ -1467,9 +1467,9 @@ mod tests {
     fn test_positional_eff_lens_totals_match_standard() {
         // Realistic FLD: truncated normal centered at 250, std 50
         let mut fld = vec![0u32; 800];
-        for f in 100..500 {
+        for (f, value) in fld.iter_mut().enumerate().take(500).skip(100) {
             let z = (f as f64 - 250.0) / 50.0;
-            fld[f] = (1000.0 * (-0.5 * z * z).exp()) as u32;
+            *value = (1000.0 * (-0.5 * z * z).exp()) as u32;
         }
 
         let ref_lens: Vec<u32> = (200..2000).step_by(100).map(|x| x as u32).collect();

@@ -92,6 +92,18 @@ pub enum ConditionRescueLockMode {
     Fixed,
     /// Choose full, partial, or no lock from the per-EC rescued posterior fraction.
     Confidence,
+    /// Use the partial lock fraction immediately above the minimum confidence
+    /// threshold, then smoothly increase to full preservation.
+    FloorSmoothConfidence,
+    /// Lock the lower confidence bound of the Phase-1 rescued posterior mass
+    /// in each EC, using the EC count as the effective sample size.
+    CredibleFloor,
+    /// Lock rescued mass in proportion to its posterior enrichment over the
+    /// uniform rescued-target share of the EC.
+    EnrichmentFloor,
+    /// Penalize phase-2 estimates that fall below the phase-1 rescued
+    /// allocation floor without subtracting locked mass from EC counts.
+    FloorBarrier,
     /// Apply confidence-style relaxation only to condition-local rescued
     /// transcripts; rescued transcripts with evidence in multiple conditions
     /// stay fully locked.
@@ -110,11 +122,17 @@ impl FromStr for ConditionRescueLockMode {
         match s.to_lowercase().as_str() {
             "fixed" => Ok(Self::Fixed),
             "confidence" => Ok(Self::Confidence),
+            "floor-smooth-confidence" | "floor_smooth_confidence" => {
+                Ok(Self::FloorSmoothConfidence)
+            }
+            "credible-floor" | "credible_floor" => Ok(Self::CredibleFloor),
+            "enrichment-floor" | "enrichment_floor" => Ok(Self::EnrichmentFloor),
+            "floor-barrier" | "floor_barrier" => Ok(Self::FloorBarrier),
             "guarded-confidence" | "guarded_confidence" => Ok(Self::GuardedConfidence),
             "instability" => Ok(Self::Instability),
             "transcript-stability" | "transcript_stability" => Ok(Self::TranscriptStability),
             other => bail!(
-                "unknown condition rescue lock mode '{}'; expected fixed, confidence, guarded-confidence, instability, or transcript-stability",
+                "unknown condition rescue lock mode '{}'; expected fixed, confidence, floor-smooth-confidence, credible-floor, enrichment-floor, floor-barrier, guarded-confidence, instability, or transcript-stability",
                 other
             ),
         }
@@ -126,6 +144,10 @@ impl Serialize for ConditionRescueLockMode {
         match self {
             Self::Fixed => serializer.serialize_str("fixed"),
             Self::Confidence => serializer.serialize_str("confidence"),
+            Self::FloorSmoothConfidence => serializer.serialize_str("floor-smooth-confidence"),
+            Self::CredibleFloor => serializer.serialize_str("credible-floor"),
+            Self::EnrichmentFloor => serializer.serialize_str("enrichment-floor"),
+            Self::FloorBarrier => serializer.serialize_str("floor-barrier"),
             Self::GuardedConfidence => serializer.serialize_str("guarded-confidence"),
             Self::Instability => serializer.serialize_str("instability"),
             Self::TranscriptStability => serializer.serialize_str("transcript-stability"),
@@ -576,6 +598,16 @@ pub struct ConsensusQuantOpts {
     /// lock. `fixed` uses --condition-rescue-lock-fraction everywhere;
     /// `confidence` locks fully when rescued posterior mass dominates an EC,
     /// partially when it is moderate, and not at all when it is tiny;
+    /// `floor-smooth-confidence` uses the partial lock fraction just above the
+    /// minimum threshold, then smoothly interpolates to full preservation;
+    /// `credible-floor` locks a lower confidence bound on the rescued posterior
+    /// EC mass, replacing fixed posterior-share thresholds with an EC-count
+    /// uncertainty adjustment;
+    /// `enrichment-floor` locks rescued mass according to its posterior
+    /// enrichment over the rescued targets' uniform EC share;
+    /// `floor-barrier` keeps all condition-rescued transcripts in phase 2 and
+    /// applies a one-sided penalty when estimates fall below their Phase-1
+    /// rescued allocation floor;
     /// `guarded-confidence` uses that rule only for condition-local rescued
     /// transcripts and fully locks rescued transcripts with evidence in multiple
     /// conditions;
@@ -585,8 +617,27 @@ pub struct ConsensusQuantOpts {
     /// `transcript-stability` applies the confidence rule unless the rescued
     /// transcript has stable aggregate Phase-1 count support in the current
     /// condition.
-    #[arg(long, default_value = "confidence", requires = "lock_condition_rescue_allocations", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Consensus Filter")]
+    #[arg(long, default_value = "floor-smooth-confidence", requires = "lock_condition_rescue_allocations", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Consensus Filter")]
     pub condition_rescue_lock_mode: ConditionRescueLockMode,
+    /// z-score used by --condition-rescue-lock-mode credible-floor. Larger
+    /// values protect only rescue mass with stronger per-EC posterior support.
+    #[arg(
+        long,
+        default_value_t = 1.96,
+        requires = "lock_condition_rescue_allocations",
+        help_heading = "Consensus Filter"
+    )]
+    pub condition_rescue_credible_floor_z: f64,
+    /// strength of the one-sided rescued-allocation floor penalty used by
+    /// --condition-rescue-lock-mode floor-barrier. Larger values approximate a
+    /// hard floor; 0 disables the penalty.
+    #[arg(
+        long,
+        default_value_t = 10.0,
+        requires = "lock_condition_rescue_allocations",
+        help_heading = "Consensus Filter"
+    )]
+    pub condition_rescue_floor_barrier_weight: f64,
     /// in confidence lock mode, fully lock rescued allocation when rescued
     /// posterior mass is at least this fraction of the EC.
     #[arg(long, default_value_t = 0.5, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Consensus Filter")]

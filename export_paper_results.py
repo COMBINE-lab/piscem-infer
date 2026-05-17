@@ -13,6 +13,8 @@ from pathlib import Path
 
 PSEUDO = 0.01
 COUNT_PSEUDO = 1.0
+SIM_DETECTION_THRESHOLD = 1.0
+SIM_SUPPLEMENT_DETECTION_THRESHOLDS = (2.0, 5.0)
 SEQ_CONDS = ("A", "B", "C", "D")
 SEQ_REPS = (1, 2, 3, 4)
 
@@ -216,6 +218,25 @@ def write_display_tables(outdir: Path, computed: dict[str, list[dict[str, object
             for row in computed["gencode_simulation_count"]
         ],
     )
+    for threshold in SIM_SUPPLEMENT_DETECTION_THRESHOLDS:
+        write_display_csv(
+            display / f"gencode_simulation_count_threshold_{threshold:g}.csv",
+            ["Method", "TP", "FP", "Prec", "Rec", "F1", "Pearson", "Spear", "FC slope"],
+            [
+                [
+                    str(row["Method"]),
+                    format_int(row["TP"]),
+                    format_int(row["FP"]),
+                    format_float(row["Precision"]),
+                    format_float(row["Recall"]),
+                    format_float(row["F1"]),
+                    format_float(row["Pearson"]),
+                    format_float(row["Spearman"]),
+                    format_float(row["FC slope"]),
+                ]
+                for row in computed[f"gencode_simulation_count_threshold_{threshold:g}"]
+            ],
+        )
     write_display_csv(
         display / "airway_replicate_cv.csv",
         ["Method", "Med CV (UNION)", "Med CV (INTER)"],
@@ -305,7 +326,11 @@ def quant_maps(method: Method, samples: list[str], target_to_class: dict[str, st
     return {sample: method.read(sample, target_to_class) for sample in samples}
 
 
-def eval_sim(simdir: Path, target_to_class: dict[str, str]) -> list[dict[str, object]]:
+def eval_sim(
+    simdir: Path,
+    target_to_class: dict[str, str],
+    detection_threshold: float = SIM_DETECTION_THRESHOLD,
+) -> list[dict[str, object]]:
     methods = [
         Method("piscem-infer (single)", read_piscem, lambda s: simdir / "quant_em" / s / f"{s}.quant"),
         Method("salmon (VBEM)", read_salmon, lambda s: simdir / "quant_salmon" / s / "quant.sf"),
@@ -352,9 +377,11 @@ def eval_sim(simdir: Path, target_to_class: dict[str, str]) -> list[dict[str, ob
                 true_count = float(gt.get(target, {"control": 0.0, "treatment": 0.0})[cond])
                 est.append(est_count)
                 true.append(true_count)
-                tp += est_count > 0 and true_count > 0
-                fp += est_count > 0 and true_count == 0
-                fn += est_count == 0 and true_count > 0
+                pred_detected = est_count > detection_threshold
+                true_detected = true_count > detection_threshold
+                tp += pred_detected and true_detected
+                fp += pred_detected and not true_detected
+                fn += not pred_detected and true_detected
             log_est = [math.log2(v + COUNT_PSEUDO) for v in est]
             log_true = [math.log2(v + COUNT_PSEUDO) for v in true]
             all_p.append(pearson(log_est, log_true))
@@ -380,6 +407,7 @@ def eval_sim(simdir: Path, target_to_class: dict[str, str]) -> list[dict[str, ob
         rows.append(
             {
                 "Method": method.name,
+                "Detection threshold": detection_threshold,
                 "TP": tp / len(samples),
                 "FP": fp / len(samples),
                 "FN": fn / len(samples),
@@ -651,6 +679,14 @@ def main() -> None:
     target_to_class, class_to_representative = parse_fasta_classes(args.fasta)
     computed = {
         "gencode_simulation_count": eval_sim(args.simdir, target_to_class),
+        **{
+            f"gencode_simulation_count_threshold_{threshold:g}": eval_sim(
+                args.simdir,
+                target_to_class,
+                detection_threshold=threshold,
+            )
+            for threshold in SIM_SUPPLEMENT_DETECTION_THRESHOLDS
+        },
         "airway_replicate_cv": eval_airway(args.airwaydir, target_to_class),
         "seqc_titration_full": eval_seqc_titration(args.seqcdir, target_to_class),
         "seqc_titration_2m": eval_seqc_titration(args.seqcdir, target_to_class, "_2M"),

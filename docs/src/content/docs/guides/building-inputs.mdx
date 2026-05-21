@@ -1,0 +1,50 @@
+---
+title: Building inputs
+description: Generate the RAD files consumed by piscem-infer.
+---
+
+`piscem-infer` does not build an index or map reads. It consumes RAD files
+created by `piscem` or `piscem-cpp`.
+
+## Build an index
+
+For transcript quantification, build an index over transcript sequences:
+
+```sh
+piscem build \
+  -s gencode.v44.transcripts.fa.gz \
+  -k 31 \
+  -m 19 \
+  -t 16 \
+  -o gencode_v44_idx
+```
+
+Use the same reference for all samples in a multi-sample experiment.
+
+## Map reads
+
+Map each sample to produce one RAD file per sample:
+
+```sh
+piscem map-bulk \
+  -t 16 \
+  -i gencode_v44_idx \
+  -1 sample_1.fastq.gz \
+  -2 sample_2.fastq.gz \
+  -o mappings/sample
+```
+
+The exact output naming is determined by the mapper. In the multi-sample
+manifest, point `rad_path` to the RAD file written for each sample.
+
+## Library type
+
+`piscem-infer` uses Salmon-style library type strings for explicit library
+orientation, and also supports automatic detection in `consensus-quant`:
+
+```sh
+--lib-type auto
+```
+
+For single-sample quantification, pass the expected library type explicitly
+unless automatic detection is available in the workflow you are using.

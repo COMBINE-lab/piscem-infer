@@ -1,0 +1,65 @@
+---
+title: Output files
+description: Files written by piscem-infer quant and consensus-quant.
+---
+
+## Quantification table
+
+The main result file is a tab-separated table:
+
+```text
+<stem>.quant
+```
+
+For `consensus-quant`, the stem is `<output_dir>/<sample_name>`.
+
+| Column | Meaning |
+| --- | --- |
+| `target_name` | Target or transcript identifier. |
+| `len` | Target length in nucleotides. |
+| `eeln` | Estimated effective length. |
+| `tpm` | Transcripts per million. |
+| `ecount` | Expected fragment count assigned to the target. |
+
+For most benchmarking and count-based downstream summaries, use `ecount`.
+
+## Metadata
+
+```text
+<stem>.meta_info.json
+```
+
+The metadata file records run settings, mapped fragment statistics, consensus
+filter parameters, condition-rescue settings, and the `piscem-infer` version.
+This is the best place to confirm the exact options used for a run.
+
+## Fragment length distribution
+
+```text
+<stem>.fld.pq
+```
+
+The fragment length distribution is written as an Apache Parquet file. It is
+used internally to compute effective lengths, but can also be inspected in R,
+Python, or any tool that reads Parquet.
+
+## Inferential replicates
+
+When bootstraps are requested in single-sample mode, inferential replicates are
+written to:
+
+```text
+<stem>.infreps.pq
+```
+
+Each column is one replicate and each row corresponds to one target.
+
+## Audit files
+
+`consensus-quant` can write optional TSV audit files:
+
+| Option | Purpose |
+| --- | --- |
+| `--consensus-audit-output` | Records per-transcript consensus, condition rescue, and final active-set decisions. |
+| `--selection-audit-output` | Records transcript-selection decisions and structural removal reasons. |
+| `--ambiguity-repair-report` | Writes non-mutating ambiguity-group repair diagnostics. |

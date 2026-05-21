@@ -1,0 +1,91 @@
+---
+title: Multi-sample quantification
+description: Recommended consensus-quant workflow for multi-sample transcript abundance estimation.
+---
+
+`consensus-quant` is the recommended workflow for multi-sample transcript
+quantification. It uses all samples to define a stable transcript active set,
+then estimates abundance for each sample.
+
+## Recommended command
+
+```sh
+piscem-infer consensus-quant \
+  --manifest manifest.csv \
+  --lib-type auto \
+  --txp-selection \
+  --filter-mode support \
+  --min-ec-support 2
+```
+
+With a multi-condition manifest, this is the current paper method. Condition
+rescue and locked rescued mass are enabled by default.
+
+The equivalent explicit command is:
+
+```sh
+piscem-infer consensus-quant \
+  --manifest manifest.csv \
+  --lib-type auto \
+  --txp-selection \
+  --filter-mode support \
+  --min-ec-support 2 \
+  --condition-rescue \
+  --lock-condition-rescue-allocations
+```
+
+## What `--txp-selection` does
+
+`--txp-selection` performs transcript variable selection on the merged EC graph
+before the first EM pass. It removes transcript variables that are structurally
+redundant under the observed equivalence classes, using stages such as exact
+signature collapse, unique-EC peeling, and subset dominance.
+
+The goal is to reduce impossible or weakly identifiable transcript competition
+before abundance estimation.
+
+## Consensus filtering
+
+The recommended filter mode is:
+
+```sh
+--filter-mode support --min-ec-support 2
+```
+
+This asks whether a transcript has sufficient effective equivalence-class
+support in enough samples, rather than relying only on a TPM cutoff.
+
+By default, the global sample threshold is `(N - 1) / N`: a transcript passes
+the strict global consensus filter if it is supported in all but one sample.
+
+## Condition rescue
+
+When the manifest contains multiple conditions, condition rescue is enabled
+automatically unless `--no-condition-rescue` is supplied. Condition rescue starts
+with the strict global consensus set, then adds transcripts with reproducible
+phase-1 evidence in at least one condition.
+
+Rescued transcripts are included in the experiment-wide phase-2 candidate set.
+They are not restricted only to the condition that rescued them.
+
+## Locked rescue mass
+
+By default, supported rescued phase-1 per-EC posterior allocation is locked,
+subtracted from EC counts, and added back after residual phase-2 EM. The residual
+mass is re-estimated over the selected transcript set.
+
+This avoids mixing unrelated phase-1 and phase-2 estimates while preserving
+condition-specific signal that would otherwise be removed by strict global
+consensus.
+
+To restore the older unlocked behavior:
+
+```sh
+--no-lock-condition-rescue-allocations
+```
+
+## Threading
+
+Use `--num-threads` to set the total thread budget. `--sample-parallelism`
+controls how many samples are processed concurrently; the default lets the tool
+choose based on the sample count and thread budget.

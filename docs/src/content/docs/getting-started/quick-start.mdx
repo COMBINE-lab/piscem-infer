@@ -1,0 +1,54 @@
+---
+title: Quick start
+description: A minimal multi-sample quantification run.
+---
+
+This page shows the recommended multi-sample command. It assumes you already
+have one RAD file per sample from `piscem map-bulk`.
+
+## Create a manifest
+
+Create a CSV file with one row per sample:
+
+```csv title="manifest.csv"
+sample_name,condition,rad_path,output_dir
+A_1,A,mappings/A_1.rad,quant/A_1
+A_2,A,mappings/A_2.rad,quant/A_2
+B_1,B,mappings/B_1.rad,quant/B_1
+B_2,B,mappings/B_2.rad,quant/B_2
+```
+
+The `condition` column is used to identify reproducible condition-specific
+transcripts. If the manifest contains more than one condition, condition rescue
+is enabled automatically.
+
+## Run the paper-method multi-sample workflow
+
+```sh
+piscem-infer consensus-quant \
+  --manifest manifest.csv \
+  --lib-type auto \
+  --txp-selection \
+  --filter-mode support \
+  --min-ec-support 2
+```
+
+This command:
+
+1. reads all sample RAD files;
+2. optionally removes structurally redundant transcript variables;
+3. runs a first EM pass per sample;
+4. builds a global consensus active set;
+5. rescues reproducible condition-specific transcripts;
+6. runs final per-sample abundance estimation over the selected transcript set.
+
+## Output
+
+Each sample writes output under its `output_dir`. For the first manifest row
+above, the main quantification file is:
+
+```text
+quant/A_1/A_1.quant
+```
+
+See [output files](/piscem-infer/reference/output-files/) for the full list.

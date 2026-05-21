@@ -1,0 +1,49 @@
+---
+title: Installation
+description: Install piscem-infer from crates.io or build it from source.
+---
+
+## Install with Cargo
+
+If you have a Rust toolchain installed, install the released binary with:
+
+```sh
+cargo install piscem-infer
+```
+
+## Build from source
+
+Clone the repository and build the optimized binary:
+
+```sh
+git clone https://github.com/COMBINE-lab/piscem-infer.git
+cd piscem-infer
+cargo build --release
+```
+
+The binary will be available at:
+
+```sh
+./target/release/piscem-infer
+```
+
+## Check the installation
+
+```sh
+piscem-infer --help
+```
+
+You should see the top-level commands:
+
+```text
+quant
+multi-quant
+consensus-quant
+```
+
+## Mapping dependency
+
+`piscem-infer` expects input RAD files. Generate those with
+[`piscem`](https://github.com/COMBINE-lab/piscem) or
+[`piscem-cpp`](https://github.com/COMBINE-lab/piscem-cpp), then pass the RAD
+paths to `piscem-infer`.

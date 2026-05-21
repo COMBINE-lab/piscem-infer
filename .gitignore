@@ -1,6 +1,9 @@
 /untracked_data
 /target
 /sim_data
+docs/.astro/
+docs/dist/
+docs/node_modules/
 
 # Benchmark data and output directories (large, regenerable)
 sim_data_gencode/reads/

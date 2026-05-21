@@ -1,0 +1,77 @@
+---
+title: CLI reference
+description: Common piscem-infer commands and options.
+---
+
+Run `piscem-infer --help` or `piscem-infer <command> --help` for the full
+machine-generated option list.
+
+## Top-level commands
+
+| Command | Description |
+| --- | --- |
+| `quant` | Single-sample quantification from one RAD file. |
+| `consensus-quant` | Consensus-filtered multi-sample quantification. |
+| `multi-quant` | Hierarchical multi-sample quantification mode. |
+
+## `consensus-quant`
+
+```sh
+piscem-infer consensus-quant \
+  --manifest manifest.csv \
+  --lib-type auto \
+  --txp-selection \
+  --filter-mode support \
+  --min-ec-support 2
+```
+
+### Core inputs
+
+| Option | Description |
+| --- | --- |
+| `-m`, `--manifest` | Sample manifest. CSV, JSON, and YAML are supported. |
+| `-l`, `--lib-type` | Expected library type, or `auto` for automatic detection. |
+
+### Recommended active-set options
+
+| Option | Description |
+| --- | --- |
+| `--txp-selection` | Remove structurally redundant transcript variables before EM. |
+| `--filter-mode support` | Use effective EC support for consensus filtering. |
+| `--min-ec-support 2` | Require at least two supporting ECs under the support filter. |
+
+### Condition rescue options
+
+| Option | Description |
+| --- | --- |
+| `--condition-rescue` | Explicitly enable condition rescue. Usually automatic with multiple conditions. |
+| `--no-condition-rescue` | Disable automatic condition rescue. |
+| `--lock-condition-rescue-allocations` | Explicitly request the default locked-rescue path. |
+| `--no-lock-condition-rescue-allocations` | Disable locked rescue and use the older unlocked behavior. |
+| `--condition-rescue-lock-mode` | Advanced rule for how rescued phase-1 mass is locked. |
+
+### Performance options
+
+| Option | Description |
+| --- | --- |
+| `--num-threads` | Total thread budget. |
+| `--sample-parallelism` | Number of samples processed concurrently. |
+| `--phase1-max-iter` | Phase-1 EM iteration cap. |
+| `--phase2-max-iter` | Phase-2 EM iteration cap. |
+
+## `quant`
+
+```sh
+piscem-infer quant \
+  --input mappings/sample \
+  --lib-type IU \
+  --output quant/sample
+```
+
+| Option | Description |
+| --- | --- |
+| `-i`, `--input` | Input RAD stem. |
+| `-l`, `--lib-type` | Expected library type. |
+| `-o`, `--output` | Output stem. |
+| `--num-bootstraps` | Number of bootstrap inferential replicates. |
+| `--num-threads` | Threads used during inference and bootstrapping. |

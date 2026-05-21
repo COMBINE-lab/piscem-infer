@@ -1,0 +1,20 @@
+---
+title: Project status
+description: Current state of piscem-infer and the documentation.
+---
+
+`piscem-infer` is under active development. The single-sample quantification
+path is usable, and the current paper method for multi-sample transcript
+quantification is implemented in `consensus-quant`.
+
+The current recommended multi-sample defaults are:
+
+- support-based consensus filtering;
+- transcript structural selection with `--txp-selection`;
+- automatic condition rescue for multi-condition manifests;
+- locked rescued phase-1 allocation with residual phase-2 re-estimation;
+- mass-preserving post-filter redistribution.
+
+This documentation focuses on the user-facing workflows and file formats. For
+methodological details and benchmarking, see the associated paper and benchmark
+scripts in the repository.

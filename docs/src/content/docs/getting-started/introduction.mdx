@@ -1,0 +1,46 @@
+---
+title: Introduction
+description: What piscem-infer does and when to use it.
+---
+
+`piscem-infer` separates statistical abundance estimation from indexing and
+mapping. Reads are first mapped to a reference with `piscem` or `piscem-cpp`,
+which writes a bulk-oriented RAD file. `piscem-infer` then reads that RAD file
+and estimates transcript, target, or taxon abundances.
+
+## What it estimates
+
+For each target in the mapped reference, `piscem-infer` reports:
+
+- an estimated count, the expected number of fragments assigned to the target;
+- TPM, a length-normalized abundance;
+- the target length and effective length used by the model.
+
+The same machinery can be used for transcriptomes, metagenomic references, or
+other target collections represented in the RAD file.
+
+## Why multi-sample quantification?
+
+Single-sample EM quantification treats each sample independently. That is useful
+and simple, but transcript-level estimates can be unstable when several isoforms
+share the same reads.
+
+The `consensus-quant` workflow uses all samples to define a transcript active
+set before final sample-level re-estimation. In multi-condition experiments, it
+automatically rescues reproducible condition-specific transcripts so that
+condition-specific signal is not removed just because it is absent from other
+conditions.
+
+## Main commands
+
+| Command | Use case |
+| --- | --- |
+| `quant` | Single-sample quantification from one RAD file. |
+| `consensus-quant` | Recommended multi-sample workflow with consensus filtering and condition rescue. |
+| `multi-quant` | Older hierarchical multi-sample quantification mode. |
+
+## Where to next
+
+- [Install `piscem-infer`](/piscem-infer/getting-started/installation/)
+- Run the [quick start](/piscem-infer/getting-started/quick-start/)
+- Read the [multi-sample guide](/piscem-infer/guides/multi-sample-quantification/)

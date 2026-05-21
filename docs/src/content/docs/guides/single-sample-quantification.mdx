@@ -1,0 +1,46 @@
+---
+title: Single-sample quantification
+description: Quantify one mapped RAD file with piscem-infer quant.
+---
+
+Use `quant` when you want an independent estimate for one sample.
+
+## Command
+
+```sh
+piscem-infer quant \
+  --input mappings/sample \
+  --lib-type IU \
+  --output quant/sample \
+  --num-threads 16
+```
+
+The `--input` argument is the RAD input stem. The `--output` argument is an
+output stem; `piscem-infer` appends suffixes such as `.quant` and
+`.meta_info.json`.
+
+## Bootstraps
+
+Inferential replicates can be requested with:
+
+```sh
+piscem-infer quant \
+  --input mappings/sample \
+  --lib-type IU \
+  --output quant/sample \
+  --num-bootstraps 30 \
+  --num-threads 16
+```
+
+Bootstraps are written to a Parquet file named `<output>.infreps.pq`.
+
+## When to use single-sample mode
+
+Single-sample mode is appropriate when:
+
+- you are quantifying one sample;
+- you need independent estimates for each sample;
+- you want bootstrap replicates for uncertainty-aware downstream analysis.
+
+For transcript-level comparisons across multiple samples, use
+[`consensus-quant`](/piscem-infer/guides/multi-sample-quantification/) instead.

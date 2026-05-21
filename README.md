@@ -18,4 +18,5 @@ requests, and to provide feedback on how you'd like to see this next "evolution"
 
 ### Check out the documentation
 
-Detailed documentation for `piscem-infer` is available in our dedicated [ReadTheDocs page](https://piscem-infer.readthedocs.io/en/latest/index.html)
+Detailed documentation for `piscem-infer` is available on the project
+[GitHub Pages site](https://combine-lab.github.io/piscem-infer/).

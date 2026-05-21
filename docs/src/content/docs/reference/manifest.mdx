@@ -1,0 +1,46 @@
+---
+title: Manifest format
+description: CSV, JSON, and YAML manifest inputs for consensus-quant.
+---
+
+`consensus-quant` reads a manifest describing the samples in a multi-sample run.
+The format is detected from the file extension: `.csv`, `.json`, `.yaml`, or
+`.yml`.
+
+## CSV
+
+```csv title="manifest.csv"
+sample_name,condition,rad_path,output_dir
+A_1,A,mappings/A_1.rad,quant/A_1
+A_2,A,mappings/A_2.rad,quant/A_2
+B_1,B,mappings/B_1.rad,quant/B_1
+B_2,B,mappings/B_2.rad,quant/B_2
+```
+
+## Columns
+
+| Column | Description |
+| --- | --- |
+| `sample_name` | Name used in logs and output file stems. |
+| `condition` | Biological or experimental condition label. |
+| `rad_path` | Path to the sample RAD file. |
+| `output_dir` | Directory where sample-level output files are written. |
+
+## Conditions
+
+If more than one unique condition is present, `consensus-quant` automatically
+enables condition rescue unless `--no-condition-rescue` is supplied.
+
+Condition labels should represent the groups in which condition-specific
+transcript expression is biologically plausible, such as treatment/control,
+tissue, mixture component, or time point.
+
+## Output naming
+
+Within each `output_dir`, `piscem-infer` writes files using `sample_name` as the
+stem. For example:
+
+```text
+quant/A_1/A_1.quant
+quant/A_1/A_1.meta_info.json
+```

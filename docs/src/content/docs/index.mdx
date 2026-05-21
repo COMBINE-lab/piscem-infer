@@ -1,0 +1,30 @@
+---
+title: piscem-infer
+description: Transcript-level abundance estimation from bulk-oriented RAD files.
+template: splash
+hero:
+  tagline: Multi-sample transcript quantification from RNA-seq equivalence classes.
+  actions:
+    - text: Quick start
+      link: /piscem-infer/getting-started/quick-start/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/COMBINE-lab/piscem-infer
+      icon: external
+---
+
+`piscem-infer` consumes bulk-oriented RAD files produced by
+[`piscem`](https://github.com/COMBINE-lab/piscem) or
+[`piscem-cpp`](https://github.com/COMBINE-lab/piscem-cpp) and produces
+target abundance estimates.
+
+The current multi-sample workflow estimates transcript abundance jointly across
+samples. It uses a consensus active set, structural transcript selection, and
+condition rescue to preserve reproducible condition-specific signal while still
+estimating abundance at transcript resolution.
+
+## Common workflows
+
+- Use [`quant`](/piscem-infer/guides/single-sample-quantification/) for a single mapped RAD file.
+- Use [`consensus-quant`](/piscem-infer/guides/multi-sample-quantification/) for the recommended multi-sample transcript quantification workflow.
+- Use [`--txp-selection`](/piscem-infer/guides/multi-sample-quantification/#recommended-command) to remove structurally redundant transcript variables before inference.

@@ -1,0 +1,60 @@
+---
+title: Condition rescue
+description: How condition-specific transcript rescue works in consensus-quant.
+---
+
+Condition rescue protects reproducible condition-specific transcripts from being
+discarded by a strict global consensus rule.
+
+## The problem
+
+In a multi-condition experiment, a real transcript may be expressed only in one
+condition. A strict global consensus filter can remove it because it is not
+supported in enough samples across the full experiment.
+
+## Rescue behavior
+
+`consensus-quant` first builds a strict global consensus set. It then identifies
+transcripts that fail this global filter but have reproducible phase-1 evidence
+within at least one condition.
+
+When a transcript is rescued:
+
+- it is added to the experiment-wide phase-2 candidate set;
+- it may receive locked sample-specific allocation where phase-1 evidence
+  supports that allocation;
+- it can be estimated in other samples if the sample-level residual data support
+  it.
+
+Condition labels are used to decide whether a transcript deserves rescue, not
+to force the transcript to be nonzero only in the rescuing condition.
+
+## Locked mass and residual EM
+
+For supported rescued transcripts, `piscem-infer` computes phase-1 posterior
+allocation within each EC. A supported portion of that allocation can be locked
+and subtracted from the EC before phase-2 residual EM. After residual EM, locked
+mass is added back to the transcript count.
+
+The default locking rule is:
+
+```sh
+--condition-rescue-lock-mode enrichment-credible-stability
+```
+
+This rule locks rescued mass when it has stable within-condition phase-1 support
+or credible EC-level enrichment.
+
+## Residual caps
+
+By default, rescue-only transcripts have a sample-local residual cap:
+
+```sh
+--condition-rescue-residual-cap
+--condition-rescue-residual-cap-active-set
+```
+
+The active-set implementation removes rescue-only transcripts from residual EM
+once they hit their cap and subtracts their fixed posterior responsibility from
+the residual EC counts. This keeps the method mass-preserving while avoiding an
+extra final EM pass.

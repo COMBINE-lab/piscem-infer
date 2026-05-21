@@ -20,7 +20,9 @@ use crate::prog_opts::{
     ConditionRescueLockMode, ConsensusQuantOpts, FilterMode, PostFilterRedistributeMode,
     StructuredRescueRankMode,
 };
-use crate::utils::collapsed_eq::{CollapsedEqMap, build_collapsed};
+use crate::utils::collapsed_eq::{
+    CollapsedEqMap, build_collapsed, build_collapsed_with_target_mask,
+};
 use crate::utils::em::{
     EMInfo, em, em_init, em_par, em_par_init, em_par_with_pool, em_par_with_pool_init,
     em_penalized_init, em_penalized_par_init, em_penalized_par_with_pool_init, em_with_coverage,
@@ -3898,7 +3900,11 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     &*(&b.packed_eq_map as *const PackedEqMap<EqLabelT>
                         as *const PackedEqMap<RangeFactorizedEqLabel>)
                 };
-                Some(build_collapsed(pos_map))
+                Some(if let Some(mask) = selection_keep_mask.as_deref() {
+                    build_collapsed_with_target_mask(pos_map, Some(mask))
+                } else {
+                    build_collapsed(pos_map)
+                })
             })
             .collect()
     } else {

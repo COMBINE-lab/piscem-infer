@@ -139,10 +139,21 @@ impl CollapsedEqMap {
 /// counts. When positional binning is disabled globally, the positional
 /// map is already collapsed and this is a cheap identity rebuild.
 pub fn build_collapsed(pos_map: &PackedEqMap<RangeFactorizedEqLabel>) -> CollapsedEqMap {
+    build_collapsed_with_target_mask(pos_map, None)
+}
+
+/// Build a collapsed equivalence-class view, optionally dropping target labels
+/// whose mask entry is false. EC counts are preserved even when all targets in
+/// an EC are removed, so EM initialization and projection see the same total
+/// input weight as the unfiltered map.
+pub fn build_collapsed_with_target_mask(
+    pos_map: &PackedEqMap<RangeFactorizedEqLabel>,
+    target_mask: Option<&[bool]>,
+) -> CollapsedEqMap {
     let n_pos = pos_map.len();
     let has_pos = NUM_POS_BINS.get().is_some_and(|&n| n > 1.0);
 
-    if !has_pos {
+    if !has_pos && target_mask.is_none() {
         // Positional map is already [targets, prob_bins]; reinterpret
         // its bytes as a collapsed-label packed map. Identity mapping.
         let packed = PackedEqMap::<CollapsedRangeFactorizedEqLabel>::from_raw(
@@ -159,23 +170,41 @@ pub fn build_collapsed(pos_map: &PackedEqMap<RangeFactorizedEqLabel>) -> Collaps
     }
 
     // General case: strip the positional-bin segment and merge duplicates.
-    // The positional packed map has layout [targets, prob_bins, pos_bins]
-    // per EC (orientations were stripped at pack time). The collapse key
-    // is the first 2/3 of the byte span per EC.
+    // With a target mask, also drop structurally removed target/bin pairs
+    // without renormalizing the retained probability bins.
     let mut pos_to_collapsed: Vec<u32> = Vec::with_capacity(n_pos);
     let mut key_to_idx: AHashMap<Vec<u32>, u32> = AHashMap::with_capacity(n_pos);
     let mut collapsed_labels: Vec<u32> = Vec::with_capacity(pos_map.eq_labels.len() * 2 / 3);
     let mut collapsed_starts: Vec<u32> = Vec::with_capacity(n_pos + 1);
     let mut collapsed_counts: Vec<usize> = Vec::with_capacity(n_pos);
+    let mut filtered_key: Vec<u32> = Vec::new();
     collapsed_starts.push(0);
 
     for (i, count) in pos_map.counts.iter().enumerate() {
         let s = pos_map.eq_label_starts[i] as usize;
         let e = pos_map.eq_label_starts[i + 1] as usize;
         let full = &pos_map.eq_labels[s..e];
-        // 3-segment layout [targets, prob_bins, pos_bins] → key length 2/3.
-        let n = full.len() / 3;
-        let key = &full[..2 * n];
+        let key = if let Some(mask) = target_mask {
+            filtered_key.clear();
+            let n_segments = if has_pos { 3 } else { 2 };
+            let n = full.len() / n_segments;
+            filtered_key.reserve(2 * n);
+            for &target in &full[..n] {
+                if mask.get(target as usize).copied().unwrap_or(false) {
+                    filtered_key.push(target);
+                }
+            }
+            for (&target, &bin) in full[..n].iter().zip(full[n..2 * n].iter()) {
+                if mask.get(target as usize).copied().unwrap_or(false) {
+                    filtered_key.push(bin);
+                }
+            }
+            filtered_key.as_slice()
+        } else {
+            // 3-segment layout [targets, prob_bins, pos_bins] -> key length 2/3.
+            let n = full.len() / 3;
+            &full[..2 * n]
+        };
 
         if let Some(&idx) = key_to_idx.get(key) {
             pos_to_collapsed.push(idx);
@@ -352,6 +381,54 @@ mod tests {
         let total_pos: f64 = out_pos.iter().sum();
         let total_col: f64 = out_col.iter().sum();
         assert!((total_pos - total_col).abs() < 1e-12);
+    }
+
+    /// Dropping masked targets from the collapsed labels should be equivalent
+    /// to keeping the full EC map but giving those targets zero effective
+    /// length: they contribute zero weight to every denominator.
+    #[test]
+    fn masked_collapse_matches_zero_effective_length() {
+        init_globals();
+
+        let mut eqm =
+            EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAgnostic);
+
+        *eqm.add(RangeFactorizedEqLabel::new(
+            &[0u32, 1u32, 2u32],
+            Some(&[0.2, 0.3, 0.5]),
+            Some(&[0, 1, 2]),
+        )) = 11;
+        *eqm.add(RangeFactorizedEqLabel::new(
+            &[1u32, 3u32],
+            Some(&[0.4, 0.6]),
+            Some(&[2, 3]),
+        )) = 7;
+        *eqm.add(RangeFactorizedEqLabel::new(
+            &[2u32],
+            Some(&[1.0]),
+            Some(&[4]),
+        )) = 5;
+
+        let pos_packed = PackedEqMap::<RangeFactorizedEqLabel>::from_eq_map(&eqm);
+        let keep = vec![true, false, true, false];
+        let collapsed = build_collapsed_with_target_mask(&pos_packed, Some(&keep));
+
+        let prev = vec![10.0, 5.0, 2.0, 8.0];
+        let inv_eff_lens = vec![0.01, 0.0, 0.015, 0.0];
+
+        let mut out_pos = vec![0.0_f64; prev.len()];
+        serial_m_step(&pos_packed, &prev, &inv_eff_lens, &mut out_pos);
+
+        let mut out_col = vec![0.0_f64; prev.len()];
+        serial_m_step(&collapsed.packed, &prev, &inv_eff_lens, &mut out_col);
+
+        for (i, (a, b)) in out_pos.iter().zip(out_col.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "transcript {i}: positional_zero_eff={a} masked_collapsed={b}"
+            );
+        }
+        assert_eq!(collapsed.packed.counts.iter().sum::<usize>(), 23);
     }
 
     /// Local replica of the serial M-step in `em.rs:m_step`. We inline

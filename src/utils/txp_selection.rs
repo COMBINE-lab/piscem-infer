@@ -152,32 +152,37 @@ impl TranscriptEqIndex {
         }
 
         // Sort each transcript's edges by EQ class ID, keeping pos_bins and counts in sync.
+        let mut sort_buf: Vec<(u32, u32, u32)> = Vec::new();
         for t in 0..num_targets {
             let s = offsets[t] as usize;
             let e = offsets[t + 1] as usize;
             if has_pos {
                 // Sort (eqc_id, pos_bin, count) triples together by eqc_id.
-                let mut triples: Vec<(u32, u32, u32)> = eqc_ids[s..e]
-                    .iter()
-                    .zip(pos_bins_vec[s..e].iter())
-                    .zip(ec_counts_vec[s..e].iter())
-                    .map(|((&a, &b), &c)| (a, b, c))
-                    .collect();
-                triples.sort_unstable_by_key(|&(eqc, _, _)| eqc);
-                for (j, &(eqc, pb, cnt)) in triples.iter().enumerate() {
+                sort_buf.clear();
+                sort_buf.extend(
+                    eqc_ids[s..e]
+                        .iter()
+                        .zip(pos_bins_vec[s..e].iter())
+                        .zip(ec_counts_vec[s..e].iter())
+                        .map(|((&a, &b), &c)| (a, b, c)),
+                );
+                sort_buf.sort_unstable_by_key(|&(eqc, _, _)| eqc);
+                for (j, &(eqc, pb, cnt)) in sort_buf.iter().enumerate() {
                     eqc_ids[s + j] = eqc;
                     pos_bins_vec[s + j] = pb;
                     ec_counts_vec[s + j] = cnt;
                 }
             } else {
                 // Sort (eqc_id, count) pairs together.
-                let mut pairs: Vec<(u32, u32)> = eqc_ids[s..e]
-                    .iter()
-                    .zip(ec_counts_vec[s..e].iter())
-                    .map(|(&a, &b)| (a, b))
-                    .collect();
-                pairs.sort_unstable_by_key(|&(eqc, _)| eqc);
-                for (j, &(eqc, cnt)) in pairs.iter().enumerate() {
+                sort_buf.clear();
+                sort_buf.extend(
+                    eqc_ids[s..e]
+                        .iter()
+                        .zip(ec_counts_vec[s..e].iter())
+                        .map(|(&a, &b)| (a, 0, b)),
+                );
+                sort_buf.sort_unstable_by_key(|&(eqc, _, _)| eqc);
+                for (j, &(eqc, _, cnt)) in sort_buf.iter().enumerate() {
                     eqc_ids[s + j] = eqc;
                     ec_counts_vec[s + j] = cnt;
                 }
@@ -297,7 +302,10 @@ pub fn signature_collapse(index: &TranscriptEqIndex) -> SignatureGroups {
 
     // Hash each transcript's signature → group by hash.
     // Use the signature slice directly as the map key (via a u64 hash for speed).
-    let mut groups: AHashMap<&[u32], Vec<u32>> = AHashMap::new();
+    let n_with_eqc = (0..num_targets)
+        .filter(|&t| !index.signature(t).is_empty())
+        .count();
+    let mut groups: AHashMap<&[u32], Vec<u32>> = AHashMap::with_capacity(n_with_eqc);
 
     for t in 0..num_targets {
         let sig = index.signature(t);
@@ -316,7 +324,7 @@ pub fn signature_collapse(index: &TranscriptEqIndex) -> SignatureGroups {
     group_list.sort_unstable_by_key(|g| g[0]);
 
     let mut representatives = Vec::with_capacity(group_list.len());
-    let mut members = Vec::new();
+    let mut members = Vec::with_capacity(n_with_eqc);
     let mut offsets = Vec::with_capacity(group_list.len() + 1);
     offsets.push(0u32);
 
@@ -522,7 +530,7 @@ pub fn subset_dominance(index: &TranscriptEqIndex, groups: &SignatureGroups) -> 
 pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
     index: &TranscriptEqIndex,
     groups: &SignatureGroups,
-    packed_map: &PackedEqMap<EqLabelT>,
+    _packed_map: &PackedEqMap<EqLabelT>,
     _num_targets: usize,
 ) -> Vec<bool> {
     use crate::utils::eq_maps::NUM_POS_BINS;
@@ -532,24 +540,7 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
         // No positional information — fall back to standard dominance.
         return subset_dominance(index, groups);
     }
-
-    // Build a lookup: for each (eqc_idx, transcript_id) → pos_bin.
-    // We store this as a flat HashMap for fast access.
-    let mut eqc_txp_posbin: std::collections::HashMap<(u32, u32), u32> =
-        std::collections::HashMap::new();
-    for eqc_idx in 0..packed_map.len() {
-        let label = packed_map.refs_for_eqc(eqc_idx);
-        if let Some(pos_bins) = label.target_pos_bins() {
-            for (tid, &pb) in label.target_labels().iter().zip(pos_bins.iter()) {
-                eqc_txp_posbin.insert((eqc_idx as u32, *tid), pb);
-            }
-        }
-    }
-
-    // If none of the labels actually carry positional bins (e.g. a
-    // `BasicEqLabel`-backed map built against a globally-enabled
-    // `NUM_POS_BINS`), fall back to the standard subset-dominance check.
-    if eqc_txp_posbin.is_empty() {
+    if !index.has_pos_bins() {
         return subset_dominance(index, groups);
     }
 
@@ -574,6 +565,7 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
         }
     }
 
+    let mut n_saved = 0usize;
     for &gi in &group_order {
         if dominated[gi] {
             continue;
@@ -590,6 +582,7 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
             .min_by_key(|&&eqc| eqc_to_groups[eqc as usize].len())
             .unwrap();
 
+        let mut saw_structural_superset = false;
         for &candidate_gj in &eqc_to_groups[*rarest_eqc as usize] {
             let gj = candidate_gj as usize;
             if gj == gi || dominated[gj] {
@@ -601,39 +594,27 @@ pub fn subset_dominance_with_coverage<EqLabelT: EqLabel>(
                 continue;
             }
 
-            if !is_sorted_subset(sig_i, sig_j) {
+            let Some(n_distinct_bins) = sorted_subset_pos_bin_count(index, sig_i, rep_j) else {
                 continue;
-            }
+            };
+            saw_structural_superset = true;
 
-            // sig_i ⊆ sig_j confirmed. Now check coverage plausibility:
+            // sig_i is a subset of sig_j. Now check coverage plausibility:
             // For each EC in sig_i, what position bin does transcript j have?
-            // If j's bins are spread across ≥ 2 distinct bins, the coverage is plausible.
-            let mut j_bins_used = [false; 32]; // up to 32 pos bins
-            let tid_j = rep_j as u32;
-            for &eqc in sig_i {
-                if let Some(&pb) = eqc_txp_posbin.get(&(eqc, tid_j)) {
-                    j_bins_used[(pb as usize).min(31)] = true;
-                }
-            }
-            let n_distinct_bins = j_bins_used.iter().filter(|&&b| b).count();
-
+            // If j's bins are spread across at least 2 distinct bins, the coverage is plausible.
             // Plausibility: j must use reads from at least 2 distinct position bins.
             // If all of i's reads map to a single position on j, j's coverage
-            // would be a spike — implausible, so i is NOT dominated.
+            // would be a spike: implausible, so i is NOT dominated.
             if n_distinct_bins >= 2 {
                 dominated[gi] = true;
                 break;
             }
-            // Otherwise: single-bin coverage on j → don't mark i as dominated.
+            // Otherwise: single-bin coverage on j means do not mark i as dominated.
+        }
+        if saw_structural_superset && !dominated[gi] {
+            n_saved += 1;
         }
     }
-
-    let n_saved = {
-        let standard = subset_dominance(index, groups);
-        let n_standard = standard.iter().filter(|&&d| d).count();
-        let n_coverage = dominated.iter().filter(|&&d| d).count();
-        n_standard - n_coverage
-    };
     if n_saved > 0 {
         info!(
             "  Coverage plausibility rescued {} groups from dominance removal",
@@ -662,6 +643,37 @@ fn is_sorted_subset(a: &[u32], b: &[u32]) -> bool {
         bi += 1;
     }
     true
+}
+
+/// If `subset_sig` is a subset of `target`'s signature, count the distinct
+/// position bins used by `target` over those shared ECs.
+///
+/// Both signatures are sorted, so this avoids building a large `(EC, target)`
+/// lookup table during coverage-aware dominance checks.
+fn sorted_subset_pos_bin_count(
+    index: &TranscriptEqIndex,
+    subset_sig: &[u32],
+    target: usize,
+) -> Option<usize> {
+    let target_sig = index.signature(target);
+    let target_bins = index.pos_bins_for(target)?;
+    let mut bins_used = [false; 32];
+    let mut j = 0usize;
+    for &eqc in subset_sig {
+        while j < target_sig.len() && target_sig[j] < eqc {
+            j += 1;
+        }
+        if j >= target_sig.len() {
+            return None;
+        }
+        if target_sig[j] == eqc {
+            bins_used[(target_bins[j] as usize).min(31)] = true;
+            j += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(bins_used.iter().filter(|&&b| b).count())
 }
 
 /// Result of the full variable selection pipeline.
@@ -846,20 +858,20 @@ pub fn merge_transcript_indices(
     }
 
     // Sort each transcript's merged signature, keeping pos_bins and counts in sync.
+    let mut sort_buf: Vec<(u32, u32, u32)> = Vec::new();
     for t in 0..num_targets {
         let s = offsets[t] as usize;
         let e = offsets[t + 1] as usize;
         if has_pos || has_counts {
             // Build sortable tuples: (eqc_id, pos_bin, count)
-            let mut triples: Vec<(u32, u32, u32)> = (s..e)
-                .map(|k| {
-                    let pb = if has_pos { pos_bins_vec[k] } else { 0 };
-                    let cnt = if has_counts { ec_counts_vec[k] } else { 0 };
-                    (eqc_ids[k], pb, cnt)
-                })
-                .collect();
-            triples.sort_unstable_by_key(|&(eqc, _, _)| eqc);
-            for (j, &(eqc, pb, cnt)) in triples.iter().enumerate() {
+            sort_buf.clear();
+            sort_buf.extend((s..e).map(|k| {
+                let pb = if has_pos { pos_bins_vec[k] } else { 0 };
+                let cnt = if has_counts { ec_counts_vec[k] } else { 0 };
+                (eqc_ids[k], pb, cnt)
+            }));
+            sort_buf.sort_unstable_by_key(|&(eqc, _, _)| eqc);
+            for (j, &(eqc, pb, cnt)) in sort_buf.iter().enumerate() {
                 eqc_ids[s + j] = eqc;
                 if has_pos {
                     pos_bins_vec[s + j] = pb;
@@ -1015,17 +1027,7 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                 }
             }
 
-            // Build reverse map: (eqc, transcript) → position in transcript's signature.
-            let mut eqc_txp_sigpos: std::collections::HashMap<(u32, u32), usize> =
-                std::collections::HashMap::new();
-            for t in 0..num_targets {
-                let sig = index.signature(t);
-                let base = index.offsets[t] as usize;
-                for (j, &eqc) in sig.iter().enumerate() {
-                    eqc_txp_sigpos.insert((eqc, t as u32), base + j);
-                }
-            }
-
+            let mut n_saved = 0usize;
             for &gi in &group_order {
                 if dominated[gi] {
                     continue;
@@ -1042,6 +1044,7 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                     .min_by_key(|&&eqc| eqc_to_groups[eqc as usize].len())
                     .unwrap();
 
+                let mut saw_structural_superset = false;
                 for &candidate_gj in &eqc_to_groups[*rarest_eqc as usize] {
                     let gj = candidate_gj as usize;
                     if gj == gi || dominated[gj] {
@@ -1052,20 +1055,13 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                     if sig_j.len() <= deg_i {
                         continue;
                     }
-                    if !is_sorted_subset(sig_i, sig_j) {
+                    let Some(n_distinct_bins) = sorted_subset_pos_bin_count(index, sig_i, rep_j)
+                    else {
                         continue;
-                    }
+                    };
+                    saw_structural_superset = true;
 
                     // Coverage plausibility: check j's pos bins from i's shared ECs.
-                    let mut j_bins_used = [false; 32];
-                    for &eqc in sig_i {
-                        if let Some(&sig_pos) = eqc_txp_sigpos.get(&(eqc, rep_j as u32)) {
-                            let pb = index.pos_bins[sig_pos];
-                            j_bins_used[(pb as usize).min(31)] = true;
-                        }
-                    }
-                    let n_distinct_bins = j_bins_used.iter().filter(|&&b| b).count();
-
                     if n_distinct_bins < 2 {
                         continue; // implausible single-bin coverage → don't dominate
                     }
@@ -1073,14 +1069,11 @@ pub fn run_selection_from_index_with_coverage<EqLabelT: EqLabel>(
                     dominated[gi] = true;
                     break;
                 }
+                if saw_structural_superset && !dominated[gi] {
+                    n_saved += 1;
+                }
             }
 
-            let n_saved = {
-                let standard = subset_dominance(index, &groups);
-                let n_standard = standard.iter().filter(|&&d| d).count();
-                let n_coverage = dominated.iter().filter(|&&d| d).count();
-                n_standard - n_coverage
-            };
             if n_saved > 0 {
                 info!(
                     "  Coverage plausibility rescued {} groups from dominance removal",

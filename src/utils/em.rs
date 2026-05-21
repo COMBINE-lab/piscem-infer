@@ -438,23 +438,23 @@ fn m_step_par_from_slice<EqLabelT: EqLabel>(
 }
 
 #[inline]
-fn em_step_plain_par_in_pool<EqLabelT: EqLabel>(
+fn em_step_plain_par_in_pool_into<EqLabelT: EqLabel>(
     eq_iterates: &[(EqLabelT::LabelRefT<'_>, &usize)],
     inv_eff_lens: &[f64],
     prev_counts: &[f64],
     curr_counts: &mut [AtomicF64],
     pool: &ThreadPool,
-) -> Vec<f64> {
+    out: &mut [f64],
+) {
     install_in_pool(Some(pool), || {
         curr_counts
             .par_iter()
             .for_each(|x| x.store(0.0f64, Ordering::Relaxed));
         m_step_par_from_slice::<EqLabelT>(eq_iterates, prev_counts, inv_eff_lens, curr_counts);
     });
-    curr_counts
-        .iter()
-        .map(|x| x.load(Ordering::Relaxed))
-        .collect::<Vec<f64>>()
+    for (dst, src) in out.iter_mut().zip(curr_counts.iter()) {
+        *dst = src.load(Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -683,7 +683,7 @@ pub fn squarem_em_init<EqLabelT: EqLabel>(
         em_steps += 1;
 
         let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
-        let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
+        let candidate: &[f64] = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
             for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
             {
                 let r = b - a;
@@ -765,45 +765,50 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
 
     let mut x0 = initial_counts(eff_lens, total_weight, init_counts);
     project_counts(&mut x0, eff_lens, total_weight);
+    let mut x1 = vec![0.0f64; eff_lens.len()];
+    let mut x2 = vec![0.0f64; eff_lens.len()];
+    let mut x_sq = vec![0.0f64; eff_lens.len()];
+    let mut x_next = vec![0.0f64; eff_lens.len()];
     let mut em_steps = 0_u32;
     let mut last_rel_diff = f64::INFINITY;
     let mut accel_attempts = 0_u32;
     let mut accel_accepts = 0_u32;
 
     while em_steps < max_iter {
-        let x1 = em_step_plain_par_in_pool::<EqLabelT>(
+        em_step_plain_par_in_pool_into::<EqLabelT>(
             &eq_iterates,
             inv_eff_lens,
             &x0,
             &mut curr_counts,
             pool,
+            &mut x1,
         );
         em_steps += 1;
         let rel1 = compute_rel_diff(&x0, &x1, presence_thresh);
         last_rel_diff = rel1;
         if rel1 < em_info.convergence_thresh || em_steps >= max_iter {
-            x0 = x1;
+            x0.clone_from_slice(&x1);
             break;
         }
 
         if !should_try_squarem(em_steps, last_rel_diff, opts) || em_steps >= max_iter {
-            x0 = x1;
+            x0.clone_from_slice(&x1);
             continue;
         }
 
         accel_attempts += 1;
-        let x2 = em_step_plain_par_in_pool::<EqLabelT>(
+        em_step_plain_par_in_pool_into::<EqLabelT>(
             &eq_iterates,
             inv_eff_lens,
             &x1,
             &mut curr_counts,
             pool,
+            &mut x2,
         );
         em_steps += 1;
 
         let ordinary_rel = compute_rel_diff(&x1, &x2, presence_thresh);
         let candidate = if let Some(alpha) = squarem_alpha(&x0, &x1, &x2, opts) {
-            let mut x_sq = vec![0.0f64; eff_lens.len()];
             for (((sq, &a), &b), &c) in x_sq.iter_mut().zip(x0.iter()).zip(x1.iter()).zip(x2.iter())
             {
                 let r = b - a;
@@ -812,31 +817,32 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
             }
             project_counts(&mut x_sq, eff_lens, total_weight);
             if em_steps < max_iter {
-                let x_next = em_step_plain_par_in_pool::<EqLabelT>(
+                em_step_plain_par_in_pool_into::<EqLabelT>(
                     &eq_iterates,
                     inv_eff_lens,
                     &x_sq,
                     &mut curr_counts,
                     pool,
+                    &mut x_next,
                 );
                 em_steps += 1;
                 let candidate_rel = compute_rel_diff(&x_sq, &x_next, presence_thresh);
                 if x_next.iter().all(|x| x.is_finite() && *x >= 0.0) && candidate_rel < ordinary_rel
                 {
                     accel_accepts += 1;
-                    x_next
+                    &x_next
                 } else {
-                    x2
+                    &x2
                 }
             } else {
-                x2
+                &x2
             }
         } else {
-            x2
+            &x2
         };
 
-        let rel_diff = compute_rel_diff(&x0, &candidate, presence_thresh);
-        x0 = candidate;
+        let rel_diff = compute_rel_diff(&x0, candidate, presence_thresh);
+        x0.clone_from_slice(candidate);
         if rel_diff < em_info.convergence_thresh {
             break;
         }
@@ -847,18 +853,19 @@ pub fn squarem_em_par_with_pool_init<EqLabelT: EqLabel>(
             *x = 0.0;
         }
     });
-    let final_counts = em_step_plain_par_in_pool::<EqLabelT>(
+    em_step_plain_par_in_pool_into::<EqLabelT>(
         &eq_iterates,
         inv_eff_lens,
         &x0,
         &mut curr_counts,
         pool,
+        &mut x1,
     );
     info!(
         "SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_rel_diff={:.6}",
         em_steps, accel_attempts, accel_accepts, last_rel_diff
     );
-    final_counts
+    x1
 }
 
 /// Run EM with pseudo-count regularization from a hierarchical prior.

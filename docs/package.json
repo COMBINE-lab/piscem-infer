@@ -14,7 +14,7 @@
     "@astrojs/check": "^0.9.4",
     "@astrojs/starlight": "^0.35.2",
     "astro": "^5.9.2",
+    "starlight-theme-galaxy": "^0.7.0",
     "typescript": "^5.8.3"
-  },
-  "devDependencies": {}
+  }
 }

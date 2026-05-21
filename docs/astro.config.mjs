@@ -1,11 +1,13 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import starlightThemeGalaxy from 'starlight-theme-galaxy';
 
 export default defineConfig({
   site: 'https://combine-lab.github.io',
   base: '/piscem-infer',
   integrations: [
     starlight({
+      plugins: [starlightThemeGalaxy()],
       title: 'piscem-infer',
       description:
         'Transcript-level abundance estimation from bulk-oriented RAD files, including multi-sample quantification with condition rescue.',

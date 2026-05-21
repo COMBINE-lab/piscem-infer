@@ -1,5 +1,5 @@
 use anyhow::bail;
-use clap::Args;
+use clap::{ArgAction, Args};
 use clap::{Parser, Subcommand};
 use clap_num::number_range;
 
@@ -47,6 +47,54 @@ impl Serialize for FilterMode {
             Self::Ues => serializer.serialize_str("ues"),
             Self::Support => serializer.serialize_str("support"),
             Self::Hybrid => serializer.serialize_str("hybrid"),
+        }
+    }
+}
+
+/// How post-Phase2 leakage-filter mass is redistributed when enabled.
+#[derive(Debug, Clone, Default)]
+pub enum PostFilterRedistributeMode {
+    /// Transfer removed mass to the dominant retained transcript in the same
+    /// local filter group.
+    #[default]
+    Dominator,
+    /// Transfer removed mass across retained transcripts that share ECs with
+    /// the removed transcript, proportional to their current posterior mass.
+    SharedPosterior,
+    /// Transfer removed mass using a one-shot local responsibility calculation:
+    /// estimate the removed transcript's EC-level assignment under the current
+    /// abundances, then reassign that mass to retained local competitors in the
+    /// same ECs according to their posterior fractions with the removed
+    /// transcript excluded.
+    SharedResponsibility,
+    /// After identifying post-Phase2 leakage transcripts, run one additional
+    /// EM pass with those transcripts masked out, initialized from Phase 2.
+    FinalEm,
+}
+
+impl FromStr for PostFilterRedistributeMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "dominator" => Ok(Self::Dominator),
+            "shared-posterior" | "shared_posterior" => Ok(Self::SharedPosterior),
+            "shared-responsibility" | "shared_responsibility" => Ok(Self::SharedResponsibility),
+            "final-em" | "final_em" => Ok(Self::FinalEm),
+            other => bail!(
+                "unknown post-filter redistribution mode '{}'; expected dominator, shared-posterior, shared-responsibility, or final-em",
+                other
+            ),
+        }
+    }
+}
+
+impl Serialize for PostFilterRedistributeMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Dominator => serializer.serialize_str("dominator"),
+            Self::SharedPosterior => serializer.serialize_str("shared-posterior"),
+            Self::SharedResponsibility => serializer.serialize_str("shared-responsibility"),
+            Self::FinalEm => serializer.serialize_str("final-em"),
         }
     }
 }
@@ -571,9 +619,9 @@ pub struct ConsensusQuantOpts {
     pub condition_aware_consensus: bool,
     /// use strict global consensus, then rescue transcripts that fail globally
     /// but have reproducible phase-1 TPM evidence within at least one
-    /// condition. By default, rescue-only transcripts retain their phase-1
-    /// estimates after phase 2. Enabled automatically when the manifest has
-    /// multiple conditions. Use --no-condition-rescue to disable.
+    /// condition. Enabled automatically when the manifest has multiple
+    /// conditions. By default, rescued phase-1 allocation is locked and
+    /// residual phase-2 mass is re-estimated experiment-wide.
     #[arg(
         long,
         conflicts_with = "condition_aware_consensus",
@@ -583,19 +631,13 @@ pub struct ConsensusQuantOpts {
     /// disable automatic condition rescue when multiple conditions are present.
     #[arg(long, conflicts_with_all = ["condition_rescue", "condition_aware_consensus"], help_heading = "Consensus Filter")]
     pub no_condition_rescue: bool,
-    /// re-estimate condition-rescued transcripts during phase 2 instead of
-    /// restoring their phase-1 estimates. The phase-2 active set remains
-    /// sample-specific: strict global consensus plus transcripts rescued for
-    /// the sample's condition.
+    /// re-estimate condition-rescued transcripts during phase 2 without locked
+    /// phase-1 allocations.
     #[arg(long, requires = "condition_rescue", help_heading = "Consensus Filter")]
     pub reestimate_condition_rescue: bool,
-    /// lock condition-rescued transcripts to phase-1 per-EC posterior
-    /// allocations, subtract that locked mass from each EC, then run phase-2 EM
-    /// on the residual EC counts. By default, rescued mass is locked when it has
-    /// stable within-condition Phase-1 support or credibly enriched EC-level
-    /// posterior support. With a multi-condition manifest, condition rescue is
-    /// enabled automatically, so this flag is the only extra flag needed to
-    /// request the recommended locked-rescue path.
+    /// explicitly request the default locked-rescue path: lock supported
+    /// rescued phase-1 per-EC posterior allocations, subtract that locked mass
+    /// from each EC, then run phase-2 EM on the residual EC counts.
     #[arg(
         long,
         conflicts_with_all = [
@@ -606,10 +648,23 @@ pub struct ConsensusQuantOpts {
         help_heading = "Consensus Filter"
     )]
     pub lock_condition_rescue_allocations: bool,
+    /// disable the default locked-rescue path and restore the older behavior
+    /// where rescue-only transcripts keep phase-1 estimates unless
+    /// --reestimate-condition-rescue is also supplied.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "lock_condition_rescue_allocations",
+            "condition_aware_consensus",
+            "no_condition_rescue"
+        ],
+        help_heading = "Consensus Filter"
+    )]
+    pub no_lock_condition_rescue_allocations: bool,
     /// fraction of each condition-rescued transcript's phase-1 per-EC posterior
     /// allocation to lock. A value below 1 leaves the un-locked residual mass
     /// available to phase-2 EM over the full active set.
-    #[arg(long, default_value_t = 0.75, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
+    #[arg(long, default_value_t = 0.75, value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_lock_fraction: f64,
     /// advanced rule for choosing how much condition-rescued posterior
     /// allocation to lock. The default, `enrichment-credible-stability`, locks
@@ -642,14 +697,13 @@ pub struct ConsensusQuantOpts {
     /// `transcript-stability` applies the confidence rule unless the rescued
     /// transcript has stable aggregate Phase-1 count support in the current
     /// condition.
-    #[arg(long, default_value = "enrichment-credible-stability", requires = "lock_condition_rescue_allocations", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Advanced Consensus Filter")]
+    #[arg(long, default_value = "enrichment-credible-stability", value_parser = clap::value_parser!(ConditionRescueLockMode), help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_lock_mode: ConditionRescueLockMode,
     /// z-score used by --condition-rescue-lock-mode credible-floor. Larger
     /// values protect only rescue mass with stronger per-EC posterior support.
     #[arg(
         long,
         default_value_t = 1.96,
-        requires = "lock_condition_rescue_allocations",
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_credible_floor_z: f64,
@@ -659,7 +713,6 @@ pub struct ConsensusQuantOpts {
     #[arg(
         long,
         default_value_t = 10.0,
-        requires = "lock_condition_rescue_allocations",
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_floor_barrier_weight: f64,
@@ -669,32 +722,30 @@ pub struct ConsensusQuantOpts {
     #[arg(
         long,
         default_value_t = 0.5,
-        requires = "lock_condition_rescue_allocations",
         value_parser = fraction_0_to_1,
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_enrichment_posterior_threshold: f64,
     /// in confidence lock mode, fully lock rescued allocation when rescued
     /// posterior mass is at least this fraction of the EC.
-    #[arg(long, default_value_t = 0.5, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
+    #[arg(long, default_value_t = 0.5, value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_full_lock_threshold: f64,
     /// in confidence lock mode, do not lock rescued allocation when rescued
     /// posterior mass is below this fraction of the EC.
-    #[arg(long, default_value_t = 0.1, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
+    #[arg(long, default_value_t = 0.1, value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_min_lock_threshold: f64,
     /// in instability lock mode, relax rescued transcripts whose within-condition
     /// Phase-1 count CV is at least this value.
     #[arg(
         long,
         default_value_t = 1.0,
-        requires = "lock_condition_rescue_allocations",
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_instability_cv_threshold: f64,
     /// in instability lock mode, relax rescued transcripts whose within-condition
     /// sample pass fraction is below this value. The default relaxes rescued
     /// transcripts with any replicate dropout in their rescued condition.
-    #[arg(long, default_value_t = 1.0, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
+    #[arg(long, default_value_t = 1.0, value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_instability_min_pass_fraction: f64,
     /// in guarded-confidence lock mode, count a transcript as having condition
     /// evidence when its mean Phase-1 count in that condition is at least this
@@ -703,7 +754,6 @@ pub struct ConsensusQuantOpts {
     #[arg(
         long,
         default_value_t = 1.0,
-        requires = "lock_condition_rescue_allocations",
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_guard_mean_count_threshold: f64,
@@ -713,7 +763,6 @@ pub struct ConsensusQuantOpts {
     #[arg(
         long,
         default_value_t = 5.0,
-        requires = "lock_condition_rescue_allocations",
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_stability_mean_count_threshold: f64,
@@ -722,15 +771,65 @@ pub struct ConsensusQuantOpts {
     #[arg(
         long,
         default_value_t = 1.0,
-        requires = "lock_condition_rescue_allocations",
         help_heading = "Advanced Consensus Filter"
     )]
     pub condition_rescue_stability_cv_threshold: f64,
     /// in stability-aware lock modes, treat rescued transcripts as stable only
     /// when their sample pass fraction in the current condition is at least
     /// this value.
-    #[arg(long, default_value_t = 0.75, requires = "lock_condition_rescue_allocations", value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
+    #[arg(long, default_value_t = 0.75, value_parser = fraction_0_to_1, help_heading = "Advanced Consensus Filter")]
     pub condition_rescue_stability_min_pass_fraction: f64,
+    /// minimum sample-local Phase-1 count required for a rescued transcript to
+    /// participate as a free residual Phase-2 EM variable. The transcript can
+    /// still receive locked sample-specific mass below this threshold. A value
+    /// of 0 disables the sample-local free-variable gate.
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub condition_rescue_free_min_count: f64,
+    /// cap residual Phase-2 EM mass for rescue-only transcripts using a
+    /// sample-local Phase-1 count bound. Locked mass is not capped and is added
+    /// back after residual EM.
+    #[arg(
+        long,
+        default_value_t = true,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub condition_rescue_residual_cap: bool,
+    /// disable residual Phase-2 EM mass caps for rescue-only transcripts.
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub no_condition_rescue_residual_cap: bool,
+    /// z multiplier for --condition-rescue-residual-cap. The residual cap is
+    /// max(phase1_count + z * sqrt(max(phase1_count, 1)) - locked_count, 0).
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub condition_rescue_residual_cap_z: f64,
+    /// when using residual caps, remove rescue-only transcripts from the
+    /// residual EM once they reach their residual cap and subtract their fixed
+    /// posterior responsibility from residual EC counts.
+    #[arg(
+        long,
+        default_value_t = true,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub condition_rescue_residual_cap_active_set: bool,
+    /// disable inline active-set residual caps and instead project capped
+    /// rescue-only counts inside the residual Phase-2 EM.
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help_heading = "Advanced Consensus Filter"
+    )]
+    pub no_condition_rescue_residual_cap_active_set: bool,
     /// experimental rescue mode: admit rescue at an EC-graph-group level, then
     /// emit only the dominant rescued isoforms within each admitted group.
     #[arg(long, requires = "condition_rescue", help_heading = "Consensus Filter")]
@@ -866,6 +965,21 @@ pub struct ConsensusQuantOpts {
     /// Set to 0 to disable.
     #[arg(long, default_value_t = 0.01, help_heading = "Consensus Filter")]
     pub gene_fraction_filter: f64,
+    /// preserve total assigned mass in the post-Phase2 leakage filter. This is
+    /// now the default; the flag is retained for explicit command provenance.
+    #[arg(long, help_heading = "Consensus Filter")]
+    pub post_filter_redistribute_mass: bool,
+    /// disable post-Phase2 leakage-filter mass redistribution, reproducing the
+    /// older lossy behavior in which filtered transcript mass is discarded.
+    #[arg(
+        long,
+        conflicts_with = "post_filter_redistribute_mass",
+        help_heading = "Consensus Filter"
+    )]
+    pub no_post_filter_redistribute_mass: bool,
+    /// rule for redistributing mass removed by the post-Phase2 leakage filter.
+    #[arg(long, default_value = "shared-responsibility", value_parser = clap::value_parser!(PostFilterRedistributeMode), help_heading = "Consensus Filter")]
+    pub post_filter_redistribute_mode: PostFilterRedistributeMode,
     /// use gene names parsed from pipe-delimited transcript IDs (GENCODE format,
     /// field 6) for within-gene leakage filtering instead of the default
     /// EC-graph-based grouping. The EC-graph filter is generally more accurate

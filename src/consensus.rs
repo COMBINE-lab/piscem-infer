@@ -17,7 +17,8 @@ use tracing::info;
 use crate::multi_sample::{SampleEntry, parse_manifest};
 use crate::process_rad::{EqMapBundle, RadProcessingOpts, build_eq_map_from_rad};
 use crate::prog_opts::{
-    ConditionRescueLockMode, ConsensusQuantOpts, FilterMode, StructuredRescueRankMode,
+    ConditionRescueLockMode, ConsensusQuantOpts, FilterMode, PostFilterRedistributeMode,
+    StructuredRescueRankMode,
 };
 use crate::utils::collapsed_eq::{CollapsedEqMap, build_collapsed};
 use crate::utils::em::{
@@ -250,6 +251,9 @@ fn sample_specific_phase2_masks(
     if !(condition_aware_consensus || use_condition_rescue) {
         return vec![pre_gene_consensus_mask.to_vec(); samples.len()];
     }
+    if use_condition_rescue && !condition_aware_consensus {
+        return vec![pre_gene_consensus_mask.to_vec(); samples.len()];
+    }
 
     let condition_names =
         condition_names.expect("condition names required for condition-aware phase-2 masks");
@@ -265,10 +269,101 @@ fn sample_specific_phase2_masks(
                 .expect("sample condition should exist in condition_names");
             let cond_mask = &condition_support_masks[ci];
             (0..pre_gene_consensus_mask.len())
-                .map(|t| cond_mask[t] || (!condition_aware_consensus && strict_global_mask[t]))
+                .map(|t| cond_mask[t] || strict_global_mask[t])
                 .collect()
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn condition_rescue_free_variable(
+    active: bool,
+    rescue_only: bool,
+    locked: bool,
+    phase1_count: f64,
+    free_min_count: f64,
+    floor_barrier_mode: bool,
+    fully_locked: bool,
+    lock_mode: &ConditionRescueLockMode,
+) -> bool {
+    if !active {
+        return false;
+    }
+    if floor_barrier_mode {
+        return true;
+    }
+    if rescue_only
+        && matches!(
+            lock_mode,
+            ConditionRescueLockMode::GuardedConfidence
+                | ConditionRescueLockMode::Instability
+                | ConditionRescueLockMode::TranscriptStability
+                | ConditionRescueLockMode::EnrichmentCredibleStability
+        )
+        && free_min_count > 0.0
+        && phase1_count < free_min_count
+    {
+        return false;
+    }
+    if matches!(
+        lock_mode,
+        ConditionRescueLockMode::GuardedConfidence
+            | ConditionRescueLockMode::Instability
+            | ConditionRescueLockMode::TranscriptStability
+            | ConditionRescueLockMode::EnrichmentCredibleStability
+    ) && locked
+    {
+        return free_min_count <= 0.0 || phase1_count >= free_min_count;
+    }
+    !(fully_locked && locked)
+}
+
+fn condition_rescue_residual_caps(
+    condition_rescue_only: &[bool],
+    phase1_counts: &[f64],
+    locked_counts: &[f64],
+    active_mask: &[bool],
+    z: f64,
+) -> Vec<f64> {
+    let z = z.max(0.0);
+    condition_rescue_only
+        .iter()
+        .zip(phase1_counts.iter())
+        .zip(locked_counts.iter())
+        .zip(active_mask.iter())
+        .map(
+            |(((&rescue_only, &phase1_count), &locked_count), &active)| {
+                if rescue_only && active {
+                    let phase1_count = phase1_count.max(0.0);
+                    let upper = phase1_count + z * phase1_count.max(1.0).sqrt();
+                    (upper - locked_count.max(0.0)).max(0.0)
+                } else {
+                    f64::INFINITY
+                }
+            },
+        )
+        .collect()
+}
+
+#[inline]
+fn condition_rescue_residual_cap_enabled(opts: &ConsensusQuantOpts) -> bool {
+    opts.condition_rescue_residual_cap && !opts.no_condition_rescue_residual_cap
+}
+
+#[inline]
+fn condition_rescue_residual_cap_active_set_enabled(opts: &ConsensusQuantOpts) -> bool {
+    opts.condition_rescue_residual_cap_active_set
+        && !opts.no_condition_rescue_residual_cap_active_set
+}
+
+#[inline]
+fn lock_condition_rescue_allocations_enabled(
+    opts: &ConsensusQuantOpts,
+    use_condition_rescue: bool,
+) -> bool {
+    use_condition_rescue
+        && !opts.no_lock_condition_rescue_allocations
+        && !opts.reestimate_condition_rescue
 }
 
 #[inline]
@@ -698,6 +793,132 @@ fn condition_rescue_leakage_exempt<EqLabelT: EqLabel>(
         Some((target_count, fraction))
     } else {
         None
+    }
+}
+
+fn signatures_intersect(
+    index: &crate::utils::txp_selection::TranscriptEqIndex,
+    a: usize,
+    b: usize,
+) -> bool {
+    let sig_a = index.signature(a);
+    let sig_b = index.signature(b);
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    while ia < sig_a.len() && ib < sig_b.len() {
+        match sig_a[ia].cmp(&sig_b[ib]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => ia += 1,
+            std::cmp::Ordering::Greater => ib += 1,
+        }
+    }
+    false
+}
+
+struct SharedResponsibilityContext<'a, L: EqLabel> {
+    packed: &'a PackedEqMap<L>,
+    index: &'a crate::utils::txp_selection::TranscriptEqIndex,
+    eff_lengths: &'a [f64],
+}
+
+fn redistribute_by_shared_responsibility<L: EqLabel>(
+    ctx: &SharedResponsibilityContext<'_, L>,
+    em_res: &mut [f64],
+    target: usize,
+    candidates: &[usize],
+    removed: f64,
+    fallback_recipient: usize,
+) {
+    if !removed.is_finite() || removed <= 0.0 {
+        return;
+    }
+    if target >= em_res.len() || target >= ctx.eff_lengths.len() || ctx.eff_lengths[target] <= 0.0 {
+        if target != fallback_recipient {
+            em_res[fallback_recipient] += removed;
+        }
+        return;
+    }
+
+    let mut local_candidate = vec![false; em_res.len()];
+    for &candidate in candidates {
+        if candidate != target
+            && candidate < em_res.len()
+            && candidate < ctx.eff_lengths.len()
+            && em_res[candidate].is_finite()
+            && em_res[candidate] > 0.0
+            && ctx.eff_lengths[candidate] > 0.0
+        {
+            local_candidate[candidate] = true;
+        }
+    }
+
+    let mut contributions: Vec<(usize, f64)> = Vec::new();
+    let mut total_reassigned = 0.0;
+    for &eq_idx_u32 in ctx.index.signature(target) {
+        let eq_idx = eq_idx_u32 as usize;
+        if eq_idx >= ctx.packed.len() {
+            continue;
+        }
+        let label = ctx.packed.refs_for_eqc(eq_idx);
+        let targets = label.target_labels();
+        let probs = label.target_probs().collect::<Vec<_>>();
+        let count = ctx.packed.counts[eq_idx] as f64;
+        if count <= 0.0 || targets.is_empty() || probs.len() != targets.len() {
+            continue;
+        }
+
+        let mut denom_all = 0.0;
+        let mut target_weight = 0.0;
+        let mut recipient_weights: Vec<(usize, f64)> = Vec::new();
+        let mut denom_recipients = 0.0;
+        for (&tid_u32, &prob) in targets.iter().zip(probs.iter()) {
+            let tid = tid_u32 as usize;
+            if tid >= em_res.len() || tid >= ctx.eff_lengths.len() || ctx.eff_lengths[tid] <= 0.0 {
+                continue;
+            }
+            let weight = prob * em_res[tid].max(0.0) / ctx.eff_lengths[tid];
+            if !weight.is_finite() || weight <= 0.0 {
+                continue;
+            }
+            denom_all += weight;
+            if tid == target {
+                target_weight += weight;
+            } else if local_candidate[tid] {
+                recipient_weights.push((tid, weight));
+                denom_recipients += weight;
+            }
+        }
+        if denom_all <= 0.0 || target_weight <= 0.0 || denom_recipients <= 0.0 {
+            continue;
+        }
+
+        let target_assignment = count * target_weight / denom_all;
+        if !target_assignment.is_finite() || target_assignment <= 0.0 {
+            continue;
+        }
+        for (recipient, weight) in recipient_weights {
+            let delta = target_assignment * weight / denom_recipients;
+            if delta > 0.0 && delta.is_finite() {
+                if let Some((_t, existing)) = contributions
+                    .iter_mut()
+                    .find(|(existing_recipient, _)| *existing_recipient == recipient)
+                {
+                    *existing += delta;
+                } else {
+                    contributions.push((recipient, delta));
+                }
+                total_reassigned += delta;
+            }
+        }
+    }
+
+    if total_reassigned > 0.0 {
+        let scale = removed / total_reassigned;
+        for (recipient, delta) in contributions {
+            em_res[recipient] += delta * scale;
+        }
+    } else if target != fallback_recipient {
+        em_res[fallback_recipient] += removed;
     }
 }
 
@@ -1740,6 +1961,78 @@ fn project_counts_to_total(counts: &mut [f64], eff_lens: &[f64], total_weight: f
     }
 }
 
+fn project_counts_to_total_with_caps(
+    counts: &mut [f64],
+    eff_lens: &[f64],
+    total_weight: f64,
+    caps: Option<&[f64]>,
+) {
+    let Some(caps) = caps else {
+        project_counts_to_total(counts, eff_lens, total_weight);
+        return;
+    };
+    let mut fixed = vec![false; counts.len()];
+    for (((count, &eff_len), &cap), is_fixed) in counts
+        .iter_mut()
+        .zip(eff_lens.iter())
+        .zip(caps.iter())
+        .zip(fixed.iter_mut())
+    {
+        if eff_len <= 0.0 || !count.is_finite() || *count < 0.0 {
+            *count = 0.0;
+            *is_fixed = true;
+        } else if cap.is_finite() {
+            let cap = cap.max(0.0);
+            if *count > cap {
+                *count = cap;
+                *is_fixed = true;
+            }
+        }
+    }
+    loop {
+        let sum: f64 = counts.iter().sum();
+        let diff = total_weight - sum;
+        if diff.abs() <= 1e-6 || total_weight <= 0.0 {
+            break;
+        }
+        let free_sum: f64 = counts
+            .iter()
+            .zip(fixed.iter())
+            .filter_map(|(&count, &is_fixed)| (!is_fixed && count > 0.0).then_some(count))
+            .sum();
+        if free_sum <= 0.0 {
+            break;
+        }
+        let scale = (total_weight - (sum - free_sum)) / free_sum;
+        if scale <= 0.0 || !scale.is_finite() {
+            break;
+        }
+        let mut newly_fixed = false;
+        for (((count, is_fixed), &eff_len), &cap) in counts
+            .iter_mut()
+            .zip(fixed.iter_mut())
+            .zip(eff_lens.iter())
+            .zip(caps.iter())
+        {
+            if *is_fixed || eff_len <= 0.0 {
+                continue;
+            }
+            *count *= scale;
+            if cap.is_finite() {
+                let cap = cap.max(0.0);
+                if *count > cap {
+                    *count = cap;
+                    *is_fixed = true;
+                    newly_fixed = true;
+                }
+            }
+        }
+        if !newly_fixed {
+            break;
+        }
+    }
+}
+
 fn compute_residual_max_rel_diff(prev: &[f64], curr: &[f64], presence_thresh: f64) -> f64 {
     let mut max_rel = 0.0f64;
     for (&p, &c) in prev.iter().zip(curr.iter()) {
@@ -1828,6 +2121,148 @@ fn residual_em_step_f64_counts<L: EqLabel>(
             curr[*tid as usize] += scale * w;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subtract_capped_responsibilities<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eq_counts: &mut [f64],
+    inv_eff_lens: &[f64],
+    estimate: &[f64],
+    newly_capped: &[usize],
+    caps: &[f64],
+) -> Vec<f64> {
+    let mut fixed_counts = vec![0.0f64; estimate.len()];
+    if newly_capped.is_empty() {
+        return fixed_counts;
+    }
+    let capped_set: HashSet<usize> = newly_capped.iter().copied().collect();
+    let mut cap_scale = vec![0.0f64; estimate.len()];
+    for &t in newly_capped {
+        if estimate[t] > 0.0 && caps[t].is_finite() {
+            cap_scale[t] = (caps[t].max(0.0) / estimate[t]).clamp(0.0, 1.0);
+        }
+    }
+    let mut weights = Vec::with_capacity(64);
+    for (label_idx, label) in packed.iter_labels().enumerate() {
+        let eq_count = eq_counts[label_idx];
+        if eq_count <= 0.0 {
+            continue;
+        }
+        weights.clear();
+        let mut denom = 0.0f64;
+        for (tid, cond_prob) in label.target_labels().iter().zip(label.target_probs()) {
+            let t = *tid as usize;
+            let w = cond_prob * estimate[t] * inv_eff_lens[t];
+            weights.push(w);
+            denom += w;
+        }
+        if denom <= 0.0 {
+            continue;
+        }
+        let mut fixed_sum = 0.0f64;
+        for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
+            let t = *tid as usize;
+            if capped_set.contains(&t) && w > 0.0 && cap_scale[t] > 0.0 {
+                let fixed = eq_count * w / denom * cap_scale[t];
+                fixed_counts[t] += fixed;
+                fixed_sum += fixed;
+            }
+        }
+        eq_counts[label_idx] = (eq_count - fixed_sum).max(0.0);
+    }
+    fixed_counts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase2_em_step_f64_counts_active_set_caps<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eq_counts: &[f64],
+    eff_lens: Vec<f64>,
+    active_mask: &[bool],
+    init_counts: Option<&[f64]>,
+    opts: &ConsensusQuantOpts,
+    residual_caps: &[f64],
+) -> Vec<f64> {
+    let n_targets = eff_lens.len();
+    let mut residual_eq_counts = eq_counts.to_vec();
+    let mut active = active_mask.to_vec();
+    let mut fixed_counts = vec![0.0f64; n_targets];
+    let mut init = init_counts.map(|counts| counts.to_vec());
+    let mut inline_opts = opts.clone();
+    inline_opts.phase2_max_iter = Some(phase2_max_iter(opts).clamp(1, 24));
+    let inv_eff_lens = eff_lens
+        .iter()
+        .map(|&eff_len| {
+            let inv = 1.0 / eff_len;
+            if inv.is_finite() { inv } else { 0.0 }
+        })
+        .collect::<Vec<_>>();
+    let mut estimate;
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        estimate = phase2_em_step_f64_counts(
+            packed,
+            &residual_eq_counts,
+            eff_lens.clone(),
+            &active,
+            init.as_deref(),
+            &inline_opts,
+            None,
+            None,
+            false,
+        );
+        let newly_capped = estimate
+            .iter()
+            .zip(active.iter())
+            .zip(residual_caps.iter())
+            .enumerate()
+            .filter_map(|(t, ((&count, &is_active), &cap))| {
+                (is_active && cap.is_finite() && count > cap.max(0.0)).then_some(t)
+            })
+            .collect::<Vec<_>>();
+        if newly_capped.is_empty() {
+            estimate = phase2_em_step_f64_counts(
+                packed,
+                &residual_eq_counts,
+                eff_lens.clone(),
+                &active,
+                Some(&phase2_init_counts(&estimate, &active)),
+                opts,
+                None,
+                None,
+                false,
+            );
+            break;
+        }
+        if rounds >= 32 {
+            break;
+        }
+        let fixed_delta = subtract_capped_responsibilities(
+            packed,
+            &mut residual_eq_counts,
+            &inv_eff_lens,
+            &estimate,
+            &newly_capped,
+            residual_caps,
+        );
+        for &t in &newly_capped {
+            active[t] = false;
+            fixed_counts[t] += fixed_delta[t];
+        }
+        init = Some(phase2_init_counts(&estimate, &active));
+    }
+    for (count, fixed) in estimate.iter_mut().zip(fixed_counts.iter()) {
+        *count += *fixed;
+    }
+    info!(
+        "Residual active-set cap stats: rounds={} fixed_targets={} residual_weight={:.3}",
+        rounds,
+        fixed_counts.iter().filter(|&&x| x > 0.0).count(),
+        residual_eq_counts.iter().sum::<f64>()
+    );
+    estimate
 }
 
 fn apply_one_sided_floor_barrier(
@@ -2106,6 +2541,7 @@ fn refine_residual_tail_f64_counts<L: EqLabel>(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn phase2_em_step_f64_counts<L: EqLabel>(
     packed: &PackedEqMap<L>,
     eq_counts: &[f64],
@@ -2114,7 +2550,23 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
     init_counts: Option<&[f64]>,
     opts: &ConsensusQuantOpts,
     floor_barrier: Option<(&[f64], f64)>,
+    residual_caps: Option<&[f64]>,
+    active_set_caps: bool,
 ) -> Vec<f64> {
+    if active_set_caps
+        && floor_barrier.is_none()
+        && let Some(caps) = residual_caps
+    {
+        return phase2_em_step_f64_counts_active_set_caps(
+            packed,
+            eq_counts,
+            eff_lens,
+            active_mask,
+            init_counts,
+            opts,
+            caps,
+        );
+    }
     for (eff_len, &active) in eff_lens.iter_mut().zip(active_mask.iter()) {
         if !active {
             *eff_len = 0.0;
@@ -2142,7 +2594,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
             .map(|&eff_len| if eff_len > 0.0 { avg } else { 0.0 })
             .collect::<Vec<_>>()
     };
-    project_counts_to_total(&mut prev, &eff_lens, total_weight);
+    project_counts_to_total_with_caps(&mut prev, &eff_lens, total_weight, residual_caps);
 
     let inv_eff_lens = eff_lens
         .iter()
@@ -2175,6 +2627,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
         if let Some((floor_counts, weight)) = floor_barrier {
             apply_one_sided_floor_barrier(&mut x1, floor_counts, &eff_lens, total_weight, weight);
         }
+        project_counts_to_total_with_caps(&mut x1, &eff_lens, total_weight, residual_caps);
         em_steps += 1;
         let rel1 = compute_residual_mean_rel_diff(&x0, &x1, opts.presence_thresh);
         final_mean_rel_diff = rel1;
@@ -2196,6 +2649,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
         if let Some((floor_counts, weight)) = floor_barrier {
             apply_one_sided_floor_barrier(&mut x2, floor_counts, &eff_lens, total_weight, weight);
         }
+        project_counts_to_total_with_caps(&mut x2, &eff_lens, total_weight, residual_caps);
         em_steps += 1;
         let ordinary_rel = compute_residual_mean_rel_diff(&x1, &x2, opts.presence_thresh);
 
@@ -2208,7 +2662,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
                 let v = c - (2.0 * b) + a;
                 *sq = a - (2.0 * alpha * r) + (alpha * alpha * v);
             }
-            project_counts_to_total(&mut x_sq, &eff_lens, total_weight);
+            project_counts_to_total_with_caps(&mut x_sq, &eff_lens, total_weight, residual_caps);
             if em_steps < max_iter {
                 residual_em_step_f64_counts(packed, eq_counts, &inv_eff_lens, &x_sq, &mut x_next);
                 if let Some((floor_counts, weight)) = floor_barrier {
@@ -2220,6 +2674,12 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
                         weight,
                     );
                 }
+                project_counts_to_total_with_caps(
+                    &mut x_next,
+                    &eff_lens,
+                    total_weight,
+                    residual_caps,
+                );
                 em_steps += 1;
                 let candidate_rel =
                     compute_residual_mean_rel_diff(&x_sq, &x_next, opts.presence_thresh);
@@ -2264,6 +2724,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
     if let Some((floor_counts, weight)) = floor_barrier {
         apply_one_sided_floor_barrier(&mut x1, floor_counts, &eff_lens, total_weight, weight);
     }
+    project_counts_to_total_with_caps(&mut x1, &eff_lens, total_weight, residual_caps);
     let tail_threshold = (20.0 * conv_thresh).max(0.01);
     let tail_seed = residual_tail_mask(&x0, &x1, opts.presence_thresh, tail_threshold);
     let tail_seed_count = tail_seed.iter().filter(|&&x| x).count();
@@ -2291,6 +2752,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
                     weight,
                 );
             }
+            project_counts_to_total_with_caps(&mut x1, &eff_lens, total_weight, residual_caps);
             final_mean_rel_diff = compute_residual_mean_rel_diff(&x0, &x1, opts.presence_thresh);
             final_max_rel_diff = compute_residual_max_rel_diff(&x0, &x1, opts.presence_thresh);
         }
@@ -2305,6 +2767,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
     if let Some((floor_counts, weight)) = floor_barrier {
         apply_one_sided_floor_barrier(&mut x1, floor_counts, &eff_lens, total_weight, weight);
     }
+    project_counts_to_total_with_caps(&mut x1, &eff_lens, total_weight, residual_caps);
     info!(
         "Residual locked-rescue SQUAREM stats: em_steps={} accel_attempts={} accel_accepts={} final_mean_rel_diff={:.6} final_max_rel_diff={:.6} alpha_none={} invalid_candidate={} not_improved={} alpha_range=[{:.3},{:.3}] mean_candidate_rel_ratio={:.3}",
         em_steps,
@@ -3383,6 +3846,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             "Auto-enabling condition rescue (multiple conditions detected; use --no-condition-rescue to disable)"
         );
     }
+    let lock_condition_rescue_allocations =
+        lock_condition_rescue_allocations_enabled(opts, use_condition_rescue);
     if opts.lock_condition_rescue_allocations && !use_condition_rescue {
         bail!(
             "--lock-condition-rescue-allocations requires condition rescue; provide multiple manifest conditions or pass --condition-rescue"
@@ -3761,16 +4226,17 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         .zip(strict_global_mask.iter())
         .map(|(&pre_gene_keep, &strict_keep)| pre_gene_keep && !strict_keep)
         .collect();
-    let condition_rescue_lock_relax_masks: Option<Vec<Vec<bool>>> = if opts
-        .lock_condition_rescue_allocations
-        && matches!(
-            opts.condition_rescue_lock_mode,
-            ConditionRescueLockMode::GuardedConfidence
-                | ConditionRescueLockMode::Instability
-                | ConditionRescueLockMode::TranscriptStability
-                | ConditionRescueLockMode::EnrichmentCredibleStability
-        ) {
-        condition_data
+    let condition_rescue_lock_relax_masks: Option<Vec<Vec<bool>>> =
+        if lock_condition_rescue_allocations
+            && matches!(
+                opts.condition_rescue_lock_mode,
+                ConditionRescueLockMode::GuardedConfidence
+                    | ConditionRescueLockMode::Instability
+                    | ConditionRescueLockMode::TranscriptStability
+                    | ConditionRescueLockMode::EnrichmentCredibleStability
+            )
+        {
+            condition_data
             .as_ref()
             .map(|(condition_names, _, _, condition_support_masks)| {
                 let masks = match opts.condition_rescue_lock_mode {
@@ -3844,9 +4310,9 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 }
                 masks
             })
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let condition_rescue_lock_condition_indices: Option<Vec<usize>> =
         condition_rescue_lock_relax_masks.as_ref().map(|_| {
             let condition_names = condition_data
@@ -3926,7 +4392,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         Some(phase2_init_counts(&phase1_counts[i], phase2_mask))
                     };
                     let alpha = phase2_prior_alpha.as_ref().map(|a| a[i].as_slice());
-                    let em_res = if opts.lock_condition_rescue_allocations {
+                    let em_res = if lock_condition_rescue_allocations {
                         let condition_locked_mask = condition_rescue_only.clone();
                         let floor_barrier_mode = matches!(
                             opts.condition_rescue_lock_mode,
@@ -3944,27 +4410,20 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                             });
                         let free_mask: Vec<bool> = phase2_mask
                             .iter()
+                            .zip(strict_global_mask.iter())
                             .zip(condition_locked_mask.iter())
-                            .enumerate()
-                            .map(|(t, (&active, &locked))| {
-                                if !active {
-                                    return false;
-                                }
-                                if floor_barrier_mode {
-                                    return true;
-                                }
-                                if matches!(
-                                    opts.condition_rescue_lock_mode,
-                                    ConditionRescueLockMode::GuardedConfidence
-                                        | ConditionRescueLockMode::Instability
-                                        | ConditionRescueLockMode::TranscriptStability
-                                        | ConditionRescueLockMode::EnrichmentCredibleStability
-                                ) && locked
-                                {
-                                    condition_relax_mask.map(|mask| mask[t]).unwrap_or(false)
-                                } else {
-                                    !(fully_locked && locked)
-                                }
+                            .zip(phase1_counts[i].iter())
+                            .map(|(((&active, &global), &locked), &phase1_count)| {
+                                condition_rescue_free_variable(
+                                    active,
+                                    active && !global,
+                                    locked,
+                                    phase1_count,
+                                    opts.condition_rescue_free_min_count,
+                                    floor_barrier_mode,
+                                    fully_locked,
+                                    &opts.condition_rescue_lock_mode,
+                                )
                             })
                             .collect();
                         let (residual_eq_counts, locked_counts) =
@@ -3994,6 +4453,16 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                         let free_init = init
                             .as_ref()
                             .map(|counts| phase2_init_counts(counts, &free_mask));
+                        let residual_caps =
+                            condition_rescue_residual_cap_enabled(opts).then(|| {
+                                condition_rescue_residual_caps(
+                                    &condition_rescue_only,
+                                    &phase1_counts[i],
+                                    &locked_counts,
+                                    phase2_mask,
+                                    opts.condition_rescue_residual_cap_z,
+                                )
+                            });
                         let mut em_res = if let Some(cm) = collapsed_maps[i].as_ref() {
                             let collapsed_counts = if floor_barrier_mode {
                                 cm.packed
@@ -4015,6 +4484,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                     locked_counts.as_slice(),
                                     opts.condition_rescue_floor_barrier_weight,
                                 )),
+                                residual_caps.as_deref(),
+                                condition_rescue_residual_cap_active_set_enabled(opts),
                             )
                         } else {
                             let full_counts = if floor_barrier_mode {
@@ -4038,6 +4509,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                     locked_counts.as_slice(),
                                     opts.condition_rescue_floor_barrier_weight,
                                 )),
+                                residual_caps.as_deref(),
+                                condition_rescue_residual_cap_active_set_enabled(opts),
                             )
                         };
                         if !floor_barrier_mode {
@@ -4093,7 +4566,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 Some(phase2_init_counts(&phase1_counts[i], phase2_mask))
             };
             let alpha = phase2_prior_alpha.as_ref().map(|a| a[i].as_slice());
-            let em_res = if opts.lock_condition_rescue_allocations {
+            let em_res = if lock_condition_rescue_allocations {
                 let condition_locked_mask = condition_rescue_only.clone();
                 let floor_barrier_mode = matches!(
                     opts.condition_rescue_lock_mode,
@@ -4111,27 +4584,20 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     });
                 let free_mask: Vec<bool> = phase2_mask
                     .iter()
+                    .zip(strict_global_mask.iter())
                     .zip(condition_locked_mask.iter())
-                    .enumerate()
-                    .map(|(t, (&active, &locked))| {
-                        if !active {
-                            return false;
-                        }
-                        if floor_barrier_mode {
-                            return true;
-                        }
-                        if matches!(
-                            opts.condition_rescue_lock_mode,
-                            ConditionRescueLockMode::GuardedConfidence
-                                | ConditionRescueLockMode::Instability
-                                | ConditionRescueLockMode::TranscriptStability
-                                | ConditionRescueLockMode::EnrichmentCredibleStability
-                        ) && locked
-                        {
-                            condition_relax_mask.map(|mask| mask[t]).unwrap_or(false)
-                        } else {
-                            !(fully_locked && locked)
-                        }
+                    .zip(phase1_counts[i].iter())
+                    .map(|(((&active, &global), &locked), &phase1_count)| {
+                        condition_rescue_free_variable(
+                            active,
+                            active && !global,
+                            locked,
+                            phase1_count,
+                            opts.condition_rescue_free_min_count,
+                            floor_barrier_mode,
+                            fully_locked,
+                            &opts.condition_rescue_lock_mode,
+                        )
                     })
                     .collect();
                 let (residual_eq_counts, locked_counts) =
@@ -4161,6 +4627,15 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 let free_init = init
                     .as_ref()
                     .map(|counts| phase2_init_counts(counts, &free_mask));
+                let residual_caps = condition_rescue_residual_cap_enabled(opts).then(|| {
+                    condition_rescue_residual_caps(
+                        &condition_rescue_only,
+                        &phase1_counts[i],
+                        &locked_counts,
+                        phase2_mask,
+                        opts.condition_rescue_residual_cap_z,
+                    )
+                });
                 let mut em_res = if let Some(cm) = collapsed_maps[i].as_ref() {
                     let collapsed_counts = if floor_barrier_mode {
                         cm.packed
@@ -4182,6 +4657,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                             locked_counts.as_slice(),
                             opts.condition_rescue_floor_barrier_weight,
                         )),
+                        residual_caps.as_deref(),
+                        condition_rescue_residual_cap_active_set_enabled(opts),
                     )
                 } else {
                     let full_counts = if floor_barrier_mode {
@@ -4205,6 +4682,8 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                             locked_counts.as_slice(),
                             opts.condition_rescue_floor_barrier_weight,
                         )),
+                        residual_caps.as_deref(),
+                        condition_rescue_residual_cap_active_set_enabled(opts),
                     )
                 };
                 if !floor_barrier_mode {
@@ -4753,13 +5232,97 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
         .zip(pre_gene_consensus_mask.iter())
         .map(|(&final_keep, &pre_gene_keep)| final_keep && !pre_gene_keep)
         .collect();
+    let post_filter_redistribute_mass = !opts.no_post_filter_redistribute_mass;
     for (i, mut em_res) in phase2_results {
+        let final_em_mode = post_filter_redistribute_mass
+            && matches!(
+                opts.post_filter_redistribute_mode,
+                PostFilterRedistributeMode::FinalEm
+            );
+        let mut post_filter_mask = if final_em_mode {
+            Some(phase2_sample_masks[i].clone())
+        } else {
+            None
+        };
+        let responsibility_index = if post_filter_redistribute_mass
+            && matches!(
+                opts.post_filter_redistribute_mode,
+                PostFilterRedistributeMode::SharedResponsibility
+            ) {
+            Some(
+                crate::utils::txp_selection::TranscriptEqIndex::from_packed_eq_map(
+                    &bundles[i].packed_eq_map,
+                    n_targets,
+                ),
+            )
+        } else {
+            None
+        };
+        let remove_leakage = |em_res: &mut [f64],
+                              post_filter_mask: &mut Option<Vec<bool>>,
+                              target: usize,
+                              recipient: usize,
+                              candidates: &[usize]| {
+            if post_filter_redistribute_mass {
+                let removed = em_res[target];
+                if removed.is_finite() && removed > 0.0 {
+                    match opts.post_filter_redistribute_mode {
+                        PostFilterRedistributeMode::Dominator => {
+                            if target != recipient {
+                                em_res[recipient] += removed;
+                            }
+                        }
+                        PostFilterRedistributeMode::SharedPosterior => {
+                            let shared: Vec<usize> = candidates
+                                .iter()
+                                .copied()
+                                .filter(|&u| {
+                                    u != target
+                                        && em_res[u].is_finite()
+                                        && em_res[u] > 0.0
+                                        && signatures_intersect(&merged_index, target, u)
+                                })
+                                .collect();
+                            let denom: f64 = shared.iter().map(|&u| em_res[u]).sum();
+                            if denom > 0.0 {
+                                for u in shared {
+                                    em_res[u] += removed * (em_res[u] / denom);
+                                }
+                            } else if target != recipient {
+                                em_res[recipient] += removed;
+                            }
+                        }
+                        PostFilterRedistributeMode::SharedResponsibility => {
+                            if let Some(index) = responsibility_index.as_ref() {
+                                let ctx = SharedResponsibilityContext {
+                                    packed: &bundles[i].packed_eq_map,
+                                    index,
+                                    eff_lengths: &bundles[i].eff_lengths,
+                                };
+                                redistribute_by_shared_responsibility(
+                                    &ctx, em_res, target, candidates, removed, recipient,
+                                );
+                            } else if target != recipient {
+                                em_res[recipient] += removed;
+                            }
+                        }
+                        PostFilterRedistributeMode::FinalEm => {
+                            if let Some(mask) = post_filter_mask.as_mut() {
+                                mask[target] = false;
+                            }
+                        }
+                    }
+                }
+            }
+            em_res[target] = 0.0;
+        };
+
         // Rescue-only transcripts retain their phase-1 estimates after phase 2.
         for t in 0..n_targets {
             if gene_rescue_only[t]
                 || (condition_rescue_only[t]
                     && !opts.reestimate_condition_rescue
-                    && !opts.lock_condition_rescue_allocations)
+                    && !lock_condition_rescue_allocations)
             {
                 em_res[t] = phase1_counts[i][t];
             }
@@ -4860,7 +5423,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                     bundles[i].ref_names[dom_t]
                                 ));
                             }
-                            em_res[t] = 0.0;
+                            remove_leakage(&mut em_res, &mut post_filter_mask, t, dom_t, txps);
                             if i == 0 {
                                 total_gene_frac_removed += 1;
                             }
@@ -4885,7 +5448,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                 bundles[i].ref_names[dom_t]
                             ));
                         }
-                        em_res[t] = 0.0;
+                        remove_leakage(&mut em_res, &mut post_filter_mask, t, dom_t, txps);
                         if i == 0 {
                             total_gene_frac_removed += 1;
                         }
@@ -5008,7 +5571,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                     bundles[i].ref_names[dom_t]
                                 ));
                             }
-                            em_res[t] = 0.0;
+                            remove_leakage(&mut em_res, &mut post_filter_mask, t, dom_t, &active);
                             if i == 0 {
                                 total_nbr_removed += 1;
                             }
@@ -5033,7 +5596,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                                 bundles[i].ref_names[dom_t]
                             ));
                         }
-                        em_res[t] = 0.0;
+                        remove_leakage(&mut em_res, &mut post_filter_mask, t, dom_t, &active);
                         if i == 0 {
                             total_nbr_removed += 1;
                         }
@@ -5229,6 +5792,166 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             );
         }
 
+        if let Some(final_mask) = post_filter_mask.as_ref() {
+            info!(
+                "  [{}/{}] Final post-filter EM for {}",
+                i + 1,
+                n_samples,
+                samples[i].sample_name
+            );
+            em_res = if lock_condition_rescue_allocations {
+                let condition_locked_mask: Vec<bool> = condition_rescue_only
+                    .iter()
+                    .zip(final_mask.iter())
+                    .map(|(&locked, &active)| locked && active)
+                    .collect();
+                let floor_barrier_mode = matches!(
+                    opts.condition_rescue_lock_mode,
+                    ConditionRescueLockMode::FloorBarrier
+                );
+                let fully_locked = matches!(
+                    opts.condition_rescue_lock_mode,
+                    ConditionRescueLockMode::Fixed
+                ) && opts.condition_rescue_lock_fraction >= 1.0;
+                let condition_relax_mask =
+                    condition_rescue_lock_relax_masks.as_ref().map(|masks| {
+                        let condition_idx =
+                            condition_rescue_lock_condition_indices.as_ref().unwrap()[i];
+                        masks[condition_idx].as_slice()
+                    });
+                let free_mask: Vec<bool> = final_mask
+                    .iter()
+                    .zip(strict_global_mask.iter())
+                    .zip(condition_locked_mask.iter())
+                    .zip(phase1_counts[i].iter())
+                    .map(|(((&active, &global), &locked), &phase1_count)| {
+                        condition_rescue_free_variable(
+                            active,
+                            active && !global,
+                            locked,
+                            phase1_count,
+                            opts.condition_rescue_free_min_count,
+                            floor_barrier_mode,
+                            fully_locked,
+                            &opts.condition_rescue_lock_mode,
+                        )
+                    })
+                    .collect();
+                let (residual_eq_counts, locked_counts) =
+                    lock_condition_rescue_allocations_for_sample(
+                        &samples[i].sample_name,
+                        &bundles[i].ref_names,
+                        &bundles[i].packed_eq_map,
+                        &phase1_counts[i],
+                        &bundles[i].eff_lengths,
+                        &condition_locked_mask,
+                        condition_relax_mask,
+                        if floor_barrier_mode {
+                            1.0
+                        } else {
+                            opts.condition_rescue_lock_fraction
+                        },
+                        if floor_barrier_mode {
+                            &ConditionRescueLockMode::Fixed
+                        } else {
+                            &opts.condition_rescue_lock_mode
+                        },
+                        opts.condition_rescue_full_lock_threshold,
+                        opts.condition_rescue_min_lock_threshold,
+                        opts.condition_rescue_credible_floor_z,
+                        opts.condition_rescue_enrichment_posterior_threshold,
+                    );
+                let free_init = phase2_init_counts(&em_res, &free_mask);
+                let residual_caps = condition_rescue_residual_cap_enabled(opts).then(|| {
+                    condition_rescue_residual_caps(
+                        &condition_rescue_only,
+                        &phase1_counts[i],
+                        &locked_counts,
+                        final_mask,
+                        opts.condition_rescue_residual_cap_z,
+                    )
+                });
+                let mut final_res = if let Some(cm) = collapsed_maps[i].as_ref() {
+                    let collapsed_counts = if floor_barrier_mode {
+                        cm.packed
+                            .counts
+                            .iter()
+                            .map(|&count| count as f64)
+                            .collect::<Vec<_>>()
+                    } else {
+                        collapse_residual_eq_counts(&residual_eq_counts, cm)
+                    };
+                    phase2_em_step_f64_counts(
+                        &cm.packed,
+                        &collapsed_counts,
+                        bundles[i].eff_lengths.clone(),
+                        &free_mask,
+                        Some(&free_init),
+                        opts,
+                        floor_barrier_mode.then_some((
+                            locked_counts.as_slice(),
+                            opts.condition_rescue_floor_barrier_weight,
+                        )),
+                        residual_caps.as_deref(),
+                        condition_rescue_residual_cap_active_set_enabled(opts),
+                    )
+                } else {
+                    let full_counts = if floor_barrier_mode {
+                        bundles[i]
+                            .packed_eq_map
+                            .counts
+                            .iter()
+                            .map(|&count| count as f64)
+                            .collect::<Vec<_>>()
+                    } else {
+                        residual_eq_counts
+                    };
+                    phase2_em_step_f64_counts(
+                        &bundles[i].packed_eq_map,
+                        &full_counts,
+                        bundles[i].eff_lengths.clone(),
+                        &free_mask,
+                        Some(&free_init),
+                        opts,
+                        floor_barrier_mode.then_some((
+                            locked_counts.as_slice(),
+                            opts.condition_rescue_floor_barrier_weight,
+                        )),
+                        residual_caps.as_deref(),
+                        condition_rescue_residual_cap_active_set_enabled(opts),
+                    )
+                };
+                if !floor_barrier_mode {
+                    for (count, locked) in final_res.iter_mut().zip(locked_counts.iter()) {
+                        *count += *locked;
+                    }
+                }
+                final_res
+            } else if let Some(cm) = collapsed_maps[i].as_ref() {
+                phase2_em_step(
+                    &cm.packed,
+                    bundles[i].eff_lengths.clone(),
+                    final_mask,
+                    Some(&em_res),
+                    None,
+                    opts,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                )
+            } else {
+                phase2_em_step(
+                    &bundles[i].packed_eq_map,
+                    bundles[i].eff_lengths.clone(),
+                    final_mask,
+                    Some(&em_res),
+                    None,
+                    opts,
+                    inner_threads,
+                    serial_inner_pool.as_ref(),
+                )
+            };
+        }
+
         let sample = &samples[i];
         create_dir_all(&sample.output_dir)?;
         let output_stem = sample.output_dir.join(&sample.sample_name);
@@ -5272,7 +5995,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             "structured_rescue_phase1_condition_complements": opts.structured_rescue_phase1_condition_complements,
             "structured_rescue_phase1_complement_tpm_floor": opts.structured_rescue_phase1_complement_tpm_floor,
             "reestimate_condition_rescue": opts.reestimate_condition_rescue,
-            "lock_condition_rescue_allocations": opts.lock_condition_rescue_allocations,
+            "lock_condition_rescue_allocations": lock_condition_rescue_allocations,
             "condition_rescue_lock_fraction": opts.condition_rescue_lock_fraction,
             "condition_rescue_lock_mode": opts.condition_rescue_lock_mode,
             "condition_rescue_floor_barrier_weight": opts.condition_rescue_floor_barrier_weight,
@@ -5292,6 +6015,16 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             "condition_rescue_leakage_phase1_floor_count": opts.condition_rescue_leakage_phase1_floor_count,
             "piscem_infer_version": env!("CARGO_PKG_VERSION"),
         });
+        meta_info["post_filter_redistribute_mass"] = json!(post_filter_redistribute_mass);
+        meta_info["post_filter_redistribute_mode"] = json!(opts.post_filter_redistribute_mode);
+        meta_info["no_lock_condition_rescue_allocations"] =
+            json!(opts.no_lock_condition_rescue_allocations);
+        meta_info["condition_rescue_free_min_count"] = json!(opts.condition_rescue_free_min_count);
+        meta_info["condition_rescue_residual_cap"] =
+            json!(condition_rescue_residual_cap_enabled(opts));
+        meta_info["condition_rescue_residual_cap_z"] = json!(opts.condition_rescue_residual_cap_z);
+        meta_info["condition_rescue_residual_cap_active_set"] =
+            json!(condition_rescue_residual_cap_active_set_enabled(opts));
         meta_info["condition_rescue_credible_floor_z"] =
             json!(opts.condition_rescue_credible_floor_z);
         meta_info["condition_rescue_enrichment_posterior_threshold"] =
@@ -5364,7 +6097,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_masks_use_condition_specific_rescue() {
+    fn phase2_masks_use_experiment_wide_condition_rescue() {
         let samples = vec![sample("s1", "A"), sample("s2", "B")];
         let strict_global_mask = vec![true, false, false];
         let pre_gene_consensus_mask = vec![true, true, false];
@@ -5379,6 +6112,28 @@ mod tests {
             Some(&condition_support_masks),
             false,
             true,
+        );
+
+        assert_eq!(masks[0], vec![true, true, false]);
+        assert_eq!(masks[1], vec![true, true, false]);
+    }
+
+    #[test]
+    fn phase2_masks_remain_condition_specific_for_condition_aware_consensus() {
+        let samples = vec![sample("s1", "A"), sample("s2", "B")];
+        let strict_global_mask = vec![true, false, false];
+        let pre_gene_consensus_mask = vec![true, true, false];
+        let condition_names = vec!["A".to_string(), "B".to_string()];
+        let condition_support_masks = vec![vec![true, true, false], vec![true, false, false]];
+
+        let masks = sample_specific_phase2_masks(
+            &samples,
+            &strict_global_mask,
+            &pre_gene_consensus_mask,
+            Some(&condition_names),
+            Some(&condition_support_masks),
+            true,
+            false,
         );
 
         assert_eq!(masks[0], vec![true, true, false]);

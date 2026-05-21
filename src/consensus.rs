@@ -2072,6 +2072,23 @@ fn normal_cdf(z: f64) -> f64 {
     0.5 * (1.0 + erf)
 }
 
+fn rescued_target_audit_fields(
+    target_labels: &[u32],
+    condition_locked_mask: &[bool],
+    ref_names: &[String],
+) -> (String, String) {
+    let mut indices = Vec::new();
+    let mut names = Vec::new();
+    for &tid in target_labels {
+        let t = tid as usize;
+        if condition_locked_mask[t] {
+            indices.push(t.to_string());
+            names.push(ref_names[t].as_str());
+        }
+    }
+    (indices.join(","), names.join(","))
+}
+
 fn residual_squarem_alpha(x0: &[f64], x1: &[f64], x2: &[f64]) -> Option<f64> {
     let mut rr = 0.0f64;
     let mut vv = 0.0f64;
@@ -2136,7 +2153,6 @@ fn subtract_capped_responsibilities<L: EqLabel>(
     if newly_capped.is_empty() {
         return fixed_counts;
     }
-    let capped_set: HashSet<usize> = newly_capped.iter().copied().collect();
     let mut cap_scale = vec![0.0f64; estimate.len()];
     for &t in newly_capped {
         if estimate[t] > 0.0 && caps[t].is_finite() {
@@ -2163,7 +2179,7 @@ fn subtract_capped_responsibilities<L: EqLabel>(
         let mut fixed_sum = 0.0f64;
         for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
             let t = *tid as usize;
-            if capped_set.contains(&t) && w > 0.0 && cap_scale[t] > 0.0 {
+            if w > 0.0 && cap_scale[t] > 0.0 {
                 let fixed = eq_count * w / denom * cap_scale[t];
                 fixed_counts[t] += fixed;
                 fixed_sum += fixed;
@@ -2178,11 +2194,12 @@ fn subtract_capped_responsibilities<L: EqLabel>(
 fn phase2_em_step_f64_counts_active_set_caps<L: EqLabel>(
     packed: &PackedEqMap<L>,
     eq_counts: &[f64],
-    eff_lens: Vec<f64>,
+    eff_lens: &[f64],
     active_mask: &[bool],
     init_counts: Option<&[f64]>,
     opts: &ConsensusQuantOpts,
     residual_caps: &[f64],
+    eq_index: Option<&crate::utils::txp_selection::TranscriptEqIndex>,
 ) -> Vec<f64> {
     let n_targets = eff_lens.len();
     let mut residual_eq_counts = eq_counts.to_vec();
@@ -2205,13 +2222,14 @@ fn phase2_em_step_f64_counts_active_set_caps<L: EqLabel>(
         estimate = phase2_em_step_f64_counts(
             packed,
             &residual_eq_counts,
-            eff_lens.clone(),
+            eff_lens,
             &active,
             init.as_deref(),
             &inline_opts,
             None,
             None,
             false,
+            eq_index,
         );
         let newly_capped = estimate
             .iter()
@@ -2226,13 +2244,14 @@ fn phase2_em_step_f64_counts_active_set_caps<L: EqLabel>(
             estimate = phase2_em_step_f64_counts(
                 packed,
                 &residual_eq_counts,
-                eff_lens.clone(),
+                eff_lens,
                 &active,
                 Some(&phase2_init_counts(&estimate, &active)),
                 opts,
                 None,
                 None,
                 false,
+                eq_index,
             );
             break;
         }
@@ -2325,6 +2344,7 @@ fn expand_tail_component<L: EqLabel>(
     eq_counts: &[f64],
     eff_lens: &[f64],
     initial_tail: &[bool],
+    eq_index: Option<&crate::utils::txp_selection::TranscriptEqIndex>,
 ) -> TailExpansion {
     let n_targets = eff_lens.len();
     let mut active = vec![false; n_targets];
@@ -2345,6 +2365,17 @@ fn expand_tail_component<L: EqLabel>(
             boundary_eqs: 0,
             boundary_weight: 0.0,
         };
+    }
+
+    if let Some(index) = eq_index {
+        return expand_tail_component_indexed(
+            packed,
+            eq_counts,
+            eff_lens,
+            active,
+            active_count,
+            index,
+        );
     }
 
     let mut frontier = active.clone();
@@ -2426,6 +2457,86 @@ fn expand_tail_component<L: EqLabel>(
     }
 }
 
+fn expand_tail_component_indexed<L: EqLabel>(
+    packed: &PackedEqMap<L>,
+    eq_counts: &[f64],
+    eff_lens: &[f64],
+    mut active: Vec<bool>,
+    mut active_count: usize,
+    index: &crate::utils::txp_selection::TranscriptEqIndex,
+) -> TailExpansion {
+    let n_targets = eff_lens.len();
+    let mut frontier = active.clone();
+    let mut visited_eq = vec![false; packed.len()];
+    let mut eq_indices = Vec::new();
+    let mut hop = 0usize;
+    let mut crossed_eqs_total = 0usize;
+    let mut crossed_weight_total = 0.0f64;
+
+    loop {
+        let before_count = active_count;
+        let mut bridge_eqs = 0usize;
+        let mut bridge_weight = 0.0f64;
+        let mut next_frontier = vec![false; n_targets];
+
+        for (t, &is_frontier) in frontier.iter().enumerate().take(n_targets) {
+            if !is_frontier {
+                continue;
+            }
+            for &eq_idx_u32 in index.signature(t) {
+                let eq_idx = eq_idx_u32 as usize;
+                if eq_idx >= packed.len() || visited_eq[eq_idx] || eq_counts[eq_idx] <= 0.0 {
+                    continue;
+                }
+                visited_eq[eq_idx] = true;
+                eq_indices.push(eq_idx);
+                let label = packed.refs_for_eqc(eq_idx);
+                let mut added_from_eq = false;
+                for tid in label.target_labels() {
+                    let target = *tid as usize;
+                    if eff_lens[target] > 0.0 && !active[target] {
+                        active[target] = true;
+                        next_frontier[target] = true;
+                        active_count += 1;
+                        added_from_eq = true;
+                    }
+                }
+                if added_from_eq {
+                    bridge_eqs += 1;
+                    bridge_weight += eq_counts[eq_idx];
+                }
+            }
+        }
+
+        let added = active_count - before_count;
+        crossed_eqs_total += bridge_eqs;
+        crossed_weight_total += bridge_weight;
+        if added > 0 {
+            info!(
+                "Residual tail component hop {}: added_targets={} bridge_eqs={} bridge_weight={:.3}",
+                hop + 1,
+                added,
+                bridge_eqs,
+                bridge_weight
+            );
+        }
+        if added == 0 {
+            break;
+        }
+        frontier = next_frontier;
+        hop += 1;
+    }
+
+    TailExpansion {
+        active,
+        eq_indices,
+        crossed_eqs: crossed_eqs_total,
+        crossed_weight: crossed_weight_total,
+        boundary_eqs: 0,
+        boundary_weight: 0.0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn residual_tail_em_step_f64_counts<L: EqLabel>(
     packed: &PackedEqMap<L>,
@@ -2483,6 +2594,7 @@ fn refine_residual_tail_f64_counts<L: EqLabel>(
     inv_eff_lens: &[f64],
     counts: &mut [f64],
     tail_seed: &[bool],
+    eq_index: Option<&crate::utils::txp_selection::TranscriptEqIndex>,
     opts: &ConsensusQuantOpts,
     max_iter: u32,
 ) {
@@ -2490,7 +2602,7 @@ fn refine_residual_tail_f64_counts<L: EqLabel>(
     if seed_count == 0 || max_iter == 0 {
         return;
     }
-    let expansion = expand_tail_component(packed, eq_counts, eff_lens, tail_seed);
+    let expansion = expand_tail_component(packed, eq_counts, eff_lens, tail_seed, eq_index);
     let active_tail = expansion.active;
     let eq_indices = expansion.eq_indices;
     let active_count = active_tail.iter().filter(|&&x| x).count();
@@ -2545,13 +2657,14 @@ fn refine_residual_tail_f64_counts<L: EqLabel>(
 fn phase2_em_step_f64_counts<L: EqLabel>(
     packed: &PackedEqMap<L>,
     eq_counts: &[f64],
-    mut eff_lens: Vec<f64>,
+    eff_lens: &[f64],
     active_mask: &[bool],
     init_counts: Option<&[f64]>,
     opts: &ConsensusQuantOpts,
     floor_barrier: Option<(&[f64], f64)>,
     residual_caps: Option<&[f64]>,
     active_set_caps: bool,
+    eq_index: Option<&crate::utils::txp_selection::TranscriptEqIndex>,
 ) -> Vec<f64> {
     if active_set_caps
         && floor_barrier.is_none()
@@ -2565,8 +2678,10 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
             init_counts,
             opts,
             caps,
+            eq_index,
         );
     }
+    let mut eff_lens = eff_lens.to_vec();
     for (eff_len, &active) in eff_lens.iter_mut().zip(active_mask.iter()) {
         if !active {
             *eff_len = 0.0;
@@ -2739,6 +2854,7 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
                 &inv_eff_lens,
                 &mut x0,
                 &tail_seed,
+                eq_index,
                 opts,
                 tail_max_iter,
             );
@@ -2789,17 +2905,19 @@ fn phase2_em_step_f64_counts<L: EqLabel>(
     x1
 }
 
-fn collapse_residual_eq_counts(residual_eq_counts: &[f64], collapsed: &CollapsedEqMap) -> Vec<f64> {
-    let mut collapsed_counts = vec![0.0f64; collapsed.packed.len()];
-    for (&count, &collapsed_idx) in residual_eq_counts
-        .iter()
-        .zip(collapsed.pos_to_collapsed.iter())
-    {
+fn record_residual_eq_count(
+    residual_eq_counts: &mut Vec<f64>,
+    collapsed: Option<&CollapsedEqMap>,
+    label_idx: usize,
+    count: f64,
+) {
+    if let Some(cm) = collapsed {
         if count > 0.0 {
-            collapsed_counts[collapsed_idx as usize] += count;
+            residual_eq_counts[cm.pos_to_collapsed[label_idx] as usize] += count;
         }
+    } else {
+        residual_eq_counts.push(count);
     }
-    collapsed_counts
 }
 
 fn sample_cv_f64(values: &[f64]) -> f64 {
@@ -2992,6 +3110,7 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
     eff_lens: &[f64],
     condition_locked_mask: &[bool],
     condition_relax_mask: Option<&[bool]>,
+    collapsed: Option<&CollapsedEqMap>,
     lock_fraction: f64,
     lock_mode: &ConditionRescueLockMode,
     full_lock_threshold: f64,
@@ -2999,7 +3118,11 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
     credible_floor_z: f64,
     enrichment_posterior_threshold: f64,
 ) -> (Vec<f64>, Vec<f64>) {
-    let mut residual_eq_counts = Vec::with_capacity(packed.len());
+    let mut residual_eq_counts = if let Some(cm) = collapsed {
+        vec![0.0f64; cm.packed.len()]
+    } else {
+        Vec::with_capacity(packed.len())
+    };
     let mut locked_counts = vec![0.0f64; phase1_counts.len()];
     let audit_targets: Option<HashSet<String>> = std::env::var("PISCEM_LOCK_AUDIT_TARGETS")
         .ok()
@@ -3125,7 +3248,7 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             })
             .unwrap_or(true);
         if eq_count <= 0.0 {
-            residual_eq_counts.push(0.0);
+            record_residual_eq_count(&mut residual_eq_counts, collapsed, label_idx, 0.0);
             continue;
         }
         weights.clear();
@@ -3144,7 +3267,7 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
                     label.target_labels().len()
                 );
             }
-            residual_eq_counts.push(eq_count);
+            record_residual_eq_count(&mut residual_eq_counts, collapsed, label_idx, eq_count);
             continue;
         }
         let mut locked_sum = 0.0f64;
@@ -3163,24 +3286,6 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
             .iter()
             .filter(|tid| condition_locked_mask[**tid as usize])
             .count();
-        let rescued_target_indices = label
-            .target_labels()
-            .iter()
-            .filter_map(|tid| {
-                let t = *tid as usize;
-                condition_locked_mask[t].then_some(t.to_string())
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let rescued_target_names = label
-            .target_labels()
-            .iter()
-            .filter_map(|tid| {
-                let t = *tid as usize;
-                condition_locked_mask[t].then_some(ref_names[t].as_str())
-            })
-            .collect::<Vec<_>>()
-            .join(",");
         let relaxed_ec_lock_fraction = match lock_mode {
             ConditionRescueLockMode::FloorSmoothConfidence => {
                 floor_smooth_confidence_lock_fraction(rescue_fraction)
@@ -3272,17 +3377,25 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
         };
         if !any_lockable {
             if audit_label_selected && let Some(file) = audit.as_mut() {
+                let (rescued_target_indices, rescued_target_names) = rescued_target_audit_fields(
+                    label.target_labels(),
+                    condition_locked_mask,
+                    ref_names,
+                );
                 let _ = writeln!(
                     file,
                     "{sample_name}\t{label_idx}\t{eq_count:.6}\t{eq_count:.6}\t0.000000\t{rescue_fraction:.6}\t0.000000\t{}\t{rescued_targets}\t0\t{rescued_target_indices}\t{rescued_target_names}\t",
                     label.target_labels().len(),
                 );
             }
-            residual_eq_counts.push(eq_count);
+            record_residual_eq_count(&mut residual_eq_counts, collapsed, label_idx, eq_count);
             continue;
         }
         let mut locked_positive_targets = 0usize;
-        let mut locked_target_indices = Vec::new();
+        let mut locked_target_indices = audit
+            .as_ref()
+            .filter(|_| audit_label_selected)
+            .map(|_| Vec::new());
         for (tid, &w) in label.target_labels().iter().zip(weights.iter()) {
             let t = *tid as usize;
             if condition_locked_mask[t] && w > 0.0 {
@@ -3330,7 +3443,9 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
                 let locked = target_lock_fraction * eq_count * w / denom;
                 if locked > 0.0 {
                     locked_positive_targets += 1;
-                    locked_target_indices.push(t.to_string());
+                    if let Some(indices) = locked_target_indices.as_mut() {
+                        indices.push(t.to_string());
+                    }
                 }
                 locked_counts[t] += locked;
                 locked_sum += locked;
@@ -3338,14 +3453,27 @@ fn lock_condition_rescue_allocations_for_sample<L: EqLabel>(
         }
         let residual_count = (eq_count - locked_sum).max(0.0);
         if audit_label_selected && let Some(file) = audit.as_mut() {
+            let (rescued_target_indices, rescued_target_names) = rescued_target_audit_fields(
+                label.target_labels(),
+                condition_locked_mask,
+                ref_names,
+            );
             let _ = writeln!(
                 file,
                 "{sample_name}\t{label_idx}\t{eq_count:.6}\t{residual_count:.6}\t{locked_sum:.6}\t{rescue_fraction:.6}\t{relaxed_ec_lock_fraction:.6}\t{}\t{rescued_targets}\t{locked_positive_targets}\t{rescued_target_indices}\t{rescued_target_names}\t{}",
                 label.target_labels().len(),
-                locked_target_indices.join(",")
+                locked_target_indices
+                    .as_ref()
+                    .map(|indices| indices.join(","))
+                    .unwrap_or_default()
             );
         }
-        residual_eq_counts.push(residual_count);
+        record_residual_eq_count(
+            &mut residual_eq_counts,
+            collapsed,
+            label_idx,
+            residual_count,
+        );
     }
 
     (residual_eq_counts, locked_counts)
@@ -3368,6 +3496,143 @@ fn sample_condition_indices(samples: &[SampleEntry], condition_names: &[String])
                 .expect("sample condition should exist in condition_names")
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn locked_rescue_phase2_for_sample<L: EqLabel>(
+    sample_name: &str,
+    ref_names: &[String],
+    packed: &PackedEqMap<L>,
+    collapsed: Option<&CollapsedEqMap>,
+    collapsed_index: Option<&crate::utils::txp_selection::TranscriptEqIndex>,
+    full_index: &crate::utils::txp_selection::TranscriptEqIndex,
+    eff_lengths: &[f64],
+    phase1_counts: &[f64],
+    init_counts: Option<&[f64]>,
+    active_mask: &[bool],
+    strict_global_mask: &[bool],
+    condition_rescue_only: &[bool],
+    condition_locked_mask: &[bool],
+    condition_relax_mask: Option<&[bool]>,
+    opts: &ConsensusQuantOpts,
+) -> Vec<f64> {
+    let floor_barrier_mode = matches!(
+        opts.condition_rescue_lock_mode,
+        ConditionRescueLockMode::FloorBarrier
+    );
+    let fully_locked = matches!(
+        opts.condition_rescue_lock_mode,
+        ConditionRescueLockMode::Fixed
+    ) && opts.condition_rescue_lock_fraction >= 1.0;
+    let free_mask: Vec<bool> = active_mask
+        .iter()
+        .zip(strict_global_mask.iter())
+        .zip(condition_locked_mask.iter())
+        .zip(phase1_counts.iter())
+        .map(|(((&active, &global), &locked), &phase1_count)| {
+            condition_rescue_free_variable(
+                active,
+                active && !global,
+                locked,
+                phase1_count,
+                opts.condition_rescue_free_min_count,
+                floor_barrier_mode,
+                fully_locked,
+                &opts.condition_rescue_lock_mode,
+            )
+        })
+        .collect();
+    let (residual_eq_counts, locked_counts) = lock_condition_rescue_allocations_for_sample(
+        sample_name,
+        ref_names,
+        packed,
+        phase1_counts,
+        eff_lengths,
+        condition_locked_mask,
+        condition_relax_mask,
+        collapsed,
+        if floor_barrier_mode {
+            1.0
+        } else {
+            opts.condition_rescue_lock_fraction
+        },
+        if floor_barrier_mode {
+            &ConditionRescueLockMode::Fixed
+        } else {
+            &opts.condition_rescue_lock_mode
+        },
+        opts.condition_rescue_full_lock_threshold,
+        opts.condition_rescue_min_lock_threshold,
+        opts.condition_rescue_credible_floor_z,
+        opts.condition_rescue_enrichment_posterior_threshold,
+    );
+    let free_init = init_counts.map(|counts| phase2_init_counts(counts, &free_mask));
+    let residual_caps = condition_rescue_residual_cap_enabled(opts).then(|| {
+        condition_rescue_residual_caps(
+            condition_rescue_only,
+            phase1_counts,
+            &locked_counts,
+            active_mask,
+            opts.condition_rescue_residual_cap_z,
+        )
+    });
+    let mut em_res = if let Some(cm) = collapsed {
+        let collapsed_counts = if floor_barrier_mode {
+            cm.packed
+                .counts
+                .iter()
+                .map(|&count| count as f64)
+                .collect::<Vec<_>>()
+        } else {
+            residual_eq_counts
+        };
+        phase2_em_step_f64_counts(
+            &cm.packed,
+            &collapsed_counts,
+            eff_lengths,
+            &free_mask,
+            free_init.as_deref(),
+            opts,
+            floor_barrier_mode.then_some((
+                locked_counts.as_slice(),
+                opts.condition_rescue_floor_barrier_weight,
+            )),
+            residual_caps.as_deref(),
+            condition_rescue_residual_cap_active_set_enabled(opts),
+            collapsed_index,
+        )
+    } else {
+        let full_counts = if floor_barrier_mode {
+            packed
+                .counts
+                .iter()
+                .map(|&count| count as f64)
+                .collect::<Vec<_>>()
+        } else {
+            residual_eq_counts
+        };
+        phase2_em_step_f64_counts(
+            packed,
+            &full_counts,
+            eff_lengths,
+            &free_mask,
+            free_init.as_deref(),
+            opts,
+            floor_barrier_mode.then_some((
+                locked_counts.as_slice(),
+                opts.condition_rescue_floor_barrier_weight,
+            )),
+            residual_caps.as_deref(),
+            condition_rescue_residual_cap_active_set_enabled(opts),
+            Some(full_index),
+        )
+    };
+    if !floor_barrier_mode {
+        for (count, locked) in em_res.iter_mut().zip(locked_counts.iter()) {
+            *count += *locked;
+        }
+    }
+    em_res
 }
 
 /// Phase-1 EM dispatch over any `PackedEqMap<L>`. `allow_coverage_smoothing`
@@ -3639,6 +3904,14 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
     } else {
         (0..n_samples).map(|_| None).collect()
     };
+    let collapsed_indices: Vec<Option<txp_selection::TranscriptEqIndex>> = collapsed_maps
+        .iter()
+        .map(|cm| {
+            cm.as_ref().map(|cm| {
+                txp_selection::TranscriptEqIndex::from_packed_eq_map(&cm.packed, n_targets)
+            })
+        })
+        .collect();
 
     // ====== Phase 1: Run initial per-sample EM ======
     info!("Phase 1: running initial EM for {} samples", n_samples);
@@ -4393,132 +4666,29 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     };
                     let alpha = phase2_prior_alpha.as_ref().map(|a| a[i].as_slice());
                     let em_res = if lock_condition_rescue_allocations {
-                        let condition_locked_mask = condition_rescue_only.clone();
-                        let floor_barrier_mode = matches!(
-                            opts.condition_rescue_lock_mode,
-                            ConditionRescueLockMode::FloorBarrier
-                        );
-                        let fully_locked = matches!(
-                            opts.condition_rescue_lock_mode,
-                            ConditionRescueLockMode::Fixed
-                        ) && opts.condition_rescue_lock_fraction >= 1.0;
                         let condition_relax_mask =
                             condition_rescue_lock_relax_masks.as_ref().map(|masks| {
                                 let condition_idx =
                                     condition_rescue_lock_condition_indices.as_ref().unwrap()[i];
                                 masks[condition_idx].as_slice()
                             });
-                        let free_mask: Vec<bool> = phase2_mask
-                            .iter()
-                            .zip(strict_global_mask.iter())
-                            .zip(condition_locked_mask.iter())
-                            .zip(phase1_counts[i].iter())
-                            .map(|(((&active, &global), &locked), &phase1_count)| {
-                                condition_rescue_free_variable(
-                                    active,
-                                    active && !global,
-                                    locked,
-                                    phase1_count,
-                                    opts.condition_rescue_free_min_count,
-                                    floor_barrier_mode,
-                                    fully_locked,
-                                    &opts.condition_rescue_lock_mode,
-                                )
-                            })
-                            .collect();
-                        let (residual_eq_counts, locked_counts) =
-                            lock_condition_rescue_allocations_for_sample(
-                                &sample.sample_name,
-                                &bundles[i].ref_names,
-                                &bundles[i].packed_eq_map,
-                                &phase1_counts[i],
-                                &bundles[i].eff_lengths,
-                                &condition_locked_mask,
-                                condition_relax_mask,
-                                if floor_barrier_mode {
-                                    1.0
-                                } else {
-                                    opts.condition_rescue_lock_fraction
-                                },
-                                if floor_barrier_mode {
-                                    &ConditionRescueLockMode::Fixed
-                                } else {
-                                    &opts.condition_rescue_lock_mode
-                                },
-                                opts.condition_rescue_full_lock_threshold,
-                                opts.condition_rescue_min_lock_threshold,
-                                opts.condition_rescue_credible_floor_z,
-                                opts.condition_rescue_enrichment_posterior_threshold,
-                            );
-                        let free_init = init
-                            .as_ref()
-                            .map(|counts| phase2_init_counts(counts, &free_mask));
-                        let residual_caps =
-                            condition_rescue_residual_cap_enabled(opts).then(|| {
-                                condition_rescue_residual_caps(
-                                    &condition_rescue_only,
-                                    &phase1_counts[i],
-                                    &locked_counts,
-                                    phase2_mask,
-                                    opts.condition_rescue_residual_cap_z,
-                                )
-                            });
-                        let mut em_res = if let Some(cm) = collapsed_maps[i].as_ref() {
-                            let collapsed_counts = if floor_barrier_mode {
-                                cm.packed
-                                    .counts
-                                    .iter()
-                                    .map(|&count| count as f64)
-                                    .collect::<Vec<_>>()
-                            } else {
-                                collapse_residual_eq_counts(&residual_eq_counts, cm)
-                            };
-                            phase2_em_step_f64_counts(
-                                &cm.packed,
-                                &collapsed_counts,
-                                bundles[i].eff_lengths.clone(),
-                                &free_mask,
-                                free_init.as_deref(),
-                                opts,
-                                floor_barrier_mode.then_some((
-                                    locked_counts.as_slice(),
-                                    opts.condition_rescue_floor_barrier_weight,
-                                )),
-                                residual_caps.as_deref(),
-                                condition_rescue_residual_cap_active_set_enabled(opts),
-                            )
-                        } else {
-                            let full_counts = if floor_barrier_mode {
-                                bundles[i]
-                                    .packed_eq_map
-                                    .counts
-                                    .iter()
-                                    .map(|&count| count as f64)
-                                    .collect::<Vec<_>>()
-                            } else {
-                                residual_eq_counts
-                            };
-                            phase2_em_step_f64_counts(
-                                &bundles[i].packed_eq_map,
-                                &full_counts,
-                                bundles[i].eff_lengths.clone(),
-                                &free_mask,
-                                free_init.as_deref(),
-                                opts,
-                                floor_barrier_mode.then_some((
-                                    locked_counts.as_slice(),
-                                    opts.condition_rescue_floor_barrier_weight,
-                                )),
-                                residual_caps.as_deref(),
-                                condition_rescue_residual_cap_active_set_enabled(opts),
-                            )
-                        };
-                        if !floor_barrier_mode {
-                            for (count, locked) in em_res.iter_mut().zip(locked_counts.iter()) {
-                                *count += *locked;
-                            }
-                        }
-                        em_res
+                        locked_rescue_phase2_for_sample(
+                            &sample.sample_name,
+                            &bundles[i].ref_names,
+                            &bundles[i].packed_eq_map,
+                            collapsed_maps[i].as_ref(),
+                            collapsed_indices[i].as_ref(),
+                            &indices[i],
+                            &bundles[i].eff_lengths,
+                            &phase1_counts[i],
+                            init.as_deref(),
+                            phase2_mask,
+                            &strict_global_mask,
+                            &condition_rescue_only,
+                            &condition_rescue_only,
+                            condition_relax_mask,
+                            opts,
+                        )
                     } else if let Some(cm) = collapsed_maps[i].as_ref() {
                         phase2_em_step(
                             &cm.packed,
@@ -4567,131 +4737,29 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
             };
             let alpha = phase2_prior_alpha.as_ref().map(|a| a[i].as_slice());
             let em_res = if lock_condition_rescue_allocations {
-                let condition_locked_mask = condition_rescue_only.clone();
-                let floor_barrier_mode = matches!(
-                    opts.condition_rescue_lock_mode,
-                    ConditionRescueLockMode::FloorBarrier
-                );
-                let fully_locked = matches!(
-                    opts.condition_rescue_lock_mode,
-                    ConditionRescueLockMode::Fixed
-                ) && opts.condition_rescue_lock_fraction >= 1.0;
                 let condition_relax_mask =
                     condition_rescue_lock_relax_masks.as_ref().map(|masks| {
                         let condition_idx =
                             condition_rescue_lock_condition_indices.as_ref().unwrap()[i];
                         masks[condition_idx].as_slice()
                     });
-                let free_mask: Vec<bool> = phase2_mask
-                    .iter()
-                    .zip(strict_global_mask.iter())
-                    .zip(condition_locked_mask.iter())
-                    .zip(phase1_counts[i].iter())
-                    .map(|(((&active, &global), &locked), &phase1_count)| {
-                        condition_rescue_free_variable(
-                            active,
-                            active && !global,
-                            locked,
-                            phase1_count,
-                            opts.condition_rescue_free_min_count,
-                            floor_barrier_mode,
-                            fully_locked,
-                            &opts.condition_rescue_lock_mode,
-                        )
-                    })
-                    .collect();
-                let (residual_eq_counts, locked_counts) =
-                    lock_condition_rescue_allocations_for_sample(
-                        &sample.sample_name,
-                        &bundles[i].ref_names,
-                        &bundles[i].packed_eq_map,
-                        &phase1_counts[i],
-                        &bundles[i].eff_lengths,
-                        &condition_locked_mask,
-                        condition_relax_mask,
-                        if floor_barrier_mode {
-                            1.0
-                        } else {
-                            opts.condition_rescue_lock_fraction
-                        },
-                        if floor_barrier_mode {
-                            &ConditionRescueLockMode::Fixed
-                        } else {
-                            &opts.condition_rescue_lock_mode
-                        },
-                        opts.condition_rescue_full_lock_threshold,
-                        opts.condition_rescue_min_lock_threshold,
-                        opts.condition_rescue_credible_floor_z,
-                        opts.condition_rescue_enrichment_posterior_threshold,
-                    );
-                let free_init = init
-                    .as_ref()
-                    .map(|counts| phase2_init_counts(counts, &free_mask));
-                let residual_caps = condition_rescue_residual_cap_enabled(opts).then(|| {
-                    condition_rescue_residual_caps(
-                        &condition_rescue_only,
-                        &phase1_counts[i],
-                        &locked_counts,
-                        phase2_mask,
-                        opts.condition_rescue_residual_cap_z,
-                    )
-                });
-                let mut em_res = if let Some(cm) = collapsed_maps[i].as_ref() {
-                    let collapsed_counts = if floor_barrier_mode {
-                        cm.packed
-                            .counts
-                            .iter()
-                            .map(|&count| count as f64)
-                            .collect::<Vec<_>>()
-                    } else {
-                        collapse_residual_eq_counts(&residual_eq_counts, cm)
-                    };
-                    phase2_em_step_f64_counts(
-                        &cm.packed,
-                        &collapsed_counts,
-                        bundles[i].eff_lengths.clone(),
-                        &free_mask,
-                        free_init.as_deref(),
-                        opts,
-                        floor_barrier_mode.then_some((
-                            locked_counts.as_slice(),
-                            opts.condition_rescue_floor_barrier_weight,
-                        )),
-                        residual_caps.as_deref(),
-                        condition_rescue_residual_cap_active_set_enabled(opts),
-                    )
-                } else {
-                    let full_counts = if floor_barrier_mode {
-                        bundles[i]
-                            .packed_eq_map
-                            .counts
-                            .iter()
-                            .map(|&count| count as f64)
-                            .collect::<Vec<_>>()
-                    } else {
-                        residual_eq_counts
-                    };
-                    phase2_em_step_f64_counts(
-                        &bundles[i].packed_eq_map,
-                        &full_counts,
-                        bundles[i].eff_lengths.clone(),
-                        &free_mask,
-                        free_init.as_deref(),
-                        opts,
-                        floor_barrier_mode.then_some((
-                            locked_counts.as_slice(),
-                            opts.condition_rescue_floor_barrier_weight,
-                        )),
-                        residual_caps.as_deref(),
-                        condition_rescue_residual_cap_active_set_enabled(opts),
-                    )
-                };
-                if !floor_barrier_mode {
-                    for (count, locked) in em_res.iter_mut().zip(locked_counts.iter()) {
-                        *count += *locked;
-                    }
-                }
-                em_res
+                locked_rescue_phase2_for_sample(
+                    &sample.sample_name,
+                    &bundles[i].ref_names,
+                    &bundles[i].packed_eq_map,
+                    collapsed_maps[i].as_ref(),
+                    collapsed_indices[i].as_ref(),
+                    &indices[i],
+                    &bundles[i].eff_lengths,
+                    &phase1_counts[i],
+                    init.as_deref(),
+                    phase2_mask,
+                    &strict_global_mask,
+                    &condition_rescue_only,
+                    &condition_rescue_only,
+                    condition_relax_mask,
+                    opts,
+                )
             } else if let Some(cm) = collapsed_maps[i].as_ref() {
                 phase2_em_step(
                     &cm.packed,
@@ -5249,12 +5317,7 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                 opts.post_filter_redistribute_mode,
                 PostFilterRedistributeMode::SharedResponsibility
             ) {
-            Some(
-                crate::utils::txp_selection::TranscriptEqIndex::from_packed_eq_map(
-                    &bundles[i].packed_eq_map,
-                    n_targets,
-                ),
-            )
+            Some(&indices[i])
         } else {
             None
         };
@@ -5805,128 +5868,29 @@ fn run_dispatch<EqLabelT: EqLabel + Send + Sync + 'static>(
                     .zip(final_mask.iter())
                     .map(|(&locked, &active)| locked && active)
                     .collect();
-                let floor_barrier_mode = matches!(
-                    opts.condition_rescue_lock_mode,
-                    ConditionRescueLockMode::FloorBarrier
-                );
-                let fully_locked = matches!(
-                    opts.condition_rescue_lock_mode,
-                    ConditionRescueLockMode::Fixed
-                ) && opts.condition_rescue_lock_fraction >= 1.0;
                 let condition_relax_mask =
                     condition_rescue_lock_relax_masks.as_ref().map(|masks| {
                         let condition_idx =
                             condition_rescue_lock_condition_indices.as_ref().unwrap()[i];
                         masks[condition_idx].as_slice()
                     });
-                let free_mask: Vec<bool> = final_mask
-                    .iter()
-                    .zip(strict_global_mask.iter())
-                    .zip(condition_locked_mask.iter())
-                    .zip(phase1_counts[i].iter())
-                    .map(|(((&active, &global), &locked), &phase1_count)| {
-                        condition_rescue_free_variable(
-                            active,
-                            active && !global,
-                            locked,
-                            phase1_count,
-                            opts.condition_rescue_free_min_count,
-                            floor_barrier_mode,
-                            fully_locked,
-                            &opts.condition_rescue_lock_mode,
-                        )
-                    })
-                    .collect();
-                let (residual_eq_counts, locked_counts) =
-                    lock_condition_rescue_allocations_for_sample(
-                        &samples[i].sample_name,
-                        &bundles[i].ref_names,
-                        &bundles[i].packed_eq_map,
-                        &phase1_counts[i],
-                        &bundles[i].eff_lengths,
-                        &condition_locked_mask,
-                        condition_relax_mask,
-                        if floor_barrier_mode {
-                            1.0
-                        } else {
-                            opts.condition_rescue_lock_fraction
-                        },
-                        if floor_barrier_mode {
-                            &ConditionRescueLockMode::Fixed
-                        } else {
-                            &opts.condition_rescue_lock_mode
-                        },
-                        opts.condition_rescue_full_lock_threshold,
-                        opts.condition_rescue_min_lock_threshold,
-                        opts.condition_rescue_credible_floor_z,
-                        opts.condition_rescue_enrichment_posterior_threshold,
-                    );
-                let free_init = phase2_init_counts(&em_res, &free_mask);
-                let residual_caps = condition_rescue_residual_cap_enabled(opts).then(|| {
-                    condition_rescue_residual_caps(
-                        &condition_rescue_only,
-                        &phase1_counts[i],
-                        &locked_counts,
-                        final_mask,
-                        opts.condition_rescue_residual_cap_z,
-                    )
-                });
-                let mut final_res = if let Some(cm) = collapsed_maps[i].as_ref() {
-                    let collapsed_counts = if floor_barrier_mode {
-                        cm.packed
-                            .counts
-                            .iter()
-                            .map(|&count| count as f64)
-                            .collect::<Vec<_>>()
-                    } else {
-                        collapse_residual_eq_counts(&residual_eq_counts, cm)
-                    };
-                    phase2_em_step_f64_counts(
-                        &cm.packed,
-                        &collapsed_counts,
-                        bundles[i].eff_lengths.clone(),
-                        &free_mask,
-                        Some(&free_init),
-                        opts,
-                        floor_barrier_mode.then_some((
-                            locked_counts.as_slice(),
-                            opts.condition_rescue_floor_barrier_weight,
-                        )),
-                        residual_caps.as_deref(),
-                        condition_rescue_residual_cap_active_set_enabled(opts),
-                    )
-                } else {
-                    let full_counts = if floor_barrier_mode {
-                        bundles[i]
-                            .packed_eq_map
-                            .counts
-                            .iter()
-                            .map(|&count| count as f64)
-                            .collect::<Vec<_>>()
-                    } else {
-                        residual_eq_counts
-                    };
-                    phase2_em_step_f64_counts(
-                        &bundles[i].packed_eq_map,
-                        &full_counts,
-                        bundles[i].eff_lengths.clone(),
-                        &free_mask,
-                        Some(&free_init),
-                        opts,
-                        floor_barrier_mode.then_some((
-                            locked_counts.as_slice(),
-                            opts.condition_rescue_floor_barrier_weight,
-                        )),
-                        residual_caps.as_deref(),
-                        condition_rescue_residual_cap_active_set_enabled(opts),
-                    )
-                };
-                if !floor_barrier_mode {
-                    for (count, locked) in final_res.iter_mut().zip(locked_counts.iter()) {
-                        *count += *locked;
-                    }
-                }
-                final_res
+                locked_rescue_phase2_for_sample(
+                    &samples[i].sample_name,
+                    &bundles[i].ref_names,
+                    &bundles[i].packed_eq_map,
+                    collapsed_maps[i].as_ref(),
+                    collapsed_indices[i].as_ref(),
+                    &indices[i],
+                    &bundles[i].eff_lengths,
+                    &phase1_counts[i],
+                    Some(&em_res),
+                    final_mask,
+                    &strict_global_mask,
+                    &condition_rescue_only,
+                    &condition_locked_mask,
+                    condition_relax_mask,
+                    opts,
+                )
             } else if let Some(cm) = collapsed_maps[i].as_ref() {
                 phase2_em_step(
                     &cm.packed,

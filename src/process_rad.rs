@@ -412,7 +412,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     );
 
     // extract whatever context we'll need to read the records
-    let tag_context = prelude.get_record_context::<PiscemBulkRecordContext>()?;
+    let tag_context = prelude.get_record_context_prefer_roles::<PiscemBulkRecordContext>()?;
 
     // resolve library type (auto-detect if requested)
     let lib_type: LibraryType = match qo.lib_type {

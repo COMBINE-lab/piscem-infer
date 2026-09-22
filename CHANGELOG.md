@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/COMBINE-lab/piscem-infer/compare/v0.6.0...v0.6.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **deps:** bump libradicl 0.10 -&gt; 0.21 to read RAD v2 files ([95a69e3](https://github.com/COMBINE-lab/piscem-infer/commit/95a69e39729693945b52577c63ef1deb658e6c2e))
+
 ## [0.6.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.5.2...v0.6.0) (2024-02-26)
 
 

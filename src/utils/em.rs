@@ -128,6 +128,11 @@ pub fn build_packed_eq_classes<EqLabelT: EqLabel>(
     starts.push(0u64);
     let mut total_count = 0u64;
     for (label, count) in eq_map.iter_labels().zip(eq_map.counts.iter()) {
+        // A class with no targets carries no assignable evidence, and the EM
+        // kernels index a class's first target unconditionally.
+        if label.target_labels().is_empty() {
+            continue;
+        }
         for (tid, cond_prob) in label.target_labels().iter().zip(label.target_probs()) {
             labels.push(*tid);
             combined.push(cond_prob * inv_eff_lens[*tid as usize]);
@@ -207,6 +212,23 @@ pub fn run_em(packed: &PackedEqClasses, opts: &EmOptions) -> Vec<f64> {
 mod tests {
     use super::*;
     use crate::utils::eq_maps::{BasicEqLabel, EqMap, OrientationProperty, RangeFactorizedEqLabel};
+
+    /// Fragments whose every mapping failed the library-type filter must not
+    /// become target-less classes: the EM kernels index a class's first target.
+    #[test]
+    fn empty_labels_are_not_packed() {
+        let mut eqm = EqMap::<BasicEqLabel>::new(OrientationProperty::OrientationAware);
+        eqm.add(BasicEqLabel::new(&[], Some(&[])));
+        eqm.add(BasicEqLabel::new(&[0, 1, 1, 1], Some(&[0.5, 0.5])));
+        let packed_map = PackedEqMap::from_eq_map(&eqm);
+        let p = build_packed_eq_classes(&packed_map, &[100.0, 200.0], false);
+        assert_eq!(p.counts, vec![1]);
+        assert_eq!(p.starts, vec![0, 2]);
+        assert_eq!(p.total_count, 1);
+        let opts = em_options(100, 1e-2, 1e-2, 1e-8, EmAccel::None);
+        let alphas = run_em(&p, &opts);
+        assert!((alphas.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn packed_from_basic_eq_map_matches_expected_layout() {

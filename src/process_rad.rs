@@ -741,9 +741,13 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                 }
             }
 
-            label_ints.append(&mut dir_ints);
-            let eql = EqLabelT::new(&label_ints, Some(&probs));
-            eqmap.add(eql);
+            // A stranded library can filter out every mapping of a fragment;
+            // an empty label would be a class with no targets to assign to.
+            if !label_ints.is_empty() {
+                label_ints.append(&mut dir_ints);
+                let eql = EqLabelT::new(&label_ints, Some(&probs));
+                eqmap.add(eql);
+            }
 
             if nm == 1 && !ft.is_orphan() {
                 if let Some(fl) = mappings.frag_lengths.first() {

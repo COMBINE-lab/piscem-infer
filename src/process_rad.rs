@@ -20,7 +20,6 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
-use crate::utils::gibbs::do_gibbs;
 use crate::utils::eq_maps::{
     BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
 };
@@ -35,10 +34,11 @@ use crate::{
 use crate::{
     fld::{EmpiricalFLD, Fld, ParametricFLD},
     utils::em::{
-        EMInfo, adjust_ref_lengths, conditional_means, conditional_means_from_params, do_bootstrap,
-        em, em_par,
+        adjust_ref_lengths, build_packed_eq_classes, conditional_means,
+        conditional_means_from_params, em_options, run_em,
     },
 };
+use salmon_infer::{EffLens, GibbsOptions, bootstrap, gibbs_sample};
 
 use libradicl::rad_types::{self, MappedFragmentOrientation};
 use libradicl::{
@@ -196,9 +196,12 @@ fn detect_lib_type_from_sample<T: Read>(
     info!(
         "Auto-detection sampled {} reads: forward={}, reverse={}, FR={}, RF={}, FF={}, RR={}, unknown={}",
         sampled,
-        counts.forward, counts.reverse,
-        counts.forward_reverse, counts.reverse_forward,
-        counts.forward_forward, counts.reverse_reverse,
+        counts.forward,
+        counts.reverse,
+        counts.forward_reverse,
+        counts.reverse_forward,
+        counts.forward_forward,
+        counts.reverse_reverse,
         counts.unknown
     );
 
@@ -246,6 +249,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let num_gibbs_samples = qo.num_gibbs_samples;
     let gibbs_thinning_factor = qo.gibbs_thinning_factor;
     let num_threads = qo.num_threads;
+    let seed = qo.seed;
+
+    // all parallel work (the EM's M-step, bootstrap replicates, Gibbs chains)
+    // runs on the global rayon pool; size it once, up front.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .context("could not initialize the rayon thread pool")?;
 
     // if there is a parent directory
     if let Some(p) = output.parent() {
@@ -272,7 +283,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
             );
         } else {
             let map_info_str = std::fs::read_to_string(&input_map_info)
-                .unwrap_or_else(|_| panic!("Couldn't open {:?}.", &input_map_info));
+                .unwrap_or_else(|_| panic!("Couldn't open {input_map_info:?}."));
             let v: Value = serde_json::from_str(&map_info_str)?;
             if let Some(sigs) = v.get("signatures") {
                 ref_sig_json = Some(sigs.clone());
@@ -319,7 +330,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
                 "The input RAD file {} was for unpaired reads, so \
                     a fragment length distribution mean and standard deviation \
                     must be provided.",
-                &input_rad.display()
+                input_rad.display()
             );
         }
     }
@@ -477,19 +488,17 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     };
     let eff_lengths = adjust_ref_lengths(ref_lengths, &cond_means);
 
-    let eminfo = EMInfo {
-        eq_map: &packed_eq_map,
-        eff_lens: &eff_lengths,
+    // build the flat CSR equivalence classes consumed by salmon-infer; the raw
+    // conditional weights are only needed by the Gibbs sampler.
+    let packed = build_packed_eq_classes(&packed_eq_map, &eff_lengths, num_gibbs_samples > 0);
+    let em_opts = em_options(
         max_iter,
         convergence_thresh,
+        qo.alpha_check_cutoff,
         presence_thresh,
-    };
-
-    let em_res = if num_threads > 1 {
-        em_par(&eminfo, num_threads)
-    } else {
-        em(&eminfo)
-    };
+        qo.em_accel.into(),
+    );
+    let em_res = run_em(&packed, &em_opts);
 
     let quant_output = output.with_additional_extension(".quant");
     io::write_results(
@@ -528,11 +537,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     }
 
     if num_bootstraps > 0 {
-        info!("performing bootstraps");
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global()?;
-        let bootstraps = do_bootstrap(&eminfo, num_bootstraps);
+        info!("performing {num_bootstraps} bootstraps");
+        let bootstraps = bootstrap(
+            &packed,
+            &em_opts,
+            EffLens::new(&eff_lengths),
+            num_bootstraps as u32,
+            seed,
+        );
 
         let mut new_arrays = vec![];
         let mut bs_fields = vec![];
@@ -550,12 +562,15 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     }
 
     if num_gibbs_samples > 0 {
-        info!("performing Gibbs sampling ({num_gibbs_samples} samples, thinning factor {gibbs_thinning_factor})");
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global()?;
-        let gibbs_samples =
-            do_gibbs(&eminfo, &em_res, num_gibbs_samples, gibbs_thinning_factor);
+        info!(
+            "performing Gibbs sampling ({num_gibbs_samples} samples, thinning factor {gibbs_thinning_factor})"
+        );
+        let gibbs_opts = GibbsOptions {
+            num_samples: num_gibbs_samples as u32,
+            thinning: gibbs_thinning_factor as u32,
+            ..GibbsOptions::default()
+        };
+        let gibbs_samples = gibbs_sample(&packed, &eff_lengths, &em_res, &gibbs_opts, seed);
 
         let mut new_arrays = vec![];
         let mut gs_fields = vec![];
@@ -664,9 +679,11 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
 
     let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(1));
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} Processed {human_pos} reads [{elapsed_precise}]")
-            .unwrap()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        ProgressStyle::with_template(
+            "{spinner:.green} Processed {human_pos} reads [{elapsed_precise}]",
+        )
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
     );
     pb.enable_steady_tick(Duration::from_secs(1));
 
@@ -724,9 +741,13 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                 }
             }
 
-            label_ints.append(&mut dir_ints);
-            let eql = EqLabelT::new(&label_ints, Some(&probs));
-            eqmap.add(eql);
+            // A stranded library can filter out every mapping of a fragment;
+            // an empty label would be a class with no targets to assign to.
+            if !label_ints.is_empty() {
+                label_ints.append(&mut dir_ints);
+                let eql = EqLabelT::new(&label_ints, Some(&probs));
+                eqmap.add(eql);
+            }
 
             if nm == 1 && !ft.is_orphan() {
                 if let Some(fl) = mappings.frag_lengths.first() {

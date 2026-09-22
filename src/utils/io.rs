@@ -37,7 +37,9 @@ pub(crate) fn write_results(
     let inv_denom: f64 = if denom > 0.0 {
         ONE_MILLION / denom
     } else {
-        warn!("The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!");
+        warn!(
+            "The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!"
+        );
         0.0
     };
     let tpms: Vec<f64> = e_counts

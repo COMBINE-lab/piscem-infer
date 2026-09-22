@@ -321,13 +321,25 @@ pub struct PackedEqMap<EqLabelT> {
 }
 
 impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
+    /// Pack the equivalence classes of `eqm` into a flat CSR layout.
+    ///
+    /// The classes are emitted in lexicographic order of their (full) keys.
+    /// The underlying `AHashMap` is iterated in an order that depends on its
+    /// per-process random hash keys; packing in that order would make the
+    /// class order — and hence the floating-point summation order of the EM
+    /// and the per-class random draws of the bootstrap / Gibbs sampler —
+    /// differ from run to run. Sorting makes the layout a pure function of
+    /// the data.
     pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
         let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
         let mut counts = Vec::<usize>::with_capacity(eqm.len());
         let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
 
+        let mut entries: Vec<(&[u32], &usize)> = eqm.full_key_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
         eq_label_starts.push(0);
-        for (eq_lab, count) in eqm.full_key_iter() {
+        for (eq_lab, count) in entries {
             eq_labels.extend_from_slice(eq_lab);
             eq_label_starts.push(eq_labels.len() as u32);
             counts.push(*count);

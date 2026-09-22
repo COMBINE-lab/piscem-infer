@@ -9,9 +9,11 @@ use std::str::FromStr;
 
 use crate::utils::map_record_types::LibraryType;
 
+// EM convergence defaults follow salmon (`salmon_infer::EmOptions::default()`).
 const PRESENCE_THRESH: f64 = 1e-8;
-const RELDIFF_THRESH: f64 = 1e-3;
-const MAX_EM_ITER: u32 = 1500;
+const RELDIFF_THRESH: f64 = 1e-2;
+const ALPHA_CHECK_CUTOFF: f64 = 1e-2;
+const MAX_EM_ITER: u32 = 10_000;
 const DEFAULT_SEED: u64 = 0x5A15_0EED;
 
 /// Convergence acceleration applied on top of the EM fixed-point iteration.
@@ -87,10 +89,17 @@ pub struct QuantOpts {
     /// max iterations to run the EM
     #[arg(short, long, default_value_t = MAX_EM_ITER, help_heading = "EM Algorithm")]
     pub max_iter: u32,
-    /// convergence threshold for EM
+    /// convergence threshold for EM: stop once every target with abundance above
+    /// `--alpha-check-cutoff` changes by less than this relative amount between
+    /// iterations
     #[arg(long, default_value_t = RELDIFF_THRESH, help_heading = "EM Algorithm")]
     pub convergence_thresh: f64,
-    /// presence threshold for EM
+    /// targets whose abundance is at or below this value are ignored when
+    /// checking convergence (salmon's `alphaCheckCutoff`)
+    #[arg(long, default_value_t = ALPHA_CHECK_CUTOFF, help_heading = "EM Algorithm")]
+    pub alpha_check_cutoff: f64,
+    /// presence threshold for EM: abundances below this are truncated to zero
+    /// (with mass-preserving redistribution) in the final estimate
     #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
     /// convergence acceleration scheme for the EM. `squarem`/`daarem` reach the

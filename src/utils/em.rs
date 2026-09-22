@@ -153,20 +153,21 @@ pub fn build_packed_eq_classes<EqLabelT: EqLabel>(
 
 /// Map piscem-infer's EM options onto `salmon-infer`'s [`EmOptions`].
 ///
-/// `presence_thresh` plays the role it did in the previous implementation:
-/// it is both the abundance below which a target is excluded from the
-/// convergence check and the threshold below which it is truncated to zero
-/// on output.
+/// Convergence follows salmon: `alpha_check_cutoff` is the abundance at or
+/// below which a target is excluded from the relative-difference convergence
+/// check, and `presence_thresh` (salmon's `min_alpha`) is the threshold below
+/// which a target is truncated to zero on output.
 pub fn em_options(
     max_iter: u32,
     convergence_thresh: f64,
+    alpha_check_cutoff: f64,
     presence_thresh: f64,
     accel: EmAccel,
 ) -> EmOptions {
     EmOptions {
         max_iter,
         rel_diff_tol: convergence_thresh,
-        alpha_check_cutoff: presence_thresh,
+        alpha_check_cutoff,
         min_alpha: presence_thresh,
         accel,
         ..EmOptions::default()
@@ -267,7 +268,7 @@ mod tests {
         let packed_map = PackedEqMap::from_eq_map(&eqm);
         let eff_lens = [1.0, 1.0];
         let p = build_packed_eq_classes(&packed_map, &eff_lens, false);
-        let opts = em_options(1500, 1e-3, 1e-8, EmAccel::Daarem);
+        let opts = em_options(1500, 1e-3, 1e-8, 1e-8, EmAccel::Daarem);
         let alphas = run_em(&p, &opts);
         let total: f64 = alphas.iter().sum();
         assert!((total - 200.0).abs() < 1e-6, "total = {total}");
@@ -342,7 +343,7 @@ mod reproducibility {
             "problem is not ambiguous enough"
         );
         for accel in [EmAccel::None, EmAccel::Squarem, EmAccel::Daarem] {
-            let opts = em_options(1500, 1e-3, 1e-8, accel);
+            let opts = em_options(1500, 1e-3, 1e-8, 1e-8, accel);
             let reference = run_in_pool(1, &p, &opts);
             let total: f64 = reference.iter().sum();
             assert!((total - p.total_count as f64).abs() < 1e-6 * total);
@@ -378,7 +379,7 @@ mod reproducibility {
         let packed_map = PackedEqMap::from_eq_map(&eqm);
         let eff_lens: Vec<f64> = (0..81).map(|i| 100.0 + i as f64).collect();
         let p = build_packed_eq_classes(&packed_map, &eff_lens, false);
-        let opts = em_options(1500, 1e-3, 1e-8, EmAccel::None);
+        let opts = em_options(1500, 1e-3, 1e-8, 1e-8, EmAccel::None);
         let a = salmon_infer::bootstrap(&p, &opts, salmon_infer::EffLens::new(&eff_lens), 8, 42);
         let b = salmon_infer::bootstrap(&p, &opts, salmon_infer::EffLens::new(&eff_lens), 8, 42);
         assert_eq!(

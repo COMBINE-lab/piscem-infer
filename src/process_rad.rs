@@ -494,6 +494,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let em_opts = em_options(
         max_iter,
         convergence_thresh,
+        qo.alpha_check_cutoff,
         presence_thresh,
         qo.em_accel.into(),
     );

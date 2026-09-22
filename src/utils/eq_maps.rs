@@ -335,14 +335,29 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
         let mut counts = Vec::<usize>::with_capacity(eqm.len());
         let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
 
-        let mut entries: Vec<(&[u32], &usize)> = eqm.full_key_iter().collect();
+        // The packed key drops orientation, so distinct entries of an
+        // orientation-aware map (same targets, different orientations) can map to
+        // the same packed key. Sort by key and coalesce such duplicates by summing
+        // their counts: this yields one class per packed label, and — because the
+        // `AHashMap` iteration order is randomized per process — it is what makes
+        // the packed class order (and hence the EM's summation order)
+        // deterministic. A plain sort would leave tied keys in hash order.
+        let mut entries: Vec<(&[u32], usize)> = eqm.full_key_iter().map(|(k, c)| (k, *c)).collect();
         entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
         eq_label_starts.push(0);
-        for (eq_lab, count) in entries {
+        let mut i = 0;
+        while i < entries.len() {
+            let (eq_lab, mut count) = entries[i];
+            let mut j = i + 1;
+            while j < entries.len() && entries[j].0 == eq_lab {
+                count += entries[j].1;
+                j += 1;
+            }
             eq_labels.extend_from_slice(eq_lab);
             eq_label_starts.push(eq_labels.len() as u32);
-            counts.push(*count);
+            counts.push(count);
+            i = j;
         }
 
         Self {

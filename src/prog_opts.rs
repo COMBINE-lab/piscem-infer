@@ -19,11 +19,11 @@ const DEFAULT_SEED: u64 = 0x5A15_0EED;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum EmAccelArg {
-    /// plain fixed-point iteration
+    /// plain fixed-point iteration (default; matches prior releases and salmon)
     None,
     /// SQUAREM (SqS3) extrapolation
     Squarem,
-    /// damped Anderson acceleration with restarts (fastest)
+    /// damped Anderson acceleration with restarts
     Daarem,
 }
 
@@ -93,8 +93,9 @@ pub struct QuantOpts {
     /// presence threshold for EM
     #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
-    /// convergence acceleration scheme for the EM
-    #[arg(long, value_enum, default_value_t = EmAccelArg::Daarem, help_heading = "EM Algorithm")]
+    /// convergence acceleration scheme for the EM. `squarem`/`daarem` reach the
+    /// same fixpoint in fewer M-steps but are not byte-identical to `none`.
+    #[arg(long, value_enum, default_value_t = EmAccelArg::None, help_heading = "EM Algorithm")]
     pub em_accel: EmAccelArg,
 
     // --- Fragment Length Distribution ---

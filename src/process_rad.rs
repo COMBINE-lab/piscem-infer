@@ -295,6 +295,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     // read the header and tag sections from the rad file
     let prelude = RadPrelude::from_bytes(&mut br)?;
+    // before anything else, make sure this is a bulk RAD file we can read
+    rad_input::check_bulk_layout(&prelude, &input_rad)?;
 
     info!("read header!");
     if prelude.hdr.is_paired > 0_u8 {
@@ -332,21 +334,9 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     // read-level
     info!("read {:?} read-level tags", prelude.read_tags.tags.len());
-
-    // required read-level tag
-    const FRAG_TYPE_NAME: &str = "frag_map_type";
-    let mut had_frag_map_type = false;
-    // parse actual tags
+    // parse actual tags (their layout was checked above)
     for rt in &prelude.read_tags.tags {
         info!("\tread-level tag {}", rt.name);
-        if rt.name == FRAG_TYPE_NAME {
-            had_frag_map_type = true;
-        }
-    }
-    if !had_frag_map_type {
-        bail!(
-            "read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed."
-        );
     }
 
     // alignment-level
@@ -354,57 +344,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         "read {:?} alignemnt-level tags",
         prelude.aln_tags.tags.len()
     );
-
-    // required alignment level tags
-    const REF_ORI_NAME: &str = "compressed_ori_ref";
-    const POS_NAME: &str = "pos";
-    const FRAGLEN_NAME: &str = "frag_len";
-
-    let mut found_ref_ori_t = false;
-    let mut found_pos_t = false;
-    let mut found_fraglen_t = false;
-    // parse actual tags
+    // parse actual tags (their layout was checked above)
     for at in &prelude.aln_tags.tags {
         info!("\talignment-level tag {}", at.name);
-        match at.name.as_str() {
-            REF_ORI_NAME => {
-                found_ref_ori_t = true;
-            }
-            POS_NAME => {
-                found_pos_t = true;
-            }
-            FRAGLEN_NAME => {
-                found_fraglen_t = true;
-            }
-            _ => {
-                info!("unknown alignment-level tag {}", at.name);
-            }
-        }
     }
-    // ensure the tags we expect are found
-    assert!(
-        found_ref_ori_t,
-        "required alignment-level tag \"{REF_ORI_NAME}\" is missing"
-    );
-    assert!(
-        found_pos_t,
-        "required alignment-level tag \"{POS_NAME}\" is missing"
-    );
-    assert!(
-        found_fraglen_t,
-        "required alignment-level tag \"{FRAGLEN_NAME}\" is missing"
-    );
 
-    // parse the actual file-level tags
-    const REF_LENGTHS_NAME: &str = "ref_lengths";
-    let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
-    // get the reference lengths from the tag map
-    let ref_lengths = match file_tag_map.get(REF_LENGTHS_NAME) {
-        Some(rad_types::TagValue::ArrayU32(v)) => Some(v),
-        _ => None,
-    };
-
-    let ref_lengths = ref_lengths.expect("was not able to read reference lengths from file!");
+    // parse the actual file-level tags, and get the reference lengths from them
+    let ref_lengths = rad_input::read_file_tags(&prelude, &mut br, &input_rad)?;
+    let ref_lengths = &ref_lengths[..];
     info!(
         "read {} reference lengths",
         ref_lengths.len().to_formatted_string(&Locale::en)

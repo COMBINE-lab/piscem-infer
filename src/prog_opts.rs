@@ -125,7 +125,7 @@ pub struct QuantOpts {
         help_heading = "Fragment Length Distribution"
     )]
     pub param_est_frags: isize,
-    /// mean of fragment length distribution mean
+    /// mean of the fragment length distribution
     /// (required, and used, only in the case of unpaired fragments).
     #[arg(
         long,
@@ -133,7 +133,7 @@ pub struct QuantOpts {
         help_heading = "Fragment Length Distribution"
     )]
     pub fld_mean: Option<f64>,
-    /// mean of fragment length distribution standard deviation
+    /// standard deviation of the fragment length distribution
     /// (required, and used, only in the case of unpaired fragments).
     #[arg(
         long,

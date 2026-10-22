@@ -38,7 +38,7 @@ pub(crate) fn write_results(
         ONE_MILLION / denom
     } else {
         warn!(
-            "The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!"
+            "The sum of ecount / eelen for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!"
         );
         0.0
     };

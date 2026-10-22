@@ -17,15 +17,20 @@ const MAX_EM_ITER: u32 = 10_000;
 const DEFAULT_SEED: u64 = 0x5A15_0EED;
 
 /// Convergence acceleration applied on top of the EM fixed-point iteration.
-/// All three reach the same fixpoint; they differ in how many M-steps it takes.
+/// The schemes iterate toward the same fixpoint but stop at different points
+/// short of it, so at a given `--convergence-thresh` their estimates differ
+/// slightly, and the accelerated ones need not take fewer M-steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum EmAccelArg {
-    /// plain fixed-point iteration (default; matches prior releases and salmon)
+    /// plain fixed-point iteration (default)
     None,
-    /// SQUAREM (SqS3) extrapolation
+    /// SQUAREM (SqS3) extrapolation. Convergence is checked over each
+    /// 3-M-step cycle, so it can take more M-steps than `none`, but it stops
+    /// closer to the fixpoint
     Squarem,
-    /// damped Anderson acceleration with restarts
+    /// damped Anderson acceleration with restarts. At the default
+    /// `--convergence-thresh` it can stop further from the fixpoint than `none`
     Daarem,
 }
 
@@ -102,8 +107,11 @@ pub struct QuantOpts {
     /// (with mass-preserving redistribution) in the final estimate
     #[arg(long, default_value_t = PRESENCE_THRESH, help_heading = "EM Algorithm")]
     pub presence_thresh: f64,
-    /// convergence acceleration scheme for the EM. `squarem`/`daarem` reach the
-    /// same fixpoint in fewer M-steps but are not byte-identical to `none`.
+    /// convergence acceleration scheme for the EM. `squarem` and `daarem` are not
+    /// byte-identical to `none`: each stops at a different point near the
+    /// fixpoint, and at the default `--convergence-thresh` they do not
+    /// necessarily take fewer M-steps. A tighter `--convergence-thresh` brings
+    /// the three closer together.
     #[arg(long, value_enum, default_value_t = EmAccelArg::None, help_heading = "EM Algorithm")]
     pub em_accel: EmAccelArg,
 

@@ -302,7 +302,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         if let (Some(flm), Some(flsd)) = (fld_mean, fld_sd) {
             warn!(
                 "provided fragment length distribution mean and sd ({flm}, {flsd}), but \
-                    the RAD file contains paired-end fragments, so these will be ignored \"
+                    the RAD file contains paired-end fragments, so these will be ignored \
                     and the fragment length distribution will be estimated."
             );
         }

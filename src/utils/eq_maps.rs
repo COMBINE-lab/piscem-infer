@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use rayon::slice::ParallelSliceMut;
 
 /// aliases for referring to the different basic types of eq class maps
 pub type BasicEqMap = EqMap<BasicEqLabel>;
@@ -34,7 +35,7 @@ pub enum EqMapType {
 /// below guarantee it by holding nothing but that key in a single `Vec<u32>`
 /// field with derived `Hash` / `Eq`.
 pub trait EqLabel:
-    TargetLabels + std::hash::Hash + PartialEq + Eq + Sync + std::borrow::Borrow<[u32]>
+    TargetLabels + std::hash::Hash + PartialEq + Eq + Send + Sync + std::borrow::Borrow<[u32]>
 {
     type LabelRefT<'a>: TargetLabelsRef;
     /// write the key of the label for these labels (and probabilities) into
@@ -382,7 +383,15 @@ pub struct PackedEqMap<EqLabelT> {
 }
 
 impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
-    /// Pack the equivalence classes of `eqm` into a flat CSR layout.
+    /// Pack the equivalence classes of `eqm` into a flat CSR layout; see
+    /// [`Self::from_eq_maps`].
+    #[allow(dead_code)]
+    pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
+        Self::from_eq_maps(std::slice::from_ref(eqm))
+    }
+
+    /// Pack the equivalence classes of all of `eqms` into a flat CSR layout,
+    /// as if they had been counted in a single map.
     ///
     /// The classes are emitted in lexicographic order of their (full) keys.
     /// The underlying `AHashMap` is iterated in an order that depends on its
@@ -391,20 +400,28 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
     /// and the per-class random draws of the bootstrap / Gibbs sampler —
     /// differ from run to run. Sorting makes the layout a pure function of
     /// the data.
-    pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
-        let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
-        let mut counts = Vec::<usize>::with_capacity(eqm.len());
-        let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
+    pub fn from_eq_maps(eqms: &[EqMap<EqLabelT>]) -> Self {
+        // there are at least as many classes as in the largest map
+        let min_classes = eqms.iter().map(|eqm| eqm.len()).max().unwrap_or(0);
+        let mut eq_labels = Vec::<u32>::with_capacity(min_classes * 5);
+        let mut counts = Vec::<usize>::with_capacity(min_classes);
+        let mut eq_label_starts = Vec::<u32>::with_capacity(min_classes + 1);
 
-        // The packed key drops orientation, so distinct entries of an
-        // orientation-aware map (same targets, different orientations) can map to
-        // the same packed key. Sort by key and coalesce such duplicates by summing
-        // their counts: this yields one class per packed label, and — because the
-        // `AHashMap` iteration order is randomized per process — it is what makes
-        // the packed class order (and hence the EM's summation order)
+        // The same class can have an entry in several of the maps (each
+        // parsing thread counts into its own), and the packed key drops
+        // orientation, so distinct entries of an orientation-aware map (same
+        // targets, different orientations) also map to the same packed key.
+        // Sort by key and coalesce such duplicates by summing their (integer)
+        // counts: this yields one class per packed label, and — because the
+        // `AHashMap` iteration order is randomized per process — it is what
+        // makes the packed class order (and hence the EM's summation order)
         // deterministic. A plain sort would leave tied keys in hash order.
-        let mut entries: Vec<(&[u32], usize)> = eqm.full_key_iter().map(|(k, c)| (k, *c)).collect();
-        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let num_entries = eqms.iter().map(|eqm| eqm.len()).sum();
+        let mut entries: Vec<(&[u32], usize)> = Vec::with_capacity(num_entries);
+        for eqm in eqms {
+            entries.extend(eqm.full_key_iter().map(|(k, c)| (k, *c)));
+        }
+        entries.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
 
         eq_label_starts.push(0);
         let mut i = 0;
@@ -425,7 +442,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
             eq_labels,
             eq_label_starts,
             counts,
-            contains_ori: eqm.contains_ori,
+            contains_ori: eqms.first().is_some_and(|eqm| eqm.contains_ori),
             phantom: std::marker::PhantomData,
         }
     }

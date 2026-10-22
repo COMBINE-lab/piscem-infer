@@ -27,7 +27,6 @@ salmon-infer = "2.7.0"
 ahash = "0.8.9"
 distrs = "0.2.1"
 anyhow = "1.0.80"
-bstr = "1.9.1"
 clap = { version = "4.5.1", features = [
   "derive",
   "wrap_help",
@@ -43,7 +42,6 @@ tracing-subscriber = { version = "0.3.18", default-features = true, features = [
 tabled = "0.20.0"
 rayon = "1.8.1"
 serde_json = "1.0.114"
-serde_derive = "1.0.197"
 serde = { version = "1.0.197", features = ["serde_derive", "derive"] }
 arrow2 = { version = "0.18.0", features = [
   "io_parquet",
@@ -51,8 +49,6 @@ arrow2 = { version = "0.18.0", features = [
   "io_parquet_zstd",
   "io_parquet_snappy",
 ] }
-scroll = "0.13.0"
-snap = "1.1.1"
 path-tools = "0.1.0"
 num-format = "0.4.4"
 clap-num = "1.2.0"

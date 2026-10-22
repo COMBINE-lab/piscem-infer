@@ -94,6 +94,9 @@ bootsrapping in parallel, we'll make use of multiple threads (``--num-threads 16
    $ for acc in ${accessions[@]}; do
       piscem-infer quant --num-bootstraps 16 --num-threads 16 -i mappings/${acc} -l IU -o quant/${acc}
 
+The ``-i`` flag takes the same *stem* that we passed to ``piscem map-bulk -o``; ``piscem-infer`` reads ``mappings/${acc}.rad``
+and ``mappings/${acc}.map_info.json`` (passing the path of the ``.rad`` file itself also works).
+
 Note that we pass to the ``-o`` flag a file *stem* prefixed with a path (in this case ``quant``). This is because ``piscem-infer``
 will produce several output files.  All of them will share the same *stem*.  If we pass a stem that is prefixed with some path 
 (e.g. a directory) then this directory will be created if it doesn't exist. We also let ``piscem-infer`` know the library type 

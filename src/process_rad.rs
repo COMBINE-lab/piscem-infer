@@ -28,6 +28,7 @@ use crate::utils::io;
 use crate::utils::map_record_types::{
     LibraryType, OrientationCounts, check_strand_warnings, detect_library_type,
 };
+use crate::utils::rad_input;
 use crate::{
     fld::FldPDF,
     prog_opts::{LibTypeArg, QuantOpts},
@@ -258,10 +259,9 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     }
 
     info!("path {:?}", input);
+    let (input_rad, input_map_info) = rad_input::input_paths(&input);
     let ref_sig_json;
     {
-        let mut input_map_info = input.clone();
-        input_map_info.set_extension("map_info.json");
         if !input_map_info.exists() {
             ref_sig_json = None;
             warn!(
@@ -285,9 +285,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         }
     }
 
-    let mut input_rad = input;
-    input_rad.set_extension("rad");
-    let i_file = File::open(&input_rad).context("could not open input rad file")?;
+    let i_file = File::open(&input_rad)
+        .with_context(|| format!("could not open input RAD file {}", input_rad.display()))?;
     let mut br = BufReader::new(i_file);
 
     let paired_end: bool;

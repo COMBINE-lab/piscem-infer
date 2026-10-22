@@ -680,6 +680,7 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     let mut label_ints = vec![];
     let mut dir_ints = vec![];
     let mut probs = vec![];
+    let mut key = vec![];
 
     let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(1));
     pb.set_style(
@@ -753,8 +754,8 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                 if eqmap.contains_ori {
                     label_ints.append(&mut dir_ints);
                 }
-                let eql = EqLabelT::new(&label_ints, Some(&probs));
-                eqmap.add(eql);
+                EqLabelT::write_key(&label_ints, Some(&probs), &mut key);
+                eqmap.add_key(&key);
             }
 
             if nm == 1 && !ft.is_orphan() {

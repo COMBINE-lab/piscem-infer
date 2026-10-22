@@ -26,9 +26,32 @@ pub enum EqMapType {
 /// Also, any type implementing this trait will have an associated `LabelRefT` type that will allow
 /// the creation of borrowed references that can enumerate labels and probabilities.
 /// These types must also be hashable and comparable to be used as keys in HashMaps.
-pub trait EqLabel: TargetLabels + std::hash::Hash + PartialEq + Eq + Sync {
+///
+/// A label is also `Borrow<[u32]>`, so an `EqMap` can be probed with the slice
+/// of `u32`s that forms the label (its "key", see [`EqLabel::write_key`])
+/// without building an owned label first. For that to be sound, the label's
+/// `Hash` and `Eq` must agree with those of its key slice; the label types
+/// below guarantee it by holding nothing but that key in a single `Vec<u32>`
+/// field with derived `Hash` / `Eq`.
+pub trait EqLabel:
+    TargetLabels + std::hash::Hash + PartialEq + Eq + Sync + std::borrow::Borrow<[u32]>
+{
     type LabelRefT<'a>: TargetLabelsRef;
-    fn new(labels: &[u32], probs: Option<&[f64]>) -> Self;
+    /// write the key of the label for these labels (and probabilities) into
+    /// `key`, replacing its contents
+    fn write_key(labels: &[u32], probs: Option<&[f64]>, key: &mut Vec<u32>);
+    /// create the label whose key is `key`
+    fn from_key(key: &[u32]) -> Self;
+    /// create the label for these labels (and probabilities)
+    #[allow(dead_code)]
+    fn new(labels: &[u32], probs: Option<&[f64]>) -> Self
+    where
+        Self: Sized,
+    {
+        let mut key = Vec::new();
+        Self::write_key(labels, probs, &mut key);
+        Self::from_key(&key)
+    }
     fn new_ref(labels: &[u32], has_ori: bool) -> Self::LabelRefT<'_>;
 }
 
@@ -53,9 +76,16 @@ pub struct BasicEqLabelRef<'a> {
     pub contains_ori: bool,
 }
 
+// must stay a single `Vec<u32>` field, see `Borrow<[u32]>` below
 #[derive(Hash, PartialEq, Eq)]
 pub struct BasicEqLabel {
     pub targets: Vec<u32>,
+}
+
+impl std::borrow::Borrow<[u32]> for BasicEqLabel {
+    fn borrow(&self) -> &[u32] {
+        &self.targets
+    }
 }
 
 impl EqLabel for BasicEqLabel {
@@ -72,9 +102,14 @@ impl EqLabel for BasicEqLabel {
 
     /// we ignore probabiltiies in the basic equivalence class, and just
     /// pass along the targets we are given as the labels
-    fn new(targets: &[u32], _probs: Option<&[f64]>) -> Self {
+    fn write_key(targets: &[u32], _probs: Option<&[f64]>, key: &mut Vec<u32>) {
+        key.clear();
+        key.extend_from_slice(targets);
+    }
+
+    fn from_key(key: &[u32]) -> Self {
         Self {
-            targets: targets.into(),
+            targets: key.into(),
         }
     }
 }
@@ -141,9 +176,16 @@ impl<'a> TargetLabelsRef for BasicEqLabelRef<'a> {
 
 // ===== Range factorized equivalence classes
 
+// must stay a single `Vec<u32>` field, see `Borrow<[u32]>` below
 #[derive(Hash, PartialEq, Eq)]
 pub struct RangeFactorizedEqLabel {
     pub targets_and_bins: Vec<u32>,
+}
+
+impl std::borrow::Borrow<[u32]> for RangeFactorizedEqLabel {
+    fn borrow(&self) -> &[u32] {
+        &self.targets_and_bins
+    }
 }
 
 impl EqLabel for RangeFactorizedEqLabel {
@@ -156,9 +198,9 @@ impl EqLabel for RangeFactorizedEqLabel {
         }
     }
 
-    /// create the range factorized equivalence class the labels and
-    /// the associated probabilities.
-    fn new(labels: &[u32], probs: Option<&[f64]>) -> Self {
+    /// create the key of the range factorized equivalence class from the
+    /// labels and the associated probabilities.
+    fn write_key(labels: &[u32], probs: Option<&[f64]>, key: &mut Vec<u32>) {
         // the probability vector must not be `None` when creating a
         // range-factorized equivalence class
         let probs = probs.expect("probs *must* be present for range factorized equivalence class");
@@ -179,9 +221,10 @@ impl EqLabel for RangeFactorizedEqLabel {
         //
         // where the `ori` components may be optional
         let (just_labels, oris) = labels.split_at(num_labels);
-        let mut targets_and_bins: Vec<u32> = just_labels.into();
+        key.clear();
+        key.extend_from_slice(just_labels);
         // map the probabilities to the appropriate bin IDs
-        targets_and_bins.extend(probs.iter().map(|&prob| {
+        key.extend(probs.iter().map(|&prob| {
             let p: f64 = prob / tot_prob;
             // Handle edge case where p = 1.0 (should go to last bin)
             if p >= 1.0 {
@@ -192,8 +235,13 @@ impl EqLabel for RangeFactorizedEqLabel {
             }
         }));
         // add back the encoding of the orientations if we have them
-        targets_and_bins.extend_from_slice(oris);
-        Self { targets_and_bins }
+        key.extend_from_slice(oris);
+    }
+
+    fn from_key(key: &[u32]) -> Self {
+        Self {
+            targets_and_bins: key.into(),
+        }
     }
 }
 
@@ -291,11 +339,24 @@ impl<EqLabelT: EqLabel> EqMap<EqLabelT> {
     /// add the equivalence class label to this `EQMap`'s
     /// count map with a count of 1 if it hasen't yet been seen,
     /// or increment the count if it already exists.
+    #[allow(dead_code)]
     pub fn add(&mut self, lab: EqLabelT) -> &'_ mut usize {
         self.count_map
             .entry(lab)
             .and_modify(|counter| *counter += 1)
             .or_insert(1)
+    }
+
+    /// like `add`, for the label whose key is `key` (see
+    /// [`EqLabel::write_key`]). The owned label is only created the first
+    /// time its class is seen, so counting a fragment of a known class
+    /// allocates nothing.
+    pub fn add_key(&mut self, key: &[u32]) {
+        if let Some(counter) = self.count_map.get_mut(key) {
+            *counter += 1;
+        } else {
+            self.count_map.insert(EqLabelT::from_key(key), 1);
+        }
     }
 }
 
@@ -563,3 +624,50 @@ impl<'a, EqLabelT: EqLabel> Iterator for EqEntryIter<'a, EqLabelT> {
 }
 
 impl<'a, EqLabelT: EqLabel> ExactSizeIterator for EqEntryIter<'a, EqLabelT> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EqMap::add_key` probes the map with a `&[u32]`; that only finds the
+    /// entry of an owned label if both hash (and compare) the same way.
+    fn check_key_lookup<EqLabelT: EqLabel>(labels: &[u32], probs: &[f64]) {
+        let mut key = vec![];
+        EqLabelT::write_key(labels, Some(probs), &mut key);
+        let lab = EqLabelT::new(labels, Some(probs));
+        assert!(lab == EqLabelT::from_key(&key));
+        assert_eq!(
+            <EqLabelT as std::borrow::Borrow<[u32]>>::borrow(&lab),
+            &key[..]
+        );
+
+        let mut eqm = EqMap::<EqLabelT>::new(OrientationProperty::OrientationAware);
+        let hasher = eqm.count_map.hasher();
+        assert_eq!(hasher.hash_one(&lab), hasher.hash_one(&key[..]));
+
+        // the owned and the borrowed path land on the same class
+        eqm.add(lab);
+        eqm.add_key(&key);
+        eqm.add_key(&key);
+        assert_eq!(eqm.len(), 1);
+        assert_eq!(eqm.count_map.get(&key[..]), Some(&3));
+
+        // and a different class gets its own entry
+        let mut other = vec![];
+        EqLabelT::write_key(&labels[1..], Some(&probs[1..]), &mut other);
+        eqm.add_key(&other);
+        assert_eq!(eqm.len(), 2);
+        assert_eq!(eqm.count_map.get(&other[..]), Some(&1));
+    }
+
+    #[test]
+    fn basic_label_key_lookup_matches_owned_label() {
+        check_key_lookup::<BasicEqLabel>(&[3, 7, 11], &[0.5, 0.25, 0.25]);
+    }
+
+    #[test]
+    fn range_factorized_label_key_lookup_matches_owned_label() {
+        let _ = NUM_BINS.set(4.0);
+        check_key_lookup::<RangeFactorizedEqLabel>(&[3, 7, 11], &[0.5, 0.25, 0.25]);
+    }
+}

@@ -2,6 +2,7 @@
 name = "piscem-infer"
 version = "0.7.0"
 edition = "2024"
+rust-version = "1.91"
 readme = "README.md"
 license-file = "LICENSE"
 keywords = ["science", "RNA-seq", "quantification", "RAD-file"]

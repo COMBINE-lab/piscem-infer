@@ -17,6 +17,10 @@ fn greater_than_0(s: &str) -> std::result::Result<u32, String> {
     number_range(s, 1, u32::MAX)
 }
 
+fn usize_greater_than_0(s: &str) -> std::result::Result<usize, String> {
+    number_range(s, 1, usize::MAX)
+}
+
 #[derive(Debug, Clone)]
 pub enum LibTypeArg {
     Explicit(LibraryType),
@@ -105,7 +109,13 @@ pub struct QuantOpts {
     #[arg(long, default_value_t = 64_u32, value_parser=greater_than_0, help_heading = "Advanced")]
     pub factorized_eqc_bins: u32,
     /// number of threads to use (used during the EM and for bootstrapping)
-    #[arg(long, default_value_t = 16, help_heading = "Advanced")]
+    #[arg(
+        short = 't',
+        long,
+        default_value_t = 16,
+        value_parser = usize_greater_than_0,
+        help_heading = "Advanced"
+    )]
     pub num_threads: usize,
     /// number of mapped reads to sample for automatic library type detection
     /// (only used when --lib-type is set to 'auto')
@@ -127,8 +137,49 @@ pub enum Commands {
 pub struct Cli {
     /// be quiet while processing and only report errors or
     /// critical log messages
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub quiet: bool,
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::{CommandFactory, Parser};
+
+    const QUANT_ARGS: [&str; 8] = ["piscem-infer", "quant", "-i", "in", "-l", "IU", "-o", "out"];
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(QUANT_ARGS.iter().chain(extra))
+    }
+
+    fn num_threads(cli: &Cli) -> usize {
+        match &cli.command {
+            Commands::Quant(qo) => qo.num_threads,
+        }
+    }
+
+    #[test]
+    fn cli_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn quiet_is_accepted_before_or_after_the_subcommand() {
+        assert!(parse(&["-q"]).unwrap().quiet);
+        assert!(parse(&["--quiet"]).unwrap().quiet);
+        let before = Cli::try_parse_from(["piscem-infer", "-q"].iter().chain(&QUANT_ARGS[1..]));
+        assert!(before.unwrap().quiet);
+        assert!(!parse(&[]).unwrap().quiet);
+    }
+
+    #[test]
+    fn num_threads_has_short_flag_and_must_be_positive() {
+        assert_eq!(num_threads(&parse(&[]).unwrap()), 16);
+        assert_eq!(num_threads(&parse(&["-t", "4"]).unwrap()), 4);
+        assert_eq!(num_threads(&parse(&["--num-threads", "1"]).unwrap()), 1);
+        assert!(parse(&["--num-threads", "0"]).is_err());
+        assert!(parse(&["-t", "0"]).is_err());
+    }
 }

@@ -108,9 +108,12 @@ pub fn build_packed_eq_classes<EqLabelT: EqLabel>(
     keep_weights: bool,
 ) -> PackedEqClasses {
     let num_classes = eq_map.len();
-    // `eq_labels` may also carry probability-bin ids (range factorized), so it
-    // is an upper bound on the number of incidences.
-    let cap = eq_map.eq_labels.len();
+    // `eq_labels` may also carry probability-bin ids (range factorized), so
+    // count the incidences (class, target) to size the arrays exactly.
+    let cap: usize = eq_map
+        .iter_labels()
+        .map(|label| label.target_labels().len())
+        .sum();
     let mut labels = Vec::<u32>::with_capacity(cap);
     let mut combined = Vec::<f64>::with_capacity(cap);
     let mut weights = Vec::<f64>::with_capacity(if keep_weights { cap } else { 0 });
@@ -273,6 +276,33 @@ mod tests {
         assert!((p.combined[0] - 0.875 / 10.0).abs() < 1e-12);
         assert!((p.combined[1] - 0.375 / 20.0).abs() < 1e-12);
         assert_eq!(p.counts, vec![1]);
+    }
+
+    /// Entries that differ only in orientation coalesce into one packed class,
+    /// and the (`usize`) offsets delimit the full range-factorized keys.
+    #[test]
+    fn packed_range_factorized_coalesces_orientations() {
+        let _ = crate::utils::eq_maps::NUM_BINS.set(4.0);
+        let mut eqm = EqMap::<RangeFactorizedEqLabel>::new(OrientationProperty::OrientationAware);
+        eqm.add(RangeFactorizedEqLabel::new(
+            &[0, 1, 1, 1],
+            Some(&[0.75, 0.25]),
+        ));
+        eqm.add(RangeFactorizedEqLabel::new(
+            &[0, 1, 2, 2],
+            Some(&[0.75, 0.25]),
+        ));
+        eqm.add(RangeFactorizedEqLabel::new(&[2, 1], Some(&[1.0])));
+        let packed_map = PackedEqMap::from_eq_map(&eqm);
+        // keys (targets, then bin ids): [0, 1, 3, 1] and [2, 3]
+        assert_eq!(packed_map.eq_label_starts, vec![0, 4, 6]);
+        assert_eq!(packed_map.counts, vec![2, 1]);
+        let p = build_packed_eq_classes(&packed_map, &[10.0, 20.0, 30.0], true);
+        assert_eq!(p.labels, vec![0, 1, 2]);
+        assert_eq!(p.starts, vec![0, 2, 3]);
+        assert_eq!(p.counts, vec![2, 1]);
+        assert_eq!(p.weights.len(), 3);
+        assert_eq!(p.combined.len(), 3);
     }
 
     #[test]

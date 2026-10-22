@@ -491,6 +491,11 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     // build the flat CSR equivalence classes consumed by salmon-infer; the raw
     // conditional weights are only needed by the Gibbs sampler.
     let packed = build_packed_eq_classes(&packed_eq_map, &eff_lengths, num_gibbs_samples > 0);
+    // only the two summary values logged below are needed from the packed map
+    // from here on; free it before the EM and the inferential replicates.
+    let num_eq_classes = packed_eq_map.len();
+    let total_weight: usize = packed_eq_map.total_weight();
+    drop(packed_eq_map);
     let em_opts = em_options(
         max_iter,
         convergence_thresh,
@@ -519,9 +524,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     );
     info!(
         "number of equivalence classes = {}",
-        packed_eq_map.len().to_formatted_string(&Locale::en)
+        num_eq_classes.to_formatted_string(&Locale::en)
     );
-    let total_weight: usize = packed_eq_map.total_weight();
     info!(
         "total equivalence map weight = {}",
         total_weight.to_formatted_string(&Locale::en)

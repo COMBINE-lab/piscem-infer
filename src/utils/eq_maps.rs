@@ -306,8 +306,10 @@ pub struct PackedEqMap<EqLabelT> {
     /// begins and ends.  The label for equivalence class i begins
     /// at offset eq_label_starts[i], and it ends at
     /// eq_label_starts[i+1].  The length of this vector is 1 greater
-    /// than the number of equivalence classes.
-    pub eq_label_starts: Vec<u32>,
+    /// than the number of equivalence classes. These are `usize` (not
+    /// `u32`): on large inputs the packed labels (targets plus probability
+    /// bins, for range-factorized classes) can exceed `u32::MAX` entries.
+    pub eq_label_starts: Vec<usize>,
     /// the vector of counts for each equivalence class
     pub counts: Vec<usize>,
     /// whether or not the underlying equivalence map was built
@@ -333,7 +335,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
     pub fn from_eq_map(eqm: &EqMap<EqLabelT>) -> Self {
         let mut eq_labels = Vec::<u32>::with_capacity(eqm.len() * 5);
         let mut counts = Vec::<usize>::with_capacity(eqm.len());
-        let mut eq_label_starts = Vec::<u32>::with_capacity(eqm.count_map.len() + 1);
+        let mut eq_label_starts = Vec::<usize>::with_capacity(eqm.count_map.len() + 1);
 
         // The packed key drops orientation, so distinct entries of an
         // orientation-aware map (same targets, different orientations) can map to
@@ -355,7 +357,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
                 j += 1;
             }
             eq_labels.extend_from_slice(eq_lab);
-            eq_label_starts.push(eq_labels.len() as u32);
+            eq_label_starts.push(eq_labels.len());
             counts.push(count);
             i = j;
         }
@@ -370,8 +372,8 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
     }
 
     pub fn refs_for_eqc(&self, idx: usize) -> <EqLabelT as EqLabel>::LabelRefT<'_> {
-        let s: usize = self.eq_label_starts[idx] as usize;
-        let e: usize = self.eq_label_starts[idx + 1] as usize;
+        let s: usize = self.eq_label_starts[idx];
+        let e: usize = self.eq_label_starts[idx + 1];
         // if we encode orientation, then it's the first half of the
         // label, otherwise it's the whole label.
         let l = e - s;
@@ -411,7 +413,7 @@ impl<EqLabelT: EqLabel> PackedEqMap<EqLabelT> {
 /// An iterator over the labels of the
 /// `PackedEqMap`.
 pub struct PackedEqLabelIter<'a, EqLabelT> {
-    counter: u32,
+    counter: usize,
     underlying_packed_map: &'a PackedEqMap<EqLabelT>,
 }
 
@@ -420,7 +422,7 @@ impl<'a, EqLabelT: EqLabel> Iterator for PackedEqLabelIter<'a, EqLabelT> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let c = self.counter as usize;
+        let c = self.counter;
         if c < self.underlying_packed_map.len() {
             self.counter += 1;
             Some(self.underlying_packed_map.refs_for_eqc(c))
@@ -430,7 +432,7 @@ impl<'a, EqLabelT: EqLabel> Iterator for PackedEqLabelIter<'a, EqLabelT> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.underlying_packed_map.len() - self.counter as usize;
+        let rem = self.underlying_packed_map.len() - self.counter;
         (rem, Some(rem))
     }
 }

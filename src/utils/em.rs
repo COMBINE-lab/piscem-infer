@@ -402,12 +402,16 @@ mod reproducibility {
         (p, eff_lens)
     }
 
-    fn run_in_pool(threads: usize, p: &PackedEqClasses, opts: &EmOptions) -> Vec<f64> {
+    fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap()
-            .install(|| run_em(p, opts).alphas)
+            .install(f)
+    }
+
+    fn run_in_pool(threads: usize, p: &PackedEqClasses, opts: &EmOptions) -> Vec<f64> {
+        in_pool(threads, || run_em(p, opts).alphas)
     }
 
     /// The headline property of the port: the point estimate is bit-identical
@@ -442,10 +446,8 @@ mod reproducibility {
         }
     }
 
-    /// Pins the property piscem-infer relies on for `--seed`: the same packed
-    /// classes and seed give bit-identical bootstrap replicates.
-    #[test]
-    fn bootstrap_is_reproducible_for_fixed_seed() {
+    /// A small ambiguous problem for the inferential-replicate tests.
+    fn replicate_problem(keep_weights: bool) -> (PackedEqClasses, Vec<f64>) {
         let mut eqm = EqMap::<BasicEqLabel>::new(OrientationProperty::OrientationAware);
         for i in 0..2000u32 {
             let a = i % 37;
@@ -458,15 +460,53 @@ mod reproducibility {
         }
         let packed_map = PackedEqMap::from_eq_map(&eqm);
         let eff_lens: Vec<f64> = (0..81).map(|i| 100.0 + i as f64).collect();
-        let p = build_packed_eq_classes(&packed_map, &eff_lens, false);
+        let p = build_packed_eq_classes(&packed_map, &eff_lens, keep_weights);
+        (p, eff_lens)
+    }
+
+    /// Pins the property piscem-infer relies on for `--seed`: the same packed
+    /// classes and seed give bit-identical bootstrap replicates whatever the
+    /// thread count, and a different seed gives different replicates.
+    #[test]
+    fn bootstrap_is_reproducible_for_fixed_seed() {
+        let (p, eff_lens) = replicate_problem(false);
         let opts = em_options(1500, 1e-3, 1e-8, 1e-8, EmAccel::None);
-        let a = salmon_infer::bootstrap(&p, &opts, salmon_infer::EffLens::new(&eff_lens), 8, 42);
-        let b = salmon_infer::bootstrap(&p, &opts, salmon_infer::EffLens::new(&eff_lens), 8, 42);
-        assert_eq!(
-            a, b,
-            "bootstrap replicates differ between two identical calls"
-        );
-        let c = salmon_infer::bootstrap(&p, &opts, salmon_infer::EffLens::new(&eff_lens), 8, 42);
-        assert_eq!(a, c);
+        let run = |threads: usize, seed: u64| {
+            in_pool(threads, || {
+                salmon_infer::bootstrap(&p, &opts, salmon_infer::EffLens::new(&eff_lens), 8, seed)
+            })
+        };
+        let a = run(1, 42);
+        assert_eq!(a.len(), 8);
+        let b = run(8, 42);
+        assert_eq!(a, b, "bootstrap replicates differ between 1 and 8 threads");
+        let c = run(8, 43);
+        assert_ne!(a, c, "bootstrap replicates do not depend on the seed");
+    }
+
+    /// The same for Gibbs sampling: the chain layout follows the sample count
+    /// (not the thread count) and each chain is seeded from (seed, chain).
+    #[test]
+    fn gibbs_is_reproducible_for_fixed_seed() {
+        let (p, eff_lens) = replicate_problem(true);
+        let opts = em_options(1500, 1e-3, 1e-8, 1e-8, EmAccel::None);
+        let alphas = run_em(&p, &opts).alphas;
+        // 100 samples run as 4 chains, so 8 threads do run them concurrently
+        let gibbs_opts = salmon_infer::GibbsOptions {
+            num_samples: 100,
+            thinning: 2,
+            ..salmon_infer::GibbsOptions::default()
+        };
+        let run = |threads: usize, seed: u64| {
+            in_pool(threads, || {
+                salmon_infer::gibbs_sample(&p, &eff_lens, &alphas, &gibbs_opts, seed)
+            })
+        };
+        let a = run(1, 42);
+        assert_eq!(a.len(), 100);
+        let b = run(8, 42);
+        assert_eq!(a, b, "Gibbs samples differ between 1 and 8 threads");
+        let c = run(8, 43);
+        assert_ne!(a, c, "Gibbs samples do not depend on the seed");
     }
 }

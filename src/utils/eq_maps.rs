@@ -10,8 +10,8 @@ pub static NUM_BINS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 /// whether or not the equivalence classes differentiate between fragments
 /// mapping in different orientations
 pub enum OrientationProperty {
-    OrientationAware,
     #[allow(dead_code)]
+    OrientationAware,
     OrientationAgnostic,
 }
 

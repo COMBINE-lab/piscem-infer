@@ -221,7 +221,11 @@ fn detect_lib_type_from_sample<T: Read>(
 }
 
 pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Result<()> {
-    let eqmap_orientation_status = OrientationProperty::OrientationAware;
+    // The packed classes the EM consumes drop orientation (see
+    // `extract_key_for_packed_map`), so keying the eq map by orientation as
+    // well only splits each class into per-orientation entries that are
+    // summed back together when the map is packed.
+    let eqmap_orientation_status = OrientationProperty::OrientationAgnostic;
     match eq_map_t {
         EqMapType::BasicEqMap => {
             process_bulk_dispatch(quant_opts, BasicEqMap::new(eqmap_orientation_status))
@@ -715,7 +719,9 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
                 if lib_type.is_compatible_with(*o) {
                     mapped_ori_count[y as usize] += 1;
                     label_ints.push(*r);
-                    dir_ints.push(y);
+                    if eqmap.contains_ori {
+                        dir_ints.push(y);
+                    }
                     let frag_len_prob = match o {
                         MappedFragmentOrientation::Forward => {
                             let max_frag_len = (ref_lengths[*r as usize] - *pos) as usize;
@@ -744,7 +750,9 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
             // A stranded library can filter out every mapping of a fragment;
             // an empty label would be a class with no targets to assign to.
             if !label_ints.is_empty() {
-                label_ints.append(&mut dir_ints);
+                if eqmap.contains_ori {
+                    label_ints.append(&mut dir_ints);
+                }
                 let eql = EqLabelT::new(&label_ints, Some(&probs));
                 eqmap.add(eql);
             }

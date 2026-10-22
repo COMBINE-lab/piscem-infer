@@ -8,7 +8,7 @@ use arrow2::{
 use libradicl::header;
 use path_tools::WithAdditionalExtension;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use tracing::warn;
@@ -20,13 +20,9 @@ pub(crate) fn write_results(
     lengths: &[u32],
     eff_lengths: &[f64],
 ) -> anyhow::Result<()> {
-    let mut ofile = File::create(output)?;
+    let mut ofile = BufWriter::new(File::create(output)?);
 
-    ofile.write_all(
-        "target_name\tlen\teelen\ttpm\tecount\n"
-            .to_string()
-            .as_bytes(),
-    )?;
+    ofile.write_all(b"target_name\tlen\teelen\ttpm\tecount\n")?;
 
     const ONE_MILLION: f64 = 1_000_000.0;
     let denom: f64 = e_counts
@@ -55,12 +51,14 @@ pub(crate) fn write_results(
         .collect();
 
     for (i, name) in hdr.ref_names.iter().enumerate() {
-        let l = format!(
-            "{}\t{}\t{:.3}\t{:.3}\t{:.3}\n",
+        writeln!(
+            ofile,
+            "{}\t{}\t{:.3}\t{:.3}\t{:.3}",
             name, lengths[i], eff_lengths[i], tpms[i], e_counts[i]
-        );
-        ofile.write_all(l.as_bytes())?;
+        )?;
     }
+    // flush explicitly, since dropping a BufWriter silently discards write errors
+    ofile.flush()?;
 
     Ok(())
 }

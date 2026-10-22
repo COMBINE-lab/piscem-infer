@@ -9,7 +9,7 @@
 //! consumes and maps piscem-infer's options onto its [`EmOptions`].
 
 use salmon_infer::{EmAccel, EmOptions, EmResult, PackedEqClasses};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::utils::eq_maps::{EqLabel, PackedEqMap, TargetLabelsRef};
 
@@ -183,7 +183,8 @@ pub fn em_options(
 }
 
 /// Run the EM to convergence over `packed`, returning the per-target
-/// fractional counts.
+/// fractional counts (`alphas`) along with the number of M-steps run and
+/// whether the convergence criterion was met before `--max-iter`.
 ///
 /// The sharded M-step is always used (over the current rayon pool). Its work
 /// partition and summation order are derived from the data alone, so the
@@ -191,24 +192,27 @@ pub fn em_options(
 /// thread, where the shards simply run one after another. salmon-infer's
 /// purely sequential M-step accumulates in a different order and is
 /// therefore *not* used even when only one thread is available.
-pub fn run_em(packed: &PackedEqClasses, opts: &EmOptions) -> Vec<f64> {
-    let EmResult {
-        alphas,
-        iters,
-        converged,
-        dropped_mass,
-    } = salmon_infer::optimize_packed(packed, opts, true);
+pub fn run_em(packed: &PackedEqClasses, opts: &EmOptions) -> EmResult {
+    let res = salmon_infer::optimize_packed(packed, opts, true);
     info!(
         "EM finished after {} M-steps (converged = {}, accel = {:?})",
-        iters, converged, opts.accel
+        res.iters, res.converged, opts.accel
     );
-    if dropped_mass > 0.0 {
-        info!(
-            "{:.3} fragments belonged to equivalence classes whose every target was truncated below the presence threshold",
-            dropped_mass
+    if !res.converged {
+        warn!(
+            "EM stopped at --max-iter ({}) without converging: some abundances were still \
+            changing by more than --convergence-thresh ({}) between M-steps. The estimates \
+            are reported as they stand; consider raising --max-iter.",
+            opts.max_iter, opts.rel_diff_tol
         );
     }
-    alphas
+    if res.dropped_mass > 0.0 {
+        info!(
+            "{:.3} fragments belonged to equivalence classes whose every target was truncated below the presence threshold",
+            res.dropped_mass
+        );
+    }
+    res
 }
 
 #[cfg(test)]
@@ -229,7 +233,7 @@ mod tests {
         assert_eq!(p.starts, vec![0, 2]);
         assert_eq!(p.total_count, 1);
         let opts = em_options(100, 1e-2, 1e-2, 1e-8, EmAccel::None);
-        let alphas = run_em(&p, &opts);
+        let alphas = run_em(&p, &opts).alphas;
         assert!((alphas.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     }
 
@@ -321,10 +325,34 @@ mod tests {
         let eff_lens = [1.0, 1.0];
         let p = build_packed_eq_classes(&packed_map, &eff_lens, false);
         let opts = em_options(1500, 1e-3, 1e-8, 1e-8, EmAccel::Daarem);
-        let alphas = run_em(&p, &opts);
-        let total: f64 = alphas.iter().sum();
+        let res = run_em(&p, &opts);
+        assert!(res.converged);
+        let total: f64 = res.alphas.iter().sum();
         assert!((total - 200.0).abs() < 1e-6, "total = {total}");
-        assert!(alphas[1] > alphas[0]);
+        assert!(res.alphas[1] > res.alphas[0]);
+    }
+
+    /// Hitting `--max-iter` is reported, not hidden: `converged` is false and
+    /// `iters` is the cap (recorded in meta_info.json as em_converged /
+    /// em_iters).
+    #[test]
+    fn em_reports_non_convergence() {
+        let mut eqm = EqMap::<BasicEqLabel>::new(OrientationProperty::OrientationAware);
+        for _ in 0..30 {
+            eqm.add(BasicEqLabel::new(&[0, 1], Some(&[1.0])));
+        }
+        for _ in 0..100 {
+            eqm.add(BasicEqLabel::new(&[0, 1, 1, 1], Some(&[1.0, 1.0])));
+        }
+        let packed_map = PackedEqMap::from_eq_map(&eqm);
+        let p = build_packed_eq_classes(&packed_map, &[1.0, 1.0], false);
+        // fewer M-steps than salmon-infer's `min_iter`, so the convergence
+        // check never runs
+        let opts = em_options(5, 1e-2, 1e-2, 1e-8, EmAccel::None);
+        let res = run_em(&p, &opts);
+        assert!(!res.converged);
+        assert_eq!(res.iters, 5);
+        assert!((res.alphas.iter().sum::<f64>() - 130.0).abs() < 1e-6);
     }
 }
 
@@ -379,7 +407,7 @@ mod reproducibility {
             .num_threads(threads)
             .build()
             .unwrap()
-            .install(|| run_em(p, opts))
+            .install(|| run_em(p, opts).alphas)
     }
 
     /// The headline property of the port: the point estimate is bit-identical

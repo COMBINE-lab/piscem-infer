@@ -38,7 +38,7 @@ use crate::{
         conditional_means_from_params, em_options, run_em,
     },
 };
-use salmon_infer::{EffLens, GibbsOptions, bootstrap, gibbs_sample};
+use salmon_infer::{EffLens, EmResult, GibbsOptions, bootstrap, gibbs_sample};
 
 use libradicl::rad_types::{self, MappedFragmentOrientation};
 use libradicl::{
@@ -503,7 +503,12 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         presence_thresh,
         qo.em_accel.into(),
     );
-    let em_res = run_em(&packed, &em_opts);
+    let EmResult {
+        alphas: em_res,
+        iters: em_iters,
+        converged: em_converged,
+        ..
+    } = run_em(&packed, &em_opts);
 
     let quant_output = output.with_additional_extension(".quant");
     io::write_results(
@@ -608,6 +613,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         "num_bootstraps": num_bootstraps,
         "num_gibbs_samples": num_gibbs_samples,
         "infrep_method": infrep_method,
+        "em_iters": em_iters,
+        "em_converged": em_converged,
         "num_targets": eff_lengths.len(),
         "signatures": ref_sig_json
     });

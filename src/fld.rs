@@ -97,3 +97,28 @@ impl FldPDF for EmpiricalFLD {
         self.cum_probs.get(i).unwrap_or(&1.0) + self.epsilon
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::utils::em::{adjust_ref_lengths, conditional_means, conditional_means_from_params};
+
+    // the upper bound used for the FLD and conditional means in `process_rad`
+    const UPPER: usize = 65_536;
+
+    #[test]
+    fn adjust_ref_lengths_at_fld_upper_bound() {
+        // with a flat FLD over 0..UPPER, cond_means[i] = i / 2
+        let cond_means = conditional_means(&vec![1u32; UPPER]);
+        assert_eq!(cond_means.len(), UPPER);
+        let eff_lens = adjust_ref_lengths(&[65_535, 65_536, 65_537], &cond_means);
+        assert_eq!(eff_lens, vec![32_767.5, 32_768.5, 32_769.5]);
+
+        let cond_means = conditional_means_from_params(200.0, 80.0, UPPER);
+        let tmean = *cond_means.last().unwrap();
+        let eff_lens = adjust_ref_lengths(&[65_535, 65_536, 65_537], &cond_means);
+        assert_eq!(
+            eff_lens,
+            vec![65_535.0 - tmean, 65_536.0 - tmean, 65_537.0 - tmean]
+        );
+    }
+}

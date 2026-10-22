@@ -71,7 +71,7 @@ pub fn adjust_ref_lengths(ref_lens: &[u32], cond_means: &[f64]) -> Vec<f64> {
         .iter()
         .map(|rli| {
             let rl = *rli as usize;
-            let adj_len = if rl > cond_means.len() {
+            let adj_len = if rl >= cond_means.len() {
                 (rl as f64) - tmean
             } else {
                 (rl as f64) - cond_means[rl]

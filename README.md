@@ -15,6 +15,11 @@ guarantees of `rust`, making the code easier to develop and maintain with confid
 While `piscem-infer` is in *active development*, it is already very usable! We encourage folks who are curious to try it out, to open GitHub issues for any questions or feature
 requests, and to provide feedback on how you'd like to see this next "evolution" of (bulk sequencing) abundance estimation tools evolve!
 
+### Compatibility with `piscem` versions
+
+Starting with version 0.24, `piscem` writes RAD version 2 files. `piscem-infer` releases after 0.7.0 read both RAD v1 and RAD v2 files,
+while releases up to and including 0.7.0 read only RAD v1 (as written by `piscem` < 0.24 and `piscem-cpp`). To quantify the output of
+`piscem` >= 0.24, use a `piscem-infer` release newer than 0.7.0.
 
 ### Check out the documentation
 

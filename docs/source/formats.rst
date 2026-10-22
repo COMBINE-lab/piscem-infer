@@ -9,14 +9,14 @@ be named based on whatever output stem is provided to the ``piscem-infer`` comma
 Specifically, with and output name of ``res``, the quantification results will be written to a file named 
 ``res.quant``.
 
-The file contains a single header row, and consists of 4 columns with the column names and descriptions as 
+The file contains a single header row, and consists of 5 columns with the column names and descriptions as
 specified below:
 
-+----------------------------------------+------------------------------------------+----------------------------------------------+--------------------------------------------------------------+---------------------------------------------------------+
-| target_name                            | len                                      |eeln                                          |  tpm                                                         | ecount                                                  | 
-+========================================+==========================================+==============================================+==============================================================+=========================================================+
-| The identifer of the quantified target | The lenth (in nucleotides) of the target |The expected *effective length* of the target | The abundance of the target in transcripts per million (TPM) | The expected number of fragments assigned to the target |
-+----------------------------------------+------------------------------------------+--------------------------------------------------------------+----------------------------------------------+---------------------------------------------------------+
++-----------------------------------------+-------------------------------------------+-----------------------------------------------+--------------------------------------------------------------+---------------------------------------------------------+
+| target_name                             | len                                       | eelen                                         | tpm                                                          | ecount                                                  |
++=========================================+===========================================+===============================================+==============================================================+=========================================================+
+| The identifier of the quantified target | The length (in nucleotides) of the target | The expected *effective length* of the target | The abundance of the target in transcripts per million (TPM) | The expected number of fragments assigned to the target |
++-----------------------------------------+-------------------------------------------+-----------------------------------------------+--------------------------------------------------------------+---------------------------------------------------------+
 
 
 Fragment length distribution
@@ -34,11 +34,13 @@ languages like Python and R.
 Inferential replicates
 ----------------------
 
-If ``piscem-infer`` was run with a ``--num-bootstraps`` value greater than 0, then a file called ``res.infreps.pq``
-will be written (again, where ``res`` is the output stem provided to the ``-o`` option of ``piscem-infer``). The 
-``infreps`` file is also a Parquet format file, and it stores in each *column* the value of a single inferential 
-replicate (i.e. an abundance for each target).  The number of columns is equal to the number of requested bootstraps,
-and the number of rows is equal to the number of targets represented in the header of the ``RAD`` file.  These 
+If ``piscem-infer`` was run with a ``--num-bootstraps`` or ``--num-gibbs-samples`` value greater than 0, then a file
+called ``res.infreps.pq`` will be written (again, where ``res`` is the output stem provided to the ``-o`` option of
+``piscem-infer``). The ``infreps`` file is also a Parquet format file, and it stores in each *column* the value of a
+single inferential replicate (i.e. an abundance for each target).  The number of columns is equal to the number of
+requested bootstraps (or Gibbs samples), and the number of rows is equal to the number of targets represented in the
+header of the ``RAD`` file.  The columns are named ``bootstrap.0``, ``bootstrap.1``, ... for both methods; the
+``infrep_method`` field of ``res.meta_info.json`` records which one (``"bootstrap"`` or ``"gibbs"``) produced them.  These
 inferential replicates can be used to assess the inferential uncertainty in the provided quantification estimates.
 In other words, variance across a row represents uncertainty in the estimated abundance of the corresponding target.
 While the ability to load up this data frame easily in Python or R makes this information readily available to 

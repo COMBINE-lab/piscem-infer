@@ -23,7 +23,7 @@ include = [
 
 [dependencies]
 libradicl = { version = "0.21.2" }
-salmon-infer = "2.9.0"
+salmon-infer = "2.9.1"
 ahash = "0.8.9"
 distrs = "0.2.1"
 anyhow = "1.0.80"

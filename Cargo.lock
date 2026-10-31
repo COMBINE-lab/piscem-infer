@@ -1379,9 +1379,9 @@ dependencies = [
 
 [[package]]
 name = "salmon-core"
-version = "2.9.0"
+version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1535570601d7709978a2e2cf12c5a8ddc7c46b918664b66f4bba98edb378d3de"
+checksum = "1bce7e1bd59c0bbea458755616d73ae5c9d7f5fbc914984aeb7aeeb2d8852adb"
 dependencies = [
  "libc",
  "niffler",
@@ -1393,9 +1393,9 @@ dependencies = [
 
 [[package]]
 name = "salmon-eqclass"
-version = "2.9.0"
+version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5120260d525c1fc207704153d8af7a26485bc8ccb65e259b7516d002b4f340a"
+checksum = "24f81caf5272602492f18cd6d9f1a2067d6f74c7a434d10ebab850ac3c7e9d24"
 dependencies = [
  "dashmap",
  "flate2",
@@ -1406,9 +1406,9 @@ dependencies = [
 
 [[package]]
 name = "salmon-infer"
-version = "2.9.0"
+version = "2.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43a07821a2bb27cb8c634fe33256bbc361035db19dd009ca2b951a1617d07b1a"
+checksum = "14c1feac4e8327705768b9f48c5bb2ce948e519dd02975d436ae83f230cd652e"
 dependencies = [
  "rand",
  "rand_distr",

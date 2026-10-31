@@ -95,6 +95,11 @@ install-updater = true
 [workspace.metadata.dist.github-custom-runners.aarch64-apple-darwin]
 runner = "macos-15"
 
+# dist 0.28.6 defaults x86_64-apple-darwin to macos-13, which GitHub has
+# retired (jobs queue forever); build the Intel binary on macos-15-intel.
+[workspace.metadata.dist.github-custom-runners.x86_64-apple-darwin]
+runner = "macos-15-intel"
+
 # Build the Linux binaries inside manylinux_2_28 containers (glibc 2.28), so
 # they run on RHEL/Rocky 8, Debian 10, Ubuntu 18.10 and newer; built on the
 # runners themselves they would need the runner's glibc (2.35+).

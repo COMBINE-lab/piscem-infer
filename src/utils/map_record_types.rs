@@ -204,9 +204,10 @@ mod tests {
         ];
 
         for (ls, lt) in lss.iter().zip(lts.iter()) {
-            if let Ok(pt) = ls.parse::<LibraryType>() {
-                assert_eq!(*lt, pt);
-            }
+            let pt = ls
+                .parse::<LibraryType>()
+                .unwrap_or_else(|e| panic!("{ls} should parse: {e}"));
+            assert_eq!(*lt, pt);
         }
     }
 

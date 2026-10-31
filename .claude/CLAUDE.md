@@ -47,13 +47,13 @@ Both output to `.infreps.pq` with `bootstrap.N` columns; `meta_info.json` record
 - `OnceLock<f64>` for lazy initialization of `NUM_BINS`
 - `anyhow::Result` throughout for error propagation
 
-**Core dependency:** `libradicl` (0.10.0) handles RAD file reading/parsing.
+**Core dependency:** `libradicl` (0.21) handles RAD file reading/parsing; the EM, bootstrap and Gibbs sampler come from `salmon-infer`.
   - **NOTE**: This `libradicl` dependency is another tool written by us, expect the version to update frequently and reflect that here when it does.
 
 ## CI/CD
 
-- **release.yml** — cargo-dist cross-platform binary builds on version tags
-- **release-please.yml** — Automated versioning and crates.io publishing
+- **release.yml** — cargo-dist cross-platform binary builds on version tags (Linux in manylinux_2_28 containers)
+- **Releases** — `./bump_and_publish.sh <version> --publish` on `main`: bumps, prepends a git-cliff CHANGELOG section, publishes to crates.io, tags and pushes (the tag starts release.yml)
 - **sanitize-cargo.yml** — Runs cargo-sanitize when commit contains `[do_tag]`
 - Targets: macOS (x86_64, aarch64), Linux (x86_64, aarch64)
 

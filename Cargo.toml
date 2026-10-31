@@ -2,6 +2,7 @@
 name = "piscem-infer"
 version = "0.7.0"
 edition = "2024"
+rust-version = "1.91"
 readme = "README.md"
 license-file = "LICENSE"
 keywords = ["science", "RNA-seq", "quantification", "RAD-file"]
@@ -21,11 +22,11 @@ include = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libradicl = { version = "0.21" }
+libradicl = { version = "0.21.2" }
+salmon-infer = "2.9.1"
 ahash = "0.8.9"
 distrs = "0.2.1"
 anyhow = "1.0.80"
-bstr = "1.9.1"
 clap = { version = "4.5.1", features = [
   "derive",
   "wrap_help",
@@ -38,26 +39,20 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", default-features = true, features = [
   "env-filter",
 ] }
-tabled = "0.20.0"
+tabled = "0.22"
 rayon = "1.8.1"
-rand_distr = "0.6"
-rand = "0.10"
 serde_json = "1.0.114"
-serde_derive = "1.0.197"
 serde = { version = "1.0.197", features = ["serde_derive", "derive"] }
-arrow2 = { version = "0.18.0", features = [
-  "io_parquet",
-  "io_parquet_gzip",
-  "io_parquet_zstd",
-  "io_parquet_snappy",
+arrow-array = "60.1"
+arrow-schema = "60.1"
+parquet = { version = "60.1", default-features = false, features = [
+  "arrow",
+  "zstd",
 ] }
-scroll = "0.13.0"
-snap = "1.1.1"
 path-tools = "0.1.0"
-atomic_float = "1.1.0"
 num-format = "0.4.4"
 clap-num = "1.2.0"
-indicatif = "0.17"
+indicatif = "0.18"
 
 [[bin]]
 name = "piscem-infer"
@@ -95,5 +90,19 @@ install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = true
 
-[workspace.metadata.dist.github-custom-runners]
-aarch64-apple-darwin = "macos-14"
+# macos-14 retires on 2026-11-02 (actions/runner-images#13518); build the
+# Apple Silicon binary on macos-15 (deployment target unchanged).
+[workspace.metadata.dist.github-custom-runners.aarch64-apple-darwin]
+runner = "macos-15"
+
+# Build the Linux binaries inside manylinux_2_28 containers (glibc 2.28), so
+# they run on RHEL/Rocky 8, Debian 10, Ubuntu 18.10 and newer; built on the
+# runners themselves they would need the runner's glibc (2.35+).
+[workspace.metadata.dist.github-custom-runners.x86_64-unknown-linux-gnu]
+runner = "ubuntu-22.04"
+container = { image = "quay.io/pypa/manylinux_2_28_x86_64", host = "x86_64-unknown-linux-musl" }
+
+[workspace.metadata.dist.github-custom-runners.aarch64-unknown-linux-gnu]
+runner = "ubuntu-24.04-arm"
+container = { image = "quay.io/pypa/manylinux_2_28_aarch64", host = "aarch64-unknown-linux-musl" }
+

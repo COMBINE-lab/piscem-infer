@@ -1,5 +1,9 @@
 # Changelog
 
+All notable changes to this project are documented here. The format follows
+[conventional commits](https://www.conventionalcommits.org); entries are
+generated from commit messages by [git-cliff](https://git-cliff.org).
+
 ## [0.6.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.5.2...v0.6.0) (2024-02-26)
 
 

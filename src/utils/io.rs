@@ -1,15 +1,12 @@
 use crate::utils::parquet_utils;
 use anyhow::Result;
-use arrow2::{
-    array::Array,
-    chunk::Chunk,
-    datatypes::{Field, Schema},
-};
+use arrow_array::{ArrayRef, Float64Array, UInt32Array};
 use libradicl::header;
 use path_tools::WithAdditionalExtension;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use tracing::warn;
 
@@ -20,13 +17,9 @@ pub(crate) fn write_results(
     lengths: &[u32],
     eff_lengths: &[f64],
 ) -> anyhow::Result<()> {
-    let mut ofile = File::create(output)?;
+    let mut ofile = BufWriter::new(File::create(output)?);
 
-    ofile.write_all(
-        "target_name\tlen\teelen\ttpm\tecount\n"
-            .to_string()
-            .as_bytes(),
-    )?;
+    ofile.write_all(b"target_name\tlen\teelen\ttpm\tecount\n")?;
 
     const ONE_MILLION: f64 = 1_000_000.0;
     let denom: f64 = e_counts
@@ -38,7 +31,7 @@ pub(crate) fn write_results(
         ONE_MILLION / denom
     } else {
         warn!(
-            "The sum of ecount / eeln for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!"
+            "The sum of ecount / eelen for all transcripts was 0. It seems likely that no fragments were quantified. Please check the input sample!"
         );
         0.0
     };
@@ -55,35 +48,45 @@ pub(crate) fn write_results(
         .collect();
 
     for (i, name) in hdr.ref_names.iter().enumerate() {
-        let l = format!(
-            "{}\t{}\t{:.3}\t{:.3}\t{:.3}\n",
+        writeln!(
+            ofile,
+            "{}\t{}\t{:.3}\t{:.3}\t{:.3}",
             name, lengths[i], eff_lengths[i], tpms[i], e_counts[i]
-        );
-        ofile.write_all(l.as_bytes())?;
+        )?;
     }
+    // flush explicitly, since dropping a BufWriter silently discards write errors
+    ofile.flush()?;
 
     Ok(())
 }
-pub(crate) fn write_fld_file(
-    output_path: &Path,
-    fields: Vec<Field>,
-    chunk: Chunk<Box<dyn Array>>,
-) -> Result<()> {
+/// Write the fragment length distribution (`<output>.fld.pq`): one column,
+/// `fragment_length_dist`, holding the count at each length.
+pub(crate) fn write_fld_file(output_path: &Path, frag_lengths: Vec<u32>) -> Result<()> {
     let output_path = output_path
         .to_path_buf()
         .with_additional_extension(".fld.pq");
-    let schema = Schema::from(fields);
-    parquet_utils::write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)
+    let col: ArrayRef = Arc::new(UInt32Array::from(frag_lengths));
+    parquet_utils::write_columns(
+        &output_path,
+        vec![("fragment_length_dist".to_string(), col)],
+    )
 }
 
-pub(crate) fn write_infrep_file(
-    output_path: &Path,
-    fields: Vec<Field>,
-    chunk: Chunk<Box<dyn Array>>,
-) -> Result<()> {
+/// Write the inferential replicates (`<output>.infreps.pq`): one column per
+/// replicate, `bootstrap.<i>`, whether drawn by bootstrap or Gibbs sampling.
+pub(crate) fn write_infrep_file(output_path: &Path, replicates: Vec<Vec<f64>>) -> Result<()> {
     let output_path = output_path
         .to_path_buf()
         .with_additional_extension(".infreps.pq");
-    let schema = Schema::from(fields);
-    parquet_utils::write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)
+    let columns = replicates
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            (
+                format!("bootstrap.{i}"),
+                Arc::new(Float64Array::from(r)) as ArrayRef,
+            )
+        })
+        .collect();
+    parquet_utils::write_columns(&output_path, columns)
 }

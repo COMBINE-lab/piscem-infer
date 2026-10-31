@@ -10,7 +10,8 @@ use num_format::{Locale, ToFormattedString};
 use path_tools::WithAdditionalExtension;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 use std::{
@@ -44,6 +45,7 @@ use libradicl::rad_types::{self, MappedFragmentOrientation};
 use libradicl::{
     chunk,
     header::RadPrelude,
+    readers::{MetaChunk, ParallelChunkReader},
     record::{PiscemBulkReadRecord, PiscemBulkRecordContext},
 };
 
@@ -62,6 +64,26 @@ impl MappedFragStats {
             num_mapped_reads: 0,
             mapped_ori_count: [0u32; 7],
             filtered_ori_count: [0u32; 7],
+        }
+    }
+
+    /// add the counts of `other` to these
+    fn merge(&mut self, other: &MappedFragStats) {
+        self.tot_mappings += other.tot_mappings;
+        self.num_mapped_reads += other.num_mapped_reads;
+        for (total, n) in self
+            .mapped_ori_count
+            .iter_mut()
+            .zip(&other.mapped_ori_count)
+        {
+            *total += n;
+        }
+        for (total, n) in self
+            .filtered_ori_count
+            .iter_mut()
+            .zip(&other.filtered_ori_count)
+        {
+            *total += n;
         }
     }
 }
@@ -221,7 +243,11 @@ fn detect_lib_type_from_sample<T: Read>(
 }
 
 pub fn process_bulk(quant_opts: QuantOpts, eq_map_t: EqMapType) -> anyhow::Result<()> {
-    let eqmap_orientation_status = OrientationProperty::OrientationAware;
+    // The packed classes the EM consumes drop orientation (see
+    // `extract_key_for_packed_map`), so keying the eq map by orientation as
+    // well only splits each class into per-orientation entries that are
+    // summed back together when the map is packed.
+    let eqmap_orientation_status = OrientationProperty::OrientationAgnostic;
     match eq_map_t {
         EqMapType::BasicEqMap => {
             process_bulk_dispatch(quant_opts, BasicEqMap::new(eqmap_orientation_status))
@@ -472,14 +498,14 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     let (packed_eq_map, frag_lengths) = process(
         &mut br,
-        prelude.hdr.num_chunks as usize,
-        &tag_context,
+        &prelude,
+        num_threads,
         lib_type,
         &mut frag_stats,
         ref_lengths,
         eqc_map,
         fld,
-    );
+    )?;
 
     let cond_means = if paired_end {
         conditional_means(&frag_lengths)
@@ -623,21 +649,21 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process<T: Read, EqLabelT: EqLabel>(
-    br: &mut BufReader<T>,
-    nrec: usize,
-    record_context: &PiscemBulkRecordContext,
+fn process<T: BufRead, EqLabelT: EqLabel>(
+    br: T,
+    prelude: &RadPrelude,
+    num_threads: usize,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
     ref_lengths: &[u32],
     eq_map: EqMap<EqLabelT>,
     fld_pdf: Fld,
-) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
+) -> anyhow::Result<(PackedEqMap<EqLabelT>, Vec<u32>)> {
     match fld_pdf {
         Fld::Empirical(f) => process_dispatch(
             br,
-            nrec,
-            record_context,
+            prelude,
+            num_threads,
             lib_type,
             mapped_stats,
             ref_lengths,
@@ -646,8 +672,8 @@ fn process<T: Read, EqLabelT: EqLabel>(
         ),
         Fld::Parametric(f) => process_dispatch(
             br,
-            nrec,
-            record_context,
+            prelude,
+            num_threads,
             lib_type,
             mapped_stats,
             ref_lengths,
@@ -657,36 +683,236 @@ fn process<T: Read, EqLabelT: EqLabel>(
     }
 }
 
+/// What the main pass accumulates over the fragments it parses. Each parsing
+/// thread fills its own `ParseState`, and they are merged once every chunk has
+/// been parsed. All of it is integer counts (and a class -> count map), so the
+/// merged result does not depend on which thread parsed which chunk.
+struct ParseState<'a, EqLabelT, D> {
+    eqmap: EqMap<EqLabelT>,
+    frag_lengths: Vec<u32>,
+    unique_frags: u32,
+    stats: MappedFragStats,
+    lib_type: LibraryType,
+    ref_lengths: &'a [u32],
+    fld_pdf: &'a D,
+    // per-fragment scratch space, reused across fragments
+    mapped_ori_count: [u32; 7],
+    filtered_ori_count: [u32; 7],
+    label_ints: Vec<u32>,
+    dir_ints: Vec<u32>,
+    probs: Vec<f64>,
+    key: Vec<u32>,
+}
+
+impl<'a, EqLabelT: EqLabel, D: FldPDF> ParseState<'a, EqLabelT, D> {
+    fn new(
+        eqmap: EqMap<EqLabelT>,
+        lib_type: LibraryType,
+        ref_lengths: &'a [u32],
+        fld_pdf: &'a D,
+    ) -> Self {
+        Self {
+            eqmap,
+            frag_lengths: vec![0u32; 65_536],
+            unique_frags: 0,
+            stats: MappedFragStats::new(),
+            lib_type,
+            ref_lengths,
+            fld_pdf,
+            mapped_ori_count: [0u32; 7],
+            filtered_ori_count: [0u32; 7],
+            label_ints: vec![],
+            dir_ints: vec![],
+            probs: vec![],
+            key: vec![],
+        }
+    }
+
+    fn add_meta_chunk(&mut self, meta_chunk: &MetaChunk<PiscemBulkReadRecord>) {
+        for c in meta_chunk.iter() {
+            for mappings in &c.reads {
+                self.add_fragment(mappings);
+            }
+        }
+    }
+
+    fn add_fragment(&mut self, mappings: &PiscemBulkReadRecord) {
+        let ft = rad_types::MappingType::from_u8(mappings.frag_type);
+        let nm = mappings.positions.len();
+
+        self.stats.tot_mappings += nm;
+        self.stats.num_mapped_reads += 1;
+
+        // reset the counter
+        self.mapped_ori_count.fill(0);
+        self.filtered_ori_count.fill(0);
+
+        self.label_ints.clear();
+        self.dir_ints.clear();
+        self.probs.clear();
+
+        for (((r, pos), o), l) in mappings
+            .refs
+            .iter()
+            .zip(mappings.positions.iter())
+            .zip(mappings.dirs.iter())
+            .zip(mappings.frag_lengths.iter())
+        {
+            let y = u32::from(*o);
+            if self.lib_type.is_compatible_with(*o) {
+                self.mapped_ori_count[y as usize] += 1;
+                self.label_ints.push(*r);
+                if self.eqmap.contains_ori {
+                    self.dir_ints.push(y);
+                }
+                let frag_len_prob = match o {
+                    MappedFragmentOrientation::Forward => {
+                        let max_frag_len = (self.ref_lengths[*r as usize] - *pos) as usize;
+                        self.fld_pdf.cdf(max_frag_len)
+                    }
+                    MappedFragmentOrientation::Reverse => {
+                        // TODO: modify the bulk RAD creation upstream so that
+                        // if a read is mapped as an orphan, then the length
+                        // field encodes the read length (instead of the maximum
+                        // fragment length).  This will allow us to compute the
+                        // actual right-most end of the mapped fragment, rather than
+                        // just assuming that the read is around length 100.
+                        let max_frag_len = *pos as usize + 100;
+                        self.fld_pdf.cdf(max_frag_len)
+                    }
+                    MappedFragmentOrientation::ForwardReverse
+                    | MappedFragmentOrientation::ReverseForward => self.fld_pdf.pdf(*l as usize),
+                    _ => 2.0 * f64::MIN_POSITIVE,
+                };
+                self.probs.push(frag_len_prob)
+            } else {
+                self.filtered_ori_count[y as usize] += 1;
+            }
+        }
+
+        // A stranded library can filter out every mapping of a fragment;
+        // an empty label would be a class with no targets to assign to.
+        if !self.label_ints.is_empty() {
+            if self.eqmap.contains_ori {
+                self.label_ints.append(&mut self.dir_ints);
+            }
+            EqLabelT::write_key(&self.label_ints, Some(&self.probs), &mut self.key);
+            self.eqmap.add_key(&self.key);
+        }
+
+        if nm == 1 && !ft.is_orphan() {
+            if let Some(fl) = mappings.frag_lengths.first() {
+                self.frag_lengths[*fl as usize] += 1;
+            }
+            self.unique_frags += 1;
+        }
+
+        // update global orientations
+        for i in 0..self.mapped_ori_count.len() {
+            self.stats.mapped_ori_count[i] += if self.mapped_ori_count[i] > 0 { 1 } else { 0 };
+            self.stats.filtered_ori_count[i] += if self.filtered_ori_count[i] > 0 { 1 } else { 0 };
+        }
+    }
+}
+
+/// Parse the chunks of the RAD file `br` (positioned at its first chunk) on
+/// `num_threads` threads, and return the state each of them accumulated.
+///
+/// The calling thread reads the chunks and queues them for `num_threads - 1`
+/// worker threads. libradicl's reader waits for room in a full queue by
+/// spinning, so instead of burning a core on that wait, the calling thread
+/// parses a queued chunk itself whenever it finds the queue full, and helps
+/// parse what is left queued once it has read the last chunk. With no worker
+/// threads (`num_threads == 1`), it thus parses every chunk itself.
+fn parse_chunks<'a, T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
+    br: T,
+    prelude: &RadPrelude,
+    num_threads: usize,
+    mut new_state: impl FnMut() -> ParseState<'a, EqLabelT, D>,
+    pb: &ProgressBar,
+) -> anyhow::Result<Vec<ParseState<'a, EqLabelT, D>>> {
+    let num_threads = NonZeroUsize::new(num_threads).unwrap_or(NonZeroUsize::MIN);
+    let mut reader = ParallelChunkReader::<PiscemBulkReadRecord>::new(prelude, num_threads);
+    let queue = reader.get_queue();
+    let mut own_state = new_state();
+
+    std::thread::scope(|s| -> anyhow::Result<_> {
+        let workers: Vec<_> = (1..num_threads.get())
+            .map(|_| {
+                let meta_chunks = reader.chunk_iter();
+                let mut state = new_state();
+                s.spawn(move || {
+                    for meta_chunk in meta_chunks {
+                        state.add_meta_chunk(&meta_chunk);
+                        pb.inc(meta_chunk.num_records() as u64);
+                    }
+                    state
+                })
+            })
+            .collect();
+
+        // called by the reader each time it has queued a meta-chunk
+        let help_when_full = |_nbytes: u64, _nchunks: u64| {
+            while queue.is_full() {
+                if let Some(meta_chunk) = queue.pop() {
+                    own_state.add_meta_chunk(&meta_chunk);
+                    pb.inc(meta_chunk.num_records() as u64);
+                }
+            }
+        };
+        let read_res = reader.start(br, Some(help_when_full));
+        if read_res.is_ok() {
+            // parse what is still queued alongside the workers
+            while let Some(meta_chunk) = queue.pop() {
+                own_state.add_meta_chunk(&meta_chunk);
+                pb.inc(meta_chunk.num_records() as u64);
+            }
+        }
+
+        let mut states: Vec<_> = workers
+            .into_iter()
+            .map(|w| w.join().expect("a RAD parsing thread panicked"))
+            .collect();
+        read_res?;
+        states.push(own_state);
+        Ok(states)
+    })
+}
+
+/// Merge the states of the parsing threads: sum their fragment length
+/// histograms, unique-fragment counts and mapping stats (the latter into
+/// `mapped_stats`), and collect their eq maps (which
+/// `PackedEqMap::from_eq_maps` packs together).
+fn merge_states<EqLabelT, D>(
+    states: Vec<ParseState<'_, EqLabelT, D>>,
+    mapped_stats: &mut MappedFragStats,
+) -> (Vec<EqMap<EqLabelT>>, Vec<u32>, u32) {
+    let mut frag_lengths = vec![0u32; 65_536];
+    let mut unique_frags = 0u32;
+    let mut eqmaps = Vec::with_capacity(states.len());
+    for state in states {
+        for (total, n) in frag_lengths.iter_mut().zip(&state.frag_lengths) {
+            *total += n;
+        }
+        unique_frags += state.unique_frags;
+        mapped_stats.merge(&state.stats);
+        eqmaps.push(state.eqmap);
+    }
+    (eqmaps, frag_lengths, unique_frags)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
-    br: &mut BufReader<T>,
-    nrec: usize,
-    record_context: &PiscemBulkRecordContext,
+fn process_dispatch<T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
+    br: T,
+    prelude: &RadPrelude,
+    num_threads: usize,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
     ref_lengths: &[u32],
     fld_pdf: D,
-    mut eqmap: EqMap<EqLabelT>,
-) -> (PackedEqMap<EqLabelT>, Vec<u32>) {
-    /*
-    let eqmap_orientation_status = if eqmap.contains_ori {
-        OrientationProperty::OrientationAware
-    } else {
-        OrientationProperty::OrientationAgnostic
-    };
-    */
-
-    //let map = &mut eqmap.count_map;
-    let mut frag_lengths = vec![0u32; 65_536];
+    eqmap: EqMap<EqLabelT>,
+) -> anyhow::Result<(PackedEqMap<EqLabelT>, Vec<u32>)> {
     const TARGET_UNIQUE_FRAGS: u32 = 5_000;
-    let mut unique_frags = 0u32;
-
-    let mut mapped_ori_count = [0u32; 7];
-    let mut filtered_ori_count = [0u32; 7];
-
-    let mut label_ints = vec![];
-    let mut dir_ints = vec![];
-    let mut probs = vec![];
 
     let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(1));
     pb.set_style(
@@ -698,84 +924,30 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
     );
     pb.enable_steady_tick(Duration::from_secs(1));
 
-    for _ in 0..nrec {
-        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
-        for mappings in &c.reads {
-            let ft = rad_types::MappingType::from_u8(mappings.frag_type);
-            let nm = mappings.positions.len();
+    // each parsing thread counts into its own eq map: the first one takes
+    // over `eqmap`, the others start from empty maps set up like it
+    let contains_ori = eqmap.contains_ori;
+    let mut eqmap = Some(eqmap);
+    let mut new_state = || {
+        let eqmap = eqmap.take().unwrap_or_else(|| EqMap {
+            count_map: Default::default(),
+            contains_ori,
+        });
+        ParseState::new(eqmap, lib_type, ref_lengths, &fld_pdf)
+    };
 
-            mapped_stats.tot_mappings += nm;
-            mapped_stats.num_mapped_reads += 1;
+    // piscem leaves a chunk count of 0 in the header of a file without
+    // chunks, and of one whose mapping run did not finish (it fills the count
+    // in at the end). The FLD and library-type pre-passes read `num_chunks`
+    // chunks, so read none here either, rather than letting the chunk reader
+    // fall back to reading until EOF.
+    let states = if prelude.hdr.num_chunks > 0 {
+        parse_chunks(br, prelude, num_threads, new_state, &pb)?
+    } else {
+        vec![new_state()]
+    };
 
-            // reset the counter
-            mapped_ori_count.fill(0);
-            filtered_ori_count.fill(0);
-
-            label_ints.clear();
-            dir_ints.clear();
-            probs.clear();
-
-            for (((r, pos), o), l) in mappings
-                .refs
-                .iter()
-                .zip(mappings.positions.iter())
-                .zip(mappings.dirs.iter())
-                .zip(mappings.frag_lengths.iter())
-            {
-                let y = u32::from(*o);
-                if lib_type.is_compatible_with(*o) {
-                    mapped_ori_count[y as usize] += 1;
-                    label_ints.push(*r);
-                    dir_ints.push(y);
-                    let frag_len_prob = match o {
-                        MappedFragmentOrientation::Forward => {
-                            let max_frag_len = (ref_lengths[*r as usize] - *pos) as usize;
-                            fld_pdf.cdf(max_frag_len)
-                        }
-                        MappedFragmentOrientation::Reverse => {
-                            // TODO: modify the bulk RAD creation upstream so that
-                            // if a read is mapped as an orphan, then the length
-                            // field encodes the read length (instead of the maximum
-                            // fragment length).  This will allow us to compute the
-                            // actual right-most end of the mapped fragment, rather than
-                            // just assuming that the read is around length 100.
-                            let max_frag_len = *pos as usize + 100;
-                            fld_pdf.cdf(max_frag_len)
-                        }
-                        MappedFragmentOrientation::ForwardReverse
-                        | MappedFragmentOrientation::ReverseForward => fld_pdf.pdf(*l as usize),
-                        _ => 2.0 * f64::MIN_POSITIVE,
-                    };
-                    probs.push(frag_len_prob)
-                } else {
-                    filtered_ori_count[y as usize] += 1;
-                }
-            }
-
-            // A stranded library can filter out every mapping of a fragment;
-            // an empty label would be a class with no targets to assign to.
-            if !label_ints.is_empty() {
-                label_ints.append(&mut dir_ints);
-                let eql = EqLabelT::new(&label_ints, Some(&probs));
-                eqmap.add(eql);
-            }
-
-            if nm == 1 && !ft.is_orphan() {
-                if let Some(fl) = mappings.frag_lengths.first() {
-                    frag_lengths[*fl as usize] += 1;
-                }
-                unique_frags += 1;
-            }
-
-            // update global orientations
-            for i in 0..mapped_ori_count.len() {
-                mapped_stats.mapped_ori_count[i] += if mapped_ori_count[i] > 0 { 1 } else { 0 };
-                mapped_stats.filtered_ori_count[i] += if filtered_ori_count[i] > 0 { 1 } else { 0 };
-            }
-
-            pb.inc(1);
-        }
-    }
+    let (eqmaps, frag_lengths, unique_frags) = merge_states(states, mapped_stats);
 
     pb.finish_with_message(format!(
         "Done — processed {} reads",
@@ -805,8 +977,198 @@ fn process_dispatch<T: Read, D: FldPDF, EqLabelT: EqLabel>(
         );
     }
 
-    let packed_eq_map = PackedEqMap::from_eq_map(&eqmap);
-    drop(eqmap);
+    let packed_eq_map = PackedEqMap::from_eq_maps(&eqmaps);
+    drop(eqmaps);
 
-    (packed_eq_map, frag_lengths)
+    Ok((packed_eq_map, frag_lengths))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::eq_maps::{NUM_BINS, OrientationProperty, RangeFactorizedEqLabel};
+    use libradicl::ChunkBuf;
+    use libradicl::header::RadHeader;
+    use libradicl::rad_types::{RadIntId, RadType, TagDesc, TagSection, TagSectionLabel};
+
+    const NUM_REFS: u32 = 50;
+    const FRAGS_PER_CHUNK: usize = 1_000;
+
+    /// pseudo-random paired-end fragments (pairs and orphans) mapping to one
+    /// or more targets, in several orientations
+    fn fragments(n: usize) -> Vec<PiscemBulkReadRecord> {
+        let mut state = 0x9E37_79B9u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        (0..n)
+            .map(|_| {
+                let frag_type = if next() % 4 == 0 { 2 } else { 4 };
+                let nm = 1 + (next() % 4) as usize;
+                let mut rec = PiscemBulkReadRecord {
+                    frag_type,
+                    dirs: vec![],
+                    refs: vec![],
+                    positions: vec![],
+                    frag_lengths: vec![],
+                };
+                for _ in 0..nm {
+                    rec.dirs.push(match (frag_type, next() % 2) {
+                        (4, 0) => MappedFragmentOrientation::ForwardReverse,
+                        (4, _) => MappedFragmentOrientation::ReverseForward,
+                        (_, 0) => MappedFragmentOrientation::Forward,
+                        _ => MappedFragmentOrientation::Reverse,
+                    });
+                    rec.refs.push(next() % NUM_REFS);
+                    rec.positions.push(next() % 500);
+                    rec.frag_lengths.push((150 + next() % 300) as u16);
+                }
+                rec
+            })
+            .collect()
+    }
+
+    /// the prelude and chunk bytes of a bulk RAD file holding `frags`
+    fn rad_file(frags: &[PiscemBulkReadRecord]) -> (RadPrelude, Vec<u8>) {
+        let mut hdr = RadHeader::from_ref_names((0..NUM_REFS).map(|i| format!("t{i}")));
+        hdr.is_paired = 1;
+        hdr.num_chunks = frags.len().div_ceil(FRAGS_PER_CHUNK) as u64;
+        let mut read_tags = TagSection::new_with_label(TagSectionLabel::ReadTags);
+        read_tags.add_tag_desc(TagDesc::new("frag_map_type", RadType::Int(RadIntId::U8)));
+        let prelude = RadPrelude::from_header_and_tag_sections(
+            hdr,
+            TagSection::new_with_label(TagSectionLabel::FileTags),
+            read_tags,
+            TagSection::new_with_label(TagSectionLabel::AlignmentTags),
+        );
+        let ctx = prelude
+            .get_record_context_prefer_roles::<PiscemBulkRecordContext>()
+            .unwrap();
+        let mut bytes = vec![];
+        for chunk_frags in frags.chunks(FRAGS_PER_CHUNK) {
+            let mut c = ChunkBuf::new();
+            for rec in chunk_frags {
+                c.write_record(rec, &ctx).unwrap();
+            }
+            bytes.extend(c.into_bytes());
+        }
+        (prelude, bytes)
+    }
+
+    struct Parsed {
+        eq_labels: Vec<u32>,
+        eq_label_starts: Vec<usize>,
+        counts: Vec<usize>,
+        frag_lengths: Vec<u32>,
+        unique_frags: u32,
+        stats: Value,
+    }
+
+    fn summarize(states: Vec<ParseState<'_, RangeFactorizedEqLabel, ParametricFLD>>) -> Parsed {
+        let mut stats = MappedFragStats::new();
+        let (eqmaps, frag_lengths, unique_frags) = merge_states(states, &mut stats);
+        let packed = PackedEqMap::from_eq_maps(&eqmaps);
+        Parsed {
+            eq_labels: packed.eq_labels,
+            eq_label_starts: packed.eq_label_starts,
+            counts: packed.counts,
+            frag_lengths,
+            unique_frags,
+            stats: serde_json::to_value(&stats).unwrap(),
+        }
+    }
+
+    fn new_eqmap(ori: bool) -> EqMap<RangeFactorizedEqLabel> {
+        EqMap::new(if ori {
+            OrientationProperty::OrientationAware
+        } else {
+            OrientationProperty::OrientationAgnostic
+        })
+    }
+
+    /// The parallel main pass (any thread count, orientation-aware or not)
+    /// must give exactly what parsing the chunks one by one into a single
+    /// orientation-aware map gives.
+    #[test]
+    fn parallel_parse_matches_sequential_parse() {
+        let _ = NUM_BINS.set(4.0);
+        let frags = fragments(300_000);
+        let (prelude, bytes) = rad_file(&frags);
+        let ref_lengths = vec![1_000u32; NUM_REFS as usize];
+        let fld = ParametricFLD::new(250.0, 25.0, 65_536);
+        let ctx = prelude
+            .get_record_context_prefer_roles::<PiscemBulkRecordContext>()
+            .unwrap();
+
+        for lib_type in [
+            LibraryType::InwardUnstranded,
+            LibraryType::InwardStrandedReverse,
+        ] {
+            let mut seq = ParseState::new(new_eqmap(true), lib_type, &ref_lengths, &fld);
+            let mut reader = std::io::Cursor::new(&bytes[..]);
+            for _ in 0..prelude.hdr.num_chunks {
+                let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(&mut reader, &ctx);
+                for rec in &c.reads {
+                    seq.add_fragment(rec);
+                }
+            }
+            let expected = summarize(vec![seq]);
+            assert_eq!(expected.stats["num_mapped_reads"], frags.len());
+            assert!(expected.counts.len() > 1_000);
+
+            for ori in [true, false] {
+                for num_threads in [1, 2, 3, 8] {
+                    let states = parse_chunks(
+                        &bytes[..],
+                        &prelude,
+                        num_threads,
+                        || ParseState::new(new_eqmap(ori), lib_type, &ref_lengths, &fld),
+                        &ProgressBar::hidden(),
+                    )
+                    .unwrap();
+                    assert_eq!(states.len(), num_threads);
+                    let got = summarize(states);
+                    let what = format!("{lib_type}, ori {ori}, {num_threads} threads");
+                    assert_eq!(got.eq_labels, expected.eq_labels, "{what}");
+                    assert_eq!(got.eq_label_starts, expected.eq_label_starts, "{what}");
+                    assert_eq!(got.counts, expected.counts, "{what}");
+                    assert_eq!(got.frag_lengths, expected.frag_lengths, "{what}");
+                    assert_eq!(got.unique_frags, expected.unique_frags, "{what}");
+                    assert_eq!(got.stats, expected.stats, "{what}");
+                }
+            }
+        }
+    }
+
+    /// A truncated file is an error (not a panic or a hang), whatever the
+    /// number of threads.
+    #[test]
+    fn parallel_parse_reports_truncated_file() {
+        let _ = NUM_BINS.set(4.0);
+        let frags = fragments(50_000);
+        let (prelude, bytes) = rad_file(&frags);
+        let ref_lengths = vec![1_000u32; NUM_REFS as usize];
+        let fld = ParametricFLD::new(250.0, 25.0, 65_536);
+        for num_threads in [1, 4] {
+            let res = parse_chunks(
+                &bytes[..bytes.len() - 100],
+                &prelude,
+                num_threads,
+                || {
+                    ParseState::new(
+                        new_eqmap(false),
+                        LibraryType::InwardUnstranded,
+                        &ref_lengths,
+                        &fld,
+                    )
+                },
+                &ProgressBar::hidden(),
+            );
+            let err = res.err().expect("truncated input must be an error");
+            assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+        }
+    }
 }

@@ -175,7 +175,8 @@ pub struct QuantOpts {
     /// If this value is set to 1, then basic equivalence classes are used.
     #[arg(long, default_value_t = 64_u32, value_parser=greater_than_0, help_heading = "Advanced")]
     pub factorized_eqc_bins: u32,
-    /// number of threads to use (used during the EM and for bootstrapping)
+    /// number of threads to use (used to parse the RAD file, during the EM and
+    /// for bootstrapping)
     #[arg(long, default_value_t = 16, help_heading = "Advanced")]
     pub num_threads: usize,
     /// number of mapped reads to sample for automatic library type detection

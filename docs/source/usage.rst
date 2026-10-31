@@ -120,6 +120,13 @@ Instead of bootstrap replicates, ``piscem-infer`` can also draw posterior sample
 ``--gibbs-thinning-factor`` option (default 5) sets how many Gibbs iterations are run per retained sample. Gibbs
 samples are written to the same ``infreps.pq`` file as bootstrap replicates.
 
+By default ``piscem-infer`` estimates abundances with the EM algorithm. Passing ``--vbem`` uses variational Bayesian EM
+instead (``salmon``'s default optimizer, with a per-target Dirichlet prior set by ``--vb-prior``, 0.01 by default), and
+stops each connected group of targets separately once its estimates have settled, which is usually much faster. The two
+optimizers trade off differently: on simulated GENCODE data, ``--vbem`` had a lower mean absolute relative difference
+and L1 error against the true counts, but a lower transcript-level Spearman correlation, because it is more willing to
+assign zero to a lowly expressed target than to spread a few reads over it.
+
 If we look at the files generated with the stem corresponding to, say, the second sample (``SRR1039509``), we 
 see the following:
 

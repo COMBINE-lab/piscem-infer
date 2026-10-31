@@ -14,6 +14,7 @@ const PRESENCE_THRESH: f64 = 1e-8;
 const RELDIFF_THRESH: f64 = 1e-2;
 const ALPHA_CHECK_CUTOFF: f64 = 1e-2;
 const MAX_EM_ITER: u32 = 10_000;
+const VB_PRIOR: f64 = 1e-2;
 const DEFAULT_SEED: u64 = 0x5A15_0EED;
 
 /// Convergence acceleration applied on top of the EM fixed-point iteration.
@@ -46,6 +47,13 @@ impl From<EmAccelArg> for salmon_infer::EmAccel {
 
 fn greater_than_0(s: &str) -> std::result::Result<u32, String> {
     number_range(s, 1, u32::MAX)
+}
+
+fn positive_f64(s: &str) -> std::result::Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v > 0.0 && v.is_finite() => Ok(v),
+        _ => Err(format!("`{s}` is not a positive number")),
+    }
 }
 
 fn usize_greater_than_0(s: &str) -> std::result::Result<usize, String> {
@@ -119,6 +127,16 @@ pub struct QuantOpts {
     /// the three closer together.
     #[arg(long, value_enum, default_value_t = EmAccelArg::None, help_heading = "EM Algorithm")]
     pub em_accel: EmAccelArg,
+    /// optimize with variational Bayesian EM (VBEM, salmon's default) instead of
+    /// EM. Each connected group of targets stops on its own, once the
+    /// convergence criterion holds over it and its projected remaining change
+    /// is below 0.1% of its fragments, which usually takes far less time than
+    /// EM. Not compatible with `--em-accel daarem`
+    #[arg(long, help_heading = "EM Algorithm")]
+    pub vbem: bool,
+    /// the VBEM Dirichlet prior on each target's abundance (with `--vbem`)
+    #[arg(long, default_value_t = VB_PRIOR, value_parser = positive_f64, requires = "vbem", help_heading = "EM Algorithm")]
+    pub vb_prior: f64,
 
     // --- Fragment Length Distribution ---
     /// number of (unique) mappings to use to perform initial coarse-grained

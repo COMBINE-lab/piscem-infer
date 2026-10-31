@@ -466,14 +466,18 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let num_eq_classes = packed_eq_map.len();
     let total_weight: usize = packed_eq_map.total_weight();
     drop(packed_eq_map);
-    let em_opts = em_options(
+    let mut em_opts = em_options(
         max_iter,
         convergence_thresh,
         qo.alpha_check_cutoff,
         presence_thresh,
         qo.em_accel.into(),
     );
-
+    if qo.vbem {
+        em_opts.use_vbem = true;
+        em_opts.vb_prior = qo.vb_prior;
+    }
+    em_opts.validate().map_err(|e| anyhow::anyhow!(e))?;
     let EmResult {
         alphas: em_res,
         iters: em_iters,

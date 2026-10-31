@@ -194,11 +194,22 @@ pub fn em_options(
 /// therefore *not* used even when only one thread is available.
 pub fn run_em(packed: &PackedEqClasses, opts: &EmOptions) -> EmResult {
     let res = salmon_infer::optimize_packed(packed, opts, true);
+    let optimizer = if opts.use_vbem { "VBEM" } else { "EM" };
     info!(
-        "EM finished after {} M-steps (converged = {}, accel = {:?})",
+        "{optimizer} finished after {} M-steps (converged = {}, accel = {:?})",
         res.iters, res.converged, opts.accel
     );
-    if !res.converged {
+    if opts.use_vbem
+        && let Some(summary) = &res.components
+    {
+        // each component stops on its own: report how they ended
+        let (line, warn) = summary.describe(res.iters);
+        if warn {
+            warn!("{line}");
+        } else {
+            info!("{line}");
+        }
+    } else if !res.converged {
         warn!(
             "EM stopped at --max-iter ({}) without converging: some abundances were still \
             changing by more than --convergence-thresh ({}) between M-steps. The estimates \

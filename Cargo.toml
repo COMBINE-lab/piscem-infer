@@ -22,7 +22,7 @@ include = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libradicl = { version = "0.21" }
+libradicl = { version = "0.21.2" }
 salmon-infer = "2.9.0"
 ahash = "0.8.9"
 distrs = "0.2.1"
@@ -106,5 +106,3 @@ container = { image = "quay.io/pypa/manylinux_2_28_x86_64", host = "x86_64-unkno
 runner = "ubuntu-24.04-arm"
 container = { image = "quay.io/pypa/manylinux_2_28_aarch64", host = "aarch64-unknown-linux-musl" }
 
-[patch.crates-io]
-libradicl = { path = "/scratch4/tmp/pbench/libradicl-wt/libradicl" }

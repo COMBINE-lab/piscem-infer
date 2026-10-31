@@ -20,6 +20,13 @@ or install it from source
    $ cd piscem-infer
    $ cargo build --release
 
+.. note::
+
+   Starting with version 0.24, ``piscem`` writes ``RAD`` version 2 files. ``piscem-infer`` releases after 0.7.0
+   read both ``RAD`` v1 and ``RAD`` v2 files, while releases up to and including 0.7.0 read only ``RAD`` v1 (as written
+   by ``piscem`` < 0.24 and ``piscem-cpp``). To quantify the output of ``piscem`` >= 0.24, use a ``piscem-infer``
+   release newer than 0.7.0.
+
 
 An example run
 --------------
@@ -76,9 +83,10 @@ a descripton of all the options):
 
 .. code-block:: console
 
-   $ mkdir -mappings
-   $ for acc in ${accessions[@]}; do 
-      piscem map-bulk -t 16 -i gencode_v44_idx -1 ${acc}_1.fastq.gz -2 ${acc}_1.fastq.gz -o mappings/${acc}
+   $ mkdir -p mappings
+   $ for acc in ${accessions[@]}; do
+      piscem map-bulk -t 16 -i gencode_v44_idx -1 ${acc}_1.fastq.gz -2 ${acc}_2.fastq.gz -o mappings/${acc}
+   done
 
 
 Quantification with ``piscem-infer``
@@ -87,18 +95,27 @@ Quantification with ``piscem-infer``
 Now that we've mapped the reads to produce a bulk-oriented ``RAD`` file, we're ready to quantify with ``piscem-infer``!
 Here, in addition to performing the basic quantification, we will be creating inferential replicates (i.e. bootstrap
 samples) for each sample we quantify. This is designated by the ``--num-bootstraps`` parameter. To perform the 
-bootsrapping in parallel, we'll make use of multiple threads (``--num-threads 16``).
+bootstrapping in parallel, we'll make use of multiple threads (``--num-threads 16``, or ``-t 16`` for short).
 
 .. code-block:: console
   
    $ for acc in ${accessions[@]}; do
       piscem-infer quant --num-bootstraps 16 --num-threads 16 -i mappings/${acc} -l IU -o quant/${acc}
+   done
 
 Note that we pass to the ``-o`` flag a file *stem* prefixed with a path (in this case ``quant``). This is because ``piscem-infer``
 will produce several output files.  All of them will share the same *stem*.  If we pass a stem that is prefixed with some path 
 (e.g. a directory) then this directory will be created if it doesn't exist. We also let ``piscem-infer`` know the library type 
 (i.e. how we expect the reads to map), where ``piscem-infer`` uses `salmon's library type specification <https://salmon.readthedocs.io/en/latest/salmon.html#what-s-this-libtype>`_.
 Here we expect the library to be unstranded and the paired-end reads to map "inward" (i.e. facing each other).
+If you don't know the library type, you can pass ``-l auto`` instead, and ``piscem-infer`` will infer it from the
+orientations of the first mapped reads in the ``RAD`` file (10,000 of them by default; see ``--auto-detect-samples``).
+Either way, the library type that was used is recorded as ``inferred_lib_type`` in the ``meta_info.json`` file.
+
+Instead of bootstrap replicates, ``piscem-infer`` can also draw posterior samples with a Gibbs sampler, by passing
+``--num-gibbs-samples <N>`` in place of ``--num-bootstraps <N>`` (the two options are mutually exclusive). The
+``--gibbs-thinning-factor`` option (default 5) sets how many Gibbs iterations are run per retained sample. Gibbs
+samples are written to the same ``infreps.pq`` file as bootstrap replicates.
 
 If we look at the files generated with the stem corresponding to, say, the second sample (``SRR1039509``), we 
 see the following:

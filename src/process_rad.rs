@@ -28,6 +28,7 @@ use crate::utils::io;
 use crate::utils::map_record_types::{
     LibraryType, OrientationCounts, check_strand_warnings, detect_library_type,
 };
+use crate::utils::rad_input::{self, ChunkReader};
 use crate::{
     fld::FldPDF,
     prog_opts::{LibTypeArg, QuantOpts},
@@ -129,7 +130,7 @@ fn build_ori_table(mapped_ori_count_global: &[u32]) -> Vec<DirectionalEntry> {
 
 fn compute_fld_from_sample<T: Read>(
     br: &mut BufReader<T>,
-    nchunk: usize,
+    chunks: &mut ChunkReader,
     record_context: &PiscemBulkRecordContext,
     lib_type: LibraryType,
     mut param_est_frags: isize,
@@ -138,8 +139,8 @@ fn compute_fld_from_sample<T: Read>(
     let mut sufficient_samples = false;
     let requested_samples = param_est_frags;
 
-    'estimate_fld: for _ in 0..nchunk {
-        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
+    'estimate_fld: for i in 0..chunks.num_chunks() {
+        let c = chunks.read(br, record_context, i)?;
         for mappings in &c.reads {
             let ft = rad_types::MappingType::from_u8(mappings.frag_type);
             let nm = mappings.positions.len();
@@ -194,7 +195,7 @@ fn compute_fld_from_params(mu: f64, sigma: f64, weight: usize, upper: usize) -> 
 
 fn detect_lib_type_from_sample<T: Read>(
     br: &mut BufReader<T>,
-    nchunk: usize,
+    chunks: &mut ChunkReader,
     record_context: &PiscemBulkRecordContext,
     paired_end: bool,
     max_samples: usize,
@@ -202,8 +203,8 @@ fn detect_lib_type_from_sample<T: Read>(
     let mut counts = OrientationCounts::default();
     let mut sampled = 0usize;
 
-    'sample: for _ in 0..nchunk {
-        let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(br, record_context);
+    'sample: for i in 0..chunks.num_chunks() {
+        let c = chunks.read(br, record_context, i)?;
         for mappings in &c.reads {
             for o in &mappings.dirs {
                 counts.add(*o);
@@ -295,10 +296,9 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     }
 
     info!("path {:?}", input);
+    let (input_rad, input_map_info) = rad_input::input_paths(&input);
     let ref_sig_json;
     {
-        let mut input_map_info = input.clone();
-        input_map_info.set_extension("map_info.json");
         if !input_map_info.exists() {
             ref_sig_json = None;
             warn!(
@@ -322,9 +322,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         }
     }
 
-    let mut input_rad = input;
-    input_rad.set_extension("rad");
-    let i_file = File::open(&input_rad).context("could not open input rad file")?;
+    let i_file = File::open(&input_rad)
+        .with_context(|| format!("could not open input RAD file {}", input_rad.display()))?;
     let mut br = BufReader::new(i_file);
 
     let paired_end: bool;
@@ -332,7 +331,10 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let mut fl_sd = 0_f64;
 
     // read the header and tag sections from the rad file
-    let prelude = RadPrelude::from_bytes(&mut br)?;
+    let prelude = RadPrelude::from_bytes(&mut br)
+        .with_context(|| format!("could not read the RAD header of {}", input_rad.display()))?;
+    // before anything else, make sure this is a bulk RAD file we can read
+    rad_input::check_bulk_layout(&prelude, &input_rad)?;
 
     info!("read header!");
     if prelude.hdr.is_paired > 0_u8 {
@@ -370,21 +372,9 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     // read-level
     info!("read {:?} read-level tags", prelude.read_tags.tags.len());
-
-    // required read-level tag
-    const FRAG_TYPE_NAME: &str = "frag_map_type";
-    let mut had_frag_map_type = false;
-    // parse actual tags
+    // parse actual tags (their layout was checked above)
     for rt in &prelude.read_tags.tags {
         info!("\tread-level tag {}", rt.name);
-        if rt.name == FRAG_TYPE_NAME {
-            had_frag_map_type = true;
-        }
-    }
-    if !had_frag_map_type {
-        bail!(
-            "read-level tag description missing required tag \"{FRAG_TYPE_NAME}\"; can't proceed."
-        );
     }
 
     // alignment-level
@@ -392,57 +382,15 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         "read {:?} alignment-level tags",
         prelude.aln_tags.tags.len()
     );
-
-    // required alignment level tags
-    const REF_ORI_NAME: &str = "compressed_ori_ref";
-    const POS_NAME: &str = "pos";
-    const FRAGLEN_NAME: &str = "frag_len";
-
-    let mut found_ref_ori_t = false;
-    let mut found_pos_t = false;
-    let mut found_fraglen_t = false;
-    // parse actual tags
+    // parse actual tags (their layout was checked above)
     for at in &prelude.aln_tags.tags {
         info!("\talignment-level tag {}", at.name);
-        match at.name.as_str() {
-            REF_ORI_NAME => {
-                found_ref_ori_t = true;
-            }
-            POS_NAME => {
-                found_pos_t = true;
-            }
-            FRAGLEN_NAME => {
-                found_fraglen_t = true;
-            }
-            _ => {
-                info!("unknown alignment-level tag {}", at.name);
-            }
-        }
     }
-    // ensure the tags we expect are found
-    assert!(
-        found_ref_ori_t,
-        "required alignment-level tag \"{REF_ORI_NAME}\" is missing"
-    );
-    assert!(
-        found_pos_t,
-        "required alignment-level tag \"{POS_NAME}\" is missing"
-    );
-    assert!(
-        found_fraglen_t,
-        "required alignment-level tag \"{FRAGLEN_NAME}\" is missing"
-    );
 
-    // parse the actual file-level tags
-    const REF_LENGTHS_NAME: &str = "ref_lengths";
-    let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
-    // get the reference lengths from the tag map
-    let ref_lengths = match file_tag_map.get(REF_LENGTHS_NAME) {
-        Some(rad_types::TagValue::ArrayU32(v)) => Some(v),
-        _ => None,
-    };
-
-    let ref_lengths = ref_lengths.expect("was not able to read reference lengths from file!");
+    // parse the actual file-level tags, and get the reference lengths from them
+    let ref_lengths = rad_input::read_file_tags(&prelude, &mut br, &input_rad)?;
+    let ref_lengths = &ref_lengths[..];
+    rad_input::check_num_chunks(&prelude.hdr, &mut br, &input_rad)?;
     info!(
         "read {} reference lengths",
         ref_lengths.len().to_formatted_string(&Locale::en)
@@ -450,6 +398,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 
     // extract whatever context we'll need to read the records
     let tag_context = prelude.get_record_context_prefer_roles::<PiscemBulkRecordContext>()?;
+    let mut chunks = ChunkReader::new(&input_rad, prelude.hdr.num_chunks as usize);
 
     // resolve library type (auto-detect if requested)
     let lib_type: LibraryType = match qo.lib_type {
@@ -461,7 +410,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
             let file_offset = br.stream_position()?;
             let detected = detect_lib_type_from_sample(
                 &mut br,
-                prelude.hdr.num_chunks as usize,
+                &mut chunks,
                 &tag_context,
                 paired_end,
                 qo.auto_detect_samples,
@@ -478,7 +427,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         let file_offset = br.stream_position()?;
         let temp_frag_lens = compute_fld_from_sample(
             &mut br,
-            prelude.hdr.num_chunks as usize,
+            &mut chunks,
             &tag_context,
             lib_type,
             qo.param_est_frags,

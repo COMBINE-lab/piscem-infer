@@ -84,7 +84,8 @@ impl Serialize for LibTypeArg {
 #[derive(Args, Serialize, Clone, Debug)]
 pub struct QuantOpts {
     // --- Input / Output ---
-    /// input stem (i.e. without the .rad suffix)
+    /// input stem, as given to `piscem map-bulk -o` (reads `<stem>.rad` and
+    /// `<stem>.map_info.json`); the path of the `.rad` file itself also works
     #[arg(short, long, help_heading = "Input / Output")]
     pub input: PathBuf,
     /// the expected library type (or 'auto' for automatic detection)

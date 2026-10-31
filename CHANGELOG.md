@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [conventional commits](https://www.conventionalcommits.org); entries are
 generated from commit messages by [git-cliff](https://git-cliff.org).
 
+## [0.8.1](https://github.com/COMBINE-lab/piscem-infer/compare/v0.8.0...v0.8.1) (2026-10-31)
+
+
+### Build & CI
+
+* Build x86_64-apple-darwin on macos-15-intel ([dfea052](https://github.com/COMBINE-lab/piscem-infer/commit/dfea0529519bea47283fe45800207b7eafc69e04))
+
 ## [0.8.0](https://github.com/COMBINE-lab/piscem-infer/compare/v0.7.0...v0.8.0) (2026-10-31)
 
 

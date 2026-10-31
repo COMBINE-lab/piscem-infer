@@ -23,7 +23,7 @@ include = [
 
 [dependencies]
 libradicl = { version = "0.21" }
-salmon-infer = "2.7.0"
+salmon-infer = "2.9.0"
 ahash = "0.8.9"
 distrs = "0.2.1"
 anyhow = "1.0.80"
@@ -92,3 +92,6 @@ install-updater = true
 
 [workspace.metadata.dist.github-custom-runners]
 aarch64-apple-darwin = "macos-14"
+
+[patch.crates-io]
+libradicl = { path = "/scratch4/tmp/pbench/libradicl-wt/libradicl" }

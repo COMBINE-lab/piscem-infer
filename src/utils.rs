@@ -1,3 +1,4 @@
+pub mod bulk_record;
 pub mod em;
 pub mod eq_maps;
 pub mod io;

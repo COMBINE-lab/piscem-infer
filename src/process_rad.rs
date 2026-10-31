@@ -21,6 +21,7 @@ use std::{
 use tabled::{Table, Tabled, settings::Style};
 use tracing::{info, warn};
 
+use crate::utils::bulk_record::{BulkAlignment, BulkRecord};
 use crate::utils::eq_maps::{
     BasicEqMap, EqLabel, EqMap, EqMapType, OrientationProperty, PackedEqMap, RangeFactorizedEqMap,
 };
@@ -44,7 +45,6 @@ use salmon_infer::{EffLens, EmResult, GibbsOptions, bootstrap, gibbs_sample};
 
 use libradicl::rad_types::{self, MappedFragmentOrientation};
 use libradicl::{
-    chunk,
     header::RadPrelude,
     readers::{MetaChunk, ParallelChunkReader},
     record::{PiscemBulkReadRecord, PiscemBulkRecordContext},
@@ -140,16 +140,11 @@ fn compute_fld_from_sample<T: Read>(
     let requested_samples = param_est_frags;
 
     'estimate_fld: for i in 0..chunks.num_chunks() {
-        let c = chunks.read(br, record_context, i)?;
-        for mappings in &c.reads {
-            let ft = rad_types::MappingType::from_u8(mappings.frag_type);
-            let nm = mappings.positions.len();
-            if nm == 1 && !ft.is_orphan() {
-                let o = mappings.dirs.first().expect("at least one mapping");
-                if lib_type.is_compatible_with(*o)
-                    && let Some(fl) = mappings.frag_lengths.first()
-                {
-                    temp_frag_lengths[*fl as usize] += 1;
+        for rec in chunks.read_records(br, record_context, i)? {
+            if rec.num_alignments() == 1 && !rec.mapping_type().is_orphan() {
+                let aln = rec.alignment(0);
+                if lib_type.is_compatible_with(aln.ori) {
+                    temp_frag_lengths[aln.frag_len as usize] += 1;
                     param_est_frags -= 1;
                     if param_est_frags <= 0 {
                         sufficient_samples = true;
@@ -204,10 +199,9 @@ fn detect_lib_type_from_sample<T: Read>(
     let mut sampled = 0usize;
 
     'sample: for i in 0..chunks.num_chunks() {
-        let c = chunks.read(br, record_context, i)?;
-        for mappings in &c.reads {
-            for o in &mappings.dirs {
-                counts.add(*o);
+        for rec in chunks.read_records(br, record_context, i)? {
+            for aln in rec.alignments() {
+                counts.add(aln.ori);
             }
             sampled += 1;
             if sampled >= max_samples {
@@ -448,6 +442,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
     let (packed_eq_map, frag_lengths) = process(
         &mut br,
         &prelude,
+        &input_rad,
         num_threads,
         lib_type,
         &mut frag_stats,
@@ -478,6 +473,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         presence_thresh,
         qo.em_accel.into(),
     );
+
     let EmResult {
         alphas: em_res,
         iters: em_iters,
@@ -601,6 +597,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
 fn process<T: BufRead, EqLabelT: EqLabel>(
     br: T,
     prelude: &RadPrelude,
+    input_rad: &Path,
     num_threads: usize,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
@@ -612,6 +609,7 @@ fn process<T: BufRead, EqLabelT: EqLabel>(
         Fld::Empirical(f) => process_dispatch(
             br,
             prelude,
+            input_rad,
             num_threads,
             lib_type,
             mapped_stats,
@@ -622,6 +620,7 @@ fn process<T: BufRead, EqLabelT: EqLabel>(
         Fld::Parametric(f) => process_dispatch(
             br,
             prelude,
+            input_rad,
             num_threads,
             lib_type,
             mapped_stats,
@@ -651,6 +650,10 @@ struct ParseState<'a, EqLabelT, D> {
     dir_ints: Vec<u32>,
     probs: Vec<f64>,
     key: Vec<u32>,
+    /// the first corrupt chunk this state met (its index and the error); the
+    /// state parses nothing after it, but keeps taking meta-chunks so the
+    /// reader is never left waiting on a full queue
+    error: Option<(usize, anyhow::Error)>,
 }
 
 impl<'a, EqLabelT: EqLabel, D: FldPDF> ParseState<'a, EqLabelT, D> {
@@ -674,21 +677,46 @@ impl<'a, EqLabelT: EqLabel, D: FldPDF> ParseState<'a, EqLabelT, D> {
             dir_ints: vec![],
             probs: vec![],
             key: vec![],
+            error: None,
         }
     }
 
-    fn add_meta_chunk(&mut self, meta_chunk: &MetaChunk<PiscemBulkReadRecord>) {
-        for c in meta_chunk.iter() {
-            for mappings in &c.reads {
-                self.add_fragment(mappings);
+    fn add_meta_chunk(
+        &mut self,
+        meta_chunk: &MetaChunk<PiscemBulkReadRecord>,
+        ctx: &PiscemBulkRecordContext,
+        path: &Path,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let first = meta_chunk.first_chunk_index();
+        for (k, c) in meta_chunk.raw_chunks().enumerate() {
+            match rad_input::chunk_records(c.records, c.num_records, ctx, path, first + k) {
+                Ok(records) => {
+                    for rec in records {
+                        self.add_fragment(rec);
+                    }
+                }
+                Err(e) => {
+                    self.error = Some((first + k, e));
+                    return;
+                }
             }
         }
     }
 
-    fn add_fragment(&mut self, mappings: &PiscemBulkReadRecord) {
-        let ft = rad_types::MappingType::from_u8(mappings.frag_type);
-        let nm = mappings.positions.len();
+    fn add_fragment(&mut self, rec: BulkRecord<'_>) {
+        self.add_alignments(rec.mapping_type(), rec.num_alignments(), rec.alignments());
+    }
 
+    /// Count one fragment, of mapping type `ft`, with its `nm` alignments.
+    fn add_alignments(
+        &mut self,
+        ft: rad_types::MappingType,
+        nm: usize,
+        alignments: impl Iterator<Item = BulkAlignment>,
+    ) {
         self.stats.tot_mappings += nm;
         self.stats.num_mapped_reads += 1;
 
@@ -700,13 +728,10 @@ impl<'a, EqLabelT: EqLabel, D: FldPDF> ParseState<'a, EqLabelT, D> {
         self.dir_ints.clear();
         self.probs.clear();
 
-        for (((r, pos), o), l) in mappings
-            .refs
-            .iter()
-            .zip(mappings.positions.iter())
-            .zip(mappings.dirs.iter())
-            .zip(mappings.frag_lengths.iter())
-        {
+        let mut first_frag_len = None;
+        for aln in alignments {
+            let (r, pos, o, l) = (&aln.tid, &aln.pos, &aln.ori, &aln.frag_len);
+            first_frag_len.get_or_insert(*l);
             let y = u32::from(*o);
             if self.lib_type.is_compatible_with(*o) {
                 self.mapped_ori_count[y as usize] += 1;
@@ -750,8 +775,8 @@ impl<'a, EqLabelT: EqLabel, D: FldPDF> ParseState<'a, EqLabelT, D> {
         }
 
         if nm == 1 && !ft.is_orphan() {
-            if let Some(fl) = mappings.frag_lengths.first() {
-                self.frag_lengths[*fl as usize] += 1;
+            if let Some(fl) = first_frag_len {
+                self.frag_lengths[fl as usize] += 1;
             }
             self.unique_frags += 1;
         }
@@ -776,11 +801,14 @@ impl<'a, EqLabelT: EqLabel, D: FldPDF> ParseState<'a, EqLabelT, D> {
 fn parse_chunks<'a, T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
     br: T,
     prelude: &RadPrelude,
+    path: &Path,
     num_threads: usize,
     mut new_state: impl FnMut() -> ParseState<'a, EqLabelT, D>,
     pb: &ProgressBar,
 ) -> anyhow::Result<Vec<ParseState<'a, EqLabelT, D>>> {
     let num_threads = NonZeroUsize::new(num_threads).unwrap_or(NonZeroUsize::MIN);
+    let ctx = prelude.get_record_context_prefer_roles::<PiscemBulkRecordContext>()?;
+    let ctx = &ctx;
     let mut reader = ParallelChunkReader::<PiscemBulkReadRecord>::new(prelude, num_threads);
     let queue = reader.get_queue();
     let mut own_state = new_state();
@@ -792,7 +820,7 @@ fn parse_chunks<'a, T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
                 let mut state = new_state();
                 s.spawn(move || {
                     for meta_chunk in meta_chunks {
-                        state.add_meta_chunk(&meta_chunk);
+                        state.add_meta_chunk(&meta_chunk, ctx, path);
                         pb.inc(meta_chunk.num_records() as u64);
                     }
                     state
@@ -804,7 +832,7 @@ fn parse_chunks<'a, T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
         let help_when_full = |_nbytes: u64, _nchunks: u64| {
             while queue.is_full() {
                 if let Some(meta_chunk) = queue.pop() {
-                    own_state.add_meta_chunk(&meta_chunk);
+                    own_state.add_meta_chunk(&meta_chunk, ctx, path);
                     pb.inc(meta_chunk.num_records() as u64);
                 }
             }
@@ -813,7 +841,7 @@ fn parse_chunks<'a, T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
         if read_res.is_ok() {
             // parse what is still queued alongside the workers
             while let Some(meta_chunk) = queue.pop() {
-                own_state.add_meta_chunk(&meta_chunk);
+                own_state.add_meta_chunk(&meta_chunk, ctx, path);
                 pb.inc(meta_chunk.num_records() as u64);
             }
         }
@@ -824,6 +852,15 @@ fn parse_chunks<'a, T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
             .collect();
         read_res?;
         states.push(own_state);
+        // report the corrupt chunk that comes first in the file, whichever
+        // thread met it
+        if let Some(i) = (0..states.len())
+            .filter(|&i| states[i].error.is_some())
+            .min_by_key(|&i| states[i].error.as_ref().map(|e| e.0))
+        {
+            let (_, e) = states.swap_remove(i).error.expect("filtered on");
+            return Err(e);
+        }
         Ok(states)
     })
 }
@@ -854,6 +891,7 @@ fn merge_states<EqLabelT, D>(
 fn process_dispatch<T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
     br: T,
     prelude: &RadPrelude,
+    input_rad: &Path,
     num_threads: usize,
     lib_type: LibraryType,
     mapped_stats: &mut MappedFragStats,
@@ -891,7 +929,7 @@ fn process_dispatch<T: BufRead, D: FldPDF + Sync, EqLabelT: EqLabel>(
     // chunks, so read none here either, rather than letting the chunk reader
     // fall back to reading until EOF.
     let states = if prelude.hdr.num_chunks > 0 {
-        parse_chunks(br, prelude, num_threads, new_state, &pb)?
+        parse_chunks(br, prelude, input_rad, num_threads, new_state, &pb)?
     } else {
         vec![new_state()]
     };
@@ -1059,9 +1097,18 @@ mod tests {
             let mut seq = ParseState::new(new_eqmap(true), lib_type, &ref_lengths, &fld);
             let mut reader = std::io::Cursor::new(&bytes[..]);
             for _ in 0..prelude.hdr.num_chunks {
-                let c = chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(&mut reader, &ctx);
+                let c =
+                    libradicl::chunk::Chunk::<PiscemBulkReadRecord>::from_bytes(&mut reader, &ctx);
+                // the reference: libradicl's own decoding of each record
                 for rec in &c.reads {
-                    seq.add_fragment(rec);
+                    let ft = rad_types::MappingType::from_u8(rec.frag_type);
+                    let alns = (0..rec.refs.len()).map(|i| BulkAlignment {
+                        tid: rec.refs[i],
+                        ori: rec.dirs[i],
+                        pos: rec.positions[i],
+                        frag_len: rec.frag_lengths[i],
+                    });
+                    seq.add_alignments(ft, rec.refs.len(), alns);
                 }
             }
             let expected = summarize(vec![seq]);
@@ -1073,6 +1120,7 @@ mod tests {
                     let states = parse_chunks(
                         &bytes[..],
                         &prelude,
+                        Path::new("test.rad"),
                         num_threads,
                         || ParseState::new(new_eqmap(ori), lib_type, &ref_lengths, &fld),
                         &ProgressBar::hidden(),
@@ -1105,6 +1153,7 @@ mod tests {
             let res = parse_chunks(
                 &bytes[..bytes.len() - 100],
                 &prelude,
+                Path::new("test.rad"),
                 num_threads,
                 || {
                     ParseState::new(

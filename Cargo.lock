@@ -31,6 +31,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -136,7 +142,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hash_hasher",
- "hashbrown",
+ "hashbrown 0.14.5",
  "num-traits",
  "parquet2",
  "rustc_version",
@@ -446,7 +452,7 @@ checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
 dependencies = [
  "cfg-if",
  "crossbeam-utils",
- "hashbrown",
+ "hashbrown 0.14.5",
  "lock_api",
  "once_cell",
  "parking_lot_core",
@@ -520,6 +526,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "equivalent"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,6 +575,12 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "foreign_vec"
@@ -735,6 +753,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -841,9 +870,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libradicl"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40907e891295ef42ada0dc9823b3eb37757cf88fb5a6cc8f186881386cfa72a2"
+version = "0.21.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -867,9 +894,7 @@ dependencies = [
 
 [[package]]
 name = "libradicl-macros"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c7fb4327e202938528d409e29367557533b7be1f068c8ed9ceb16a588ca3250"
+version = "0.21.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -902,9 +927,6 @@ name = "lz4_flex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
-dependencies = [
- "twox-hash",
-]
 
 [[package]]
 name = "matchers"
@@ -1383,9 +1405,9 @@ dependencies = [
 
 [[package]]
 name = "salmon-core"
-version = "2.7.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5cbc9e7843db4958189e94532c5b7480d8ba0071e170d1a5d434ae66960dda8"
+checksum = "1535570601d7709978a2e2cf12c5a8ddc7c46b918664b66f4bba98edb378d3de"
 dependencies = [
  "libc",
  "niffler",
@@ -1397,21 +1419,22 @@ dependencies = [
 
 [[package]]
 name = "salmon-eqclass"
-version = "2.7.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65e42c9f4b313e421e6fa7a735f3747436cf11018255ba109e39e55d58b38e67"
+checksum = "a5120260d525c1fc207704153d8af7a26485bc8ccb65e259b7516d002b4f340a"
 dependencies = [
  "dashmap",
  "flate2",
+ "hashbrown 0.17.1",
  "salmon-core",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "salmon-infer"
-version = "2.7.0"
+version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3314377132abfc3af6b948b311669b4298f5a6e6118003e02d14d7f78270938"
+checksum = "43a07821a2bb27cb8c634fe33256bbc361035db19dd009ca2b951a1617d07b1a"
 dependencies = [
  "rand",
  "rand_distr",
@@ -1767,12 +1790,6 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "typenum"

@@ -7,13 +7,14 @@
 //! file, is checked here first and reported as an error naming the file.
 
 use anyhow::{Context, anyhow, bail, ensure};
-use libradicl::chunk::Chunk;
 use libradicl::codec::{ChunkCodec, chunk_codec_from_tag_map};
 use libradicl::header::{RadHeader, RadPrelude};
 use libradicl::rad_types::{RadIntId, RadType, TagMap, TagRole, TagSection, TagValue};
-use libradicl::record::{PiscemBulkReadRecord, PiscemBulkRecordContext};
+use libradicl::record::PiscemBulkRecordContext;
 use libradicl::utils::{has_data_left, read_chunk_header};
-use std::io::{BufRead, Cursor, Read};
+
+use crate::utils::bulk_record::{ALN_BYTES, BulkRecords};
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 /// Resolve the `-i` argument to the RAD file and its `map_info.json`.
@@ -245,13 +246,46 @@ impl ChunkReader {
     }
 
     /// Read the next chunk from `reader`; `idx` is its 0-based index in the
-    /// file, used in error messages.
+    /// file, used in error messages. (The tests check [`Self::read_records`]
+    /// against the records libradicl decodes from the same chunk.)
+    #[cfg(test)]
     pub(crate) fn read<T: BufRead>(
         &mut self,
         reader: &mut T,
         ctx: &PiscemBulkRecordContext,
         idx: usize,
-    ) -> anyhow::Result<Chunk<PiscemBulkReadRecord>> {
+    ) -> anyhow::Result<libradicl::chunk::Chunk<libradicl::record::PiscemBulkReadRecord>> {
+        self.read_checked(reader, ctx, idx)?;
+        Ok(libradicl::chunk::Chunk::from_bytes(
+            &mut std::io::Cursor::new(&self.buf[..]),
+            ctx,
+        ))
+    }
+
+    /// As [`Self::read`], but walks the chunk's records in place rather than
+    /// decoding each into an owned record.
+    pub(crate) fn read_records<T: BufRead>(
+        &mut self,
+        reader: &mut T,
+        ctx: &PiscemBulkRecordContext,
+        idx: usize,
+    ) -> anyhow::Result<BulkRecords<'_>> {
+        let nrec = self.read_checked(reader, ctx, idx)?;
+        Ok(BulkRecords::new(
+            &self.buf[CHUNK_HEADER_BYTES..],
+            nrec,
+            ctx.frag_map_t.bytes_for_type(),
+        ))
+    }
+
+    /// Read the next chunk into `self.buf` and check its records fill it;
+    /// returns its record count.
+    fn read_checked<T: BufRead>(
+        &mut self,
+        reader: &mut T,
+        ctx: &PiscemBulkRecordContext,
+        idx: usize,
+    ) -> anyhow::Result<u32> {
         let (path, n) = (self.path.display(), self.num_chunks);
         let (nbytes, nrec) = read_chunk_header(reader).with_context(|| {
             format!("{path} is truncated: its header records {n} chunks, but it ends after {idx}")
@@ -283,12 +317,32 @@ impl ChunkReader {
                 idx + 1
             )
         })?;
-
-        Ok(Chunk::<PiscemBulkReadRecord>::from_bytes(
-            &mut Cursor::new(&self.buf[..]),
-            ctx,
-        ))
+        Ok(nrec)
     }
+}
+
+/// The records of a chunk handed over by libradicl's parallel reader (its
+/// records, without the chunk header), checked to fill the chunk; `chunk` is
+/// the chunk's 0-based index in the file, for the error message.
+pub(crate) fn chunk_records<'a>(
+    records: &'a [u8],
+    nrec: u32,
+    ctx: &PiscemBulkRecordContext,
+    path: &Path,
+    chunk: usize,
+) -> anyhow::Result<BulkRecords<'a>> {
+    check_record_sizes(records, nrec, ctx).with_context(|| {
+        format!(
+            "chunk {} in {} is corrupt or not in the bulk RAD layout",
+            chunk + 1,
+            path.display()
+        )
+    })?;
+    Ok(BulkRecords::new(
+        records,
+        nrec,
+        ctx.frag_map_t.bytes_for_type(),
+    ))
 }
 
 /// Check that the `nrec` records of a chunk payload occupy exactly its bytes
@@ -304,6 +358,7 @@ fn check_record_sizes(
         .iter()
         .map(|(_, width, _)| width.bytes_for_type())
         .sum();
+    debug_assert_eq!(aln_bytes, ALN_BYTES);
     let mut off = 0usize;
     for r in 0..nrec {
         ensure!(
@@ -329,9 +384,10 @@ fn check_record_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libradicl::chunk::Chunk;
     use libradicl::header::SpecVersion;
     use libradicl::rad_types::{MappedFragmentOrientation, TagDesc, TagSectionLabel};
-    use libradicl::record::MappedRecord;
+    use libradicl::record::{MappedRecord, PiscemBulkReadRecord};
 
     #[test]
     fn input_paths_append_to_the_stem() {
@@ -544,6 +600,62 @@ mod tests {
             assert_eq!(format!("{got:?}"), format!("{want:?}"));
         }
         assert!(direct.is_empty() && buffered.is_empty());
+    }
+
+    #[test]
+    fn records_read_in_place_match_libradicl() {
+        // Hand-encoded records covering every orientation code under each
+        // mapping type, at every width of the mapping type; the in-place view
+        // must decode exactly what libradicl's own record parser does.
+        for frag_map_t in [RadIntId::U8, RadIntId::U16, RadIntId::U32, RadIntId::U64] {
+            let ctx = PiscemBulkRecordContext { frag_map_t };
+            let mut payload = Vec::new();
+            let mut nrec = 0u32;
+            for frag_type in 0u64..=5 {
+                for na in 0u32..=4 {
+                    payload.extend_from_slice(&na.to_le_bytes());
+                    payload
+                        .extend_from_slice(&frag_type.to_le_bytes()[..frag_map_t.bytes_for_type()]);
+                    for i in 0..na {
+                        let tid = 1_000_000 * frag_type as u32 + 7 * i;
+                        payload.extend_from_slice(&((i << 30) | tid).to_le_bytes());
+                        payload.extend_from_slice(&(10 * i + 3).to_le_bytes());
+                        payload.extend_from_slice(&(250 + i as u16).to_le_bytes());
+                    }
+                    nrec += 1;
+                }
+            }
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&((payload.len() + 8) as u32).to_le_bytes());
+            framed.extend_from_slice(&nrec.to_le_bytes());
+            framed.extend_from_slice(&payload);
+            let want = Chunk::<PiscemBulkReadRecord>::from_bytes(&mut &framed[..], &ctx);
+
+            let got = chunk_records(&payload, nrec, &ctx, Path::new("x.rad"), 0).unwrap();
+            assert_eq!(got.len(), want.reads.len());
+            for (g, w) in got.zip(&want.reads) {
+                assert_eq!(g.frag_type, w.frag_type);
+                assert_eq!(g.num_alignments(), w.refs.len());
+                for (i, a) in g.alignments().enumerate() {
+                    assert_eq!(a.tid, w.refs[i]);
+                    assert_eq!(u32::from(a.ori), u32::from(w.dirs[i]));
+                    assert_eq!(a.pos, w.positions[i]);
+                    assert_eq!(a.frag_len, w.frag_lengths[i]);
+                }
+            }
+
+            // a record that runs past its chunk is an error, not a panic
+            let err = chunk_records(
+                &payload[..payload.len() - 1],
+                nrec,
+                &ctx,
+                Path::new("x.rad"),
+                6,
+            )
+            .err()
+            .expect("short chunk");
+            assert!(format!("{err:#}").contains("chunk 7 in x.rad"), "{err:#}");
+        }
     }
 
     #[test]

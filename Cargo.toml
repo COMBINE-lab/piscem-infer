@@ -39,20 +39,20 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", default-features = true, features = [
   "env-filter",
 ] }
-tabled = "0.20.0"
+tabled = "0.22"
 rayon = "1.8.1"
 serde_json = "1.0.114"
 serde = { version = "1.0.197", features = ["serde_derive", "derive"] }
-arrow2 = { version = "0.18.0", features = [
-  "io_parquet",
-  "io_parquet_gzip",
-  "io_parquet_zstd",
-  "io_parquet_snappy",
+arrow-array = "60.1"
+arrow-schema = "60.1"
+parquet = { version = "60.1", default-features = false, features = [
+  "arrow",
+  "zstd",
 ] }
 path-tools = "0.1.0"
 num-format = "0.4.4"
 clap-num = "1.2.0"
-indicatif = "0.17"
+indicatif = "0.18"
 
 [[bin]]
 name = "piscem-infer"

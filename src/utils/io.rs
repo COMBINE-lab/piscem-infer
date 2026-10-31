@@ -1,15 +1,12 @@
 use crate::utils::parquet_utils;
 use anyhow::Result;
-use arrow2::{
-    array::Array,
-    chunk::Chunk,
-    datatypes::{Field, Schema},
-};
+use arrow_array::{ArrayRef, Float64Array, UInt32Array};
 use libradicl::header;
 use path_tools::WithAdditionalExtension;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use tracing::warn;
 
@@ -62,26 +59,34 @@ pub(crate) fn write_results(
 
     Ok(())
 }
-pub(crate) fn write_fld_file(
-    output_path: &Path,
-    fields: Vec<Field>,
-    chunk: Chunk<Box<dyn Array>>,
-) -> Result<()> {
+/// Write the fragment length distribution (`<output>.fld.pq`): one column,
+/// `fragment_length_dist`, holding the count at each length.
+pub(crate) fn write_fld_file(output_path: &Path, frag_lengths: Vec<u32>) -> Result<()> {
     let output_path = output_path
         .to_path_buf()
         .with_additional_extension(".fld.pq");
-    let schema = Schema::from(fields);
-    parquet_utils::write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)
+    let col: ArrayRef = Arc::new(UInt32Array::from(frag_lengths));
+    parquet_utils::write_columns(
+        &output_path,
+        vec![("fragment_length_dist".to_string(), col)],
+    )
 }
 
-pub(crate) fn write_infrep_file(
-    output_path: &Path,
-    fields: Vec<Field>,
-    chunk: Chunk<Box<dyn Array>>,
-) -> Result<()> {
+/// Write the inferential replicates (`<output>.infreps.pq`): one column per
+/// replicate, `bootstrap.<i>`, whether drawn by bootstrap or Gibbs sampling.
+pub(crate) fn write_infrep_file(output_path: &Path, replicates: Vec<Vec<f64>>) -> Result<()> {
     let output_path = output_path
         .to_path_buf()
         .with_additional_extension(".infreps.pq");
-    let schema = Schema::from(fields);
-    parquet_utils::write_chunk_to_file(output_path.to_str().unwrap(), schema, chunk)
+    let columns = replicates
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            (
+                format!("bootstrap.{i}"),
+                Arc::new(Float64Array::from(r)) as ArrayRef,
+            )
+        })
+        .collect();
+    parquet_utils::write_columns(&output_path, columns)
 }

@@ -1,9 +1,4 @@
 use anyhow::{Context, bail};
-use arrow2::{
-    array::{Float64Array, UInt32Array},
-    chunk::Chunk,
-    datatypes::Field,
-};
 
 use indicatif::{HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use num_format::{Locale, ToFormattedString};
@@ -511,14 +506,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         total_weight.to_formatted_string(&Locale::en)
     );
 
-    {
-        let fld_array = UInt32Array::from_vec(frag_lengths);
-        let field = Field::new("fragment_length_dist", fld_array.data_type().clone(), false);
-
-        let chunk = Chunk::new(vec![fld_array.boxed()]);
-        let fields = vec![field];
-        io::write_fld_file(&output, fields, chunk)?;
-    }
+    io::write_fld_file(&output, frag_lengths)?;
 
     if num_bootstraps > 0 {
         info!("performing {num_bootstraps} bootstraps");
@@ -530,19 +518,7 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
             seed,
         );
 
-        let mut new_arrays = vec![];
-        let mut bs_fields = vec![];
-        for (i, b) in bootstraps.into_iter().enumerate() {
-            let bs_array = Float64Array::from_vec(b);
-            bs_fields.push(Field::new(
-                format!("bootstrap.{i}"),
-                bs_array.data_type().clone(),
-                false,
-            ));
-            new_arrays.push(bs_array.boxed());
-        }
-        let chunk = Chunk::new(new_arrays);
-        io::write_infrep_file(&output, bs_fields, chunk)?;
+        io::write_infrep_file(&output, bootstraps)?;
     }
 
     if num_gibbs_samples > 0 {
@@ -556,19 +532,8 @@ pub fn process_bulk_dispatch<EqLabelT: EqLabel>(
         };
         let gibbs_samples = gibbs_sample(&packed, &eff_lengths, &em_res, &gibbs_opts, seed);
 
-        let mut new_arrays = vec![];
-        let mut gs_fields = vec![];
-        for (i, g) in gibbs_samples.into_iter().enumerate() {
-            let gs_array = Float64Array::from_vec(g);
-            gs_fields.push(Field::new(
-                format!("bootstrap.{i}"),
-                gs_array.data_type().clone(),
-                false,
-            ));
-            new_arrays.push(gs_array.boxed());
-        }
-        let chunk = Chunk::new(new_arrays);
-        io::write_infrep_file(&output, gs_fields, chunk)?;
+        // (Gibbs samples go in the same file and columns as bootstraps)
+        io::write_infrep_file(&output, gibbs_samples)?;
     }
 
     let infrep_method = if num_gibbs_samples > 0 {
